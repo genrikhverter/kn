@@ -1,0 +1,88 @@
+/* Код Урожая: карта — панель управления (адаптация AOKNP map_panel.css) */
+.kumap-panel {
+    position: absolute; top: 10px; right: 10px; z-index: 1000;
+    background: rgba(255,255,255,.95); border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.2); padding: 10px;
+    width: 200px; font-family: sans-serif; font-size: 12px;
+}
+.kumap-panel__tabs {
+    display: flex; gap: 2px; margin-bottom: 8px;
+    border-bottom: 1px solid #e0e0e0; padding-bottom: 6px;
+}
+.kumap-panel__tab {
+    flex: 1; padding: 4px 8px; border: none; background: transparent;
+    font-size: 11px; cursor: pointer; border-radius: 4px; color: #666;
+}
+.kumap-panel__tab--active {
+    background: transparent; color: #0b2142;
+    border-bottom: 2px solid #BED6A5; font-weight: 600;
+}
+.kumap-panel__body--hidden { display: none; }
+.kumap-panel__label {
+    font-size: 10px; color: #888; margin: 4px 0;
+    text-transform: uppercase; letter-spacing: .5px;
+}
+.kumap-tile-btn {
+    display: inline-block; padding: 4px 10px; margin: 2px;
+    border: 1px solid #d0d0d0; border-radius: 4px;
+    font-size: 11px; cursor: pointer; background: #fff;
+}
+.kumap-tile-btn--active {
+    background: #11305e; color: #fff; border-color: #11305e;
+}
+.kumap-panel label { display: block; padding: 2px 0; font-size: 12px; cursor: pointer; }
+.kumap-legend {
+    position: absolute; bottom: 10px; left: 10px; z-index: 1000;
+    background: rgba(255,255,255,.92); border-radius: 6px;
+    padding: 8px; font-family: sans-serif; font-size: 11px;
+    max-height: 200px; overflow-y: auto;
+    box-shadow: 0 2px 6px rgba(0,0,0,.15);
+}
+.kumap-legend__item {
+    display: flex; align-items: center; gap: 6px; padding: 2px 0;
+}
+.kumap-legend__swatch {
+    width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0;
+}
+
+/* п.2 UI-обзора: кнопки-инструменты — одной строкой ПОД картой */
+.kumap-bottombar {
+    display: flex; flex-wrap: wrap; justify-content: center; align-items: center;
+    gap: 6px; padding: 8px 4px 4px; width: 100%;
+    font-family: sans-serif;
+}
+
+/* п.4 UI-обзора: попап непрозрачный (стилей InfoWindow в maptalks.css нет —
+   окно рисовалось без фона), закрытие — крестиком сверху и кнопкой внизу */
+.kumap-infowindow {
+    position: relative;
+    background: #ffffff;
+    border: 1px solid #c9d2bd;
+    border-radius: 8px;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, .28);
+    min-width: 210px;
+    max-width: 320px;
+    font: 12px/1.5 sans-serif;
+    color: #263238;
+    overflow: hidden;
+}
+.kumap-infowindow .maptalks-ico { display: none; }
+.kumap-infowindow h2 {
+    margin: 0;
+    padding: 6px 26px 6px 12px;
+    font: 600 12.5px/1.4 sans-serif;
+    color: #1d3a1d;
+    background: #eef4e6;
+    border-bottom: 1px solid #dfe6d4;
+}
+.kumap-infowindow a.maptalks-close {
+    position: absolute;
+    top: 3px; right: 6px;
+    font: bold 14px/1 sans-serif;
+    color: #7d8a76;
+    text-decoration: none;
+}
+.kumap-infowindow .maptalks-msgContent {
+    background: #ffffff;
+    padding: 8px 12px;
+}

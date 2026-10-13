@@ -1,0 +1,1388 @@
+MODULE KuCrop;
+
+// Код Урожая: НСИ культур с правилами севооборота.
+// Спецификация: docs/02-data-model.md §1, docs/03-logic-KuCrop.md.
+REQUIRE Authentication, SystemEvents, Utils;
+
+NAMESPACE Ku;
+
+// ===================== Перечисления =====================
+CLASS NsiStatus 'Статус НСИ' {
+    active 'Активен', archived 'Архив'
+}
+nameNsiStatus (NsiStatus s) = staticCaption(s);
+CLASS CropType 'Тип культуры' {
+    grain 'зерновая',
+    industrial 'техническая',
+    fodder 'кормовая',
+    vegetable 'овощная',
+    fruit 'плодовая',
+    other 'прочая'
+}
+CLASS SeasonKind 'Сезонность' {
+    spring 'весенняя',
+    winter 'зимняя',
+    perennial 'многолетняя'
+}
+
+// ===================== Культура =====================
+CLASS Crop 'Культура';
+TABLE crop (Crop);
+
+name 'Наименование' = DATA ISTRING[100] (Crop) NONULL IN id;
+code 'Идентификатор' = DATA ISTRING[16] (Crop) NONULL;
+registryCode 'Код Госсорткомиссии' = DATA ISTRING[24] (Crop) NONULL;
+variety 'Сорт/гибрид' = DATA ISTRING[100] (Crop) NONULL;
+cropType 'Тип' = DATA CropType (Crop) NONULL;
+nameCropType 'Тип' (Crop c) = staticCaption(cropType(c));
+seasonKind 'Сезонность' = DATA SeasonKind (Crop) NONULL;
+nameSeason 'Сезонность' (Crop c) = staticCaption(seasonKind(c));
+
+vegetationDays 'Вегетация, дн' = DATA INTEGER (Crop) NONULL;
+targetYield 'Целевая урожайность, ц/га' = DATA NUMERIC[10,2] (Crop);
+
+phMin 'pH мин' = DATA DOUBLE (Crop);
+phMax 'pH макс' = DATA DOUBLE (Crop);
+humusMin 'Гумус мин, %' = DATA DOUBLE (Crop);
+humusMax 'Гумус макс, %' = DATA DOUBLE (Crop);
+nMin 'N мин, мг/кг' = DATA DOUBLE (Crop);
+nMax 'N макс, мг/кг' = DATA DOUBLE (Crop);
+pMin 'P мин, мг/кг' = DATA DOUBLE (Crop);
+pMax 'P макс, мг/кг' = DATA DOUBLE (Crop);
+kMin 'K мин, мг/кг' = DATA DOUBLE (Crop);
+kMax 'K макс, мг/кг' = DATA DOUBLE (Crop);
+moistMin 'Влажность мин, %' = DATA DOUBLE (Crop);
+moistMax 'Влажность макс, %' = DATA DOUBLE (Crop);
+tempMin 't роста мин, °C' = DATA DOUBLE (Crop);
+tempMax 't роста макс, °C' = DATA DOUBLE (Crop);
+
+// Агрокоэффициенты (вынос кг/т) — потребители: KuYield (балансовый метод),
+// KuSimulation (модель роста). ⚠ значения сида — допущение прототипа.
+removalN 'Вынос N, кг/т' = DATA NUMERIC[8,3] (Crop);
+removalP 'Вынос P, кг/т' = DATA NUMERIC[8,3] (Crop);
+removalK 'Вынос K, кг/т' = DATA NUMERIC[8,3] (Crop);
+
+// Атрибуты справочника по спецификации v2.0 (группа «Агрономические
+// характеристики» / «Интеграционные атрибуты»), ранее сокращённые
+climateZone 'Климатическая зона допуска (коды ОК)' = DATA ISTRING[100] (Crop);
+bbchStages 'Фенологические стадии (BBCH)' = DATA TEXT (Crop);
+stressThresholds 'Пороговые значения стрессов' = DATA TEXT (Crop);
+
+// Генетические коэффициенты (атрибут справочника по v2.0: «используются в
+// имитационном моделировании роста и развития культур»); глобальные
+// калибруемые коэффициенты модели — ModelCoeff в KuSimulation
+genGdd 'САТ до созревания, °C·дн' = DATA NUMERIC[10,1] (Crop);
+genBiomassMax 'Макс. биомасса (ген.), т/га' = DATA NUMERIC[8,2] (Crop);
+genStressResist 'Устойчивость к стрессам (0-1)' = DATA NUMERIC[5,2] (Crop);
+
+returnYears 'Мин. период возврата, лет' = DATA INTEGER (Crop) NONULL;
+
+image 'Изображение' = DATA IMAGEFILE (Crop);
+description 'Описание' = DATA TEXT (Crop);
+source 'Источник информации' = DATA ISTRING[100] (Crop);
+actualized 'Дата актуализации' = DATA DATE (Crop);
+gostLink 'ГОСТ/ТУ' = DATA ISTRING[100] (Crop);
+note 'Примечания' = DATA TEXT (Crop);
+status 'Статус' = DATA ISTRING[20] (Crop);
+created 'Создано' = DATA DATETIME (Crop);
+createdBy 'Автор' = DATA CustomUser (Crop);
+nameKuUser 'Пользователь' (CustomUser u) = OVERRIDE login(u), '';
+nameCreatedBy 'Автор' (Crop c) = OVERRIDE nameKuUser(createdBy(c)), '';
+updated 'Изменено' = DATA DATETIME (Crop);
+
+// уникальность бизнес-ключей (GROUP AGGR = встроенный CONSTRAINT)
+cropByCode = GROUP AGGR Crop c BY code(c);
+cropByRegistry = GROUP AGGR Crop c BY registryCode(c);
+
+isArchived (Crop c) = status(c) = 'Архив';
+nameCrop 'Культура (с сортом)' (Crop c) = name(c) + ' ' + variety(c);
+
+// авто-заполнение при создании
+WHEN SET(Crop c IS Crop) DO {
+    status(c) <- 'Активен';
+    created(c) <- currentDateTime();
+    createdBy(c) <- currentUser();
+}
+
+// ===================== Реестры правил севооборота =====================
+CLASS CropPredecessor 'Допустимый предшественник';
+TABLE cropPredecessor (CropPredecessor);
+crop 'Культура' = DATA Crop (CropPredecessor);
+predecessor 'Предшественник' = DATA Crop (CropPredecessor) NONULL;
+namePredecessor 'Предшественник' (CropPredecessor p) = nameCrop(predecessor(p));
+predCropLink 'Культура' (CropPredecessor p) = crop(p);
+
+CLASS CropTaboo 'Запрещённый предшественник';
+TABLE cropTaboo (CropTaboo);
+crop 'Культура' = DATA Crop (CropTaboo);
+taboo 'Запрещён после' = DATA Crop (CropTaboo) NONULL;
+nameTaboo 'Запрещён после' (CropTaboo t) = nameCrop(taboo(t));
+tabooCropLink 'Культура' (CropTaboo t) = crop(t);
+
+allowedAfter 'Можно после' (Crop c) =
+    GROUP CONCAT name(predecessor(CropPredecessor p)) IF crop(p) = c, ', ' ORDER predecessor(p), p;
+// уникальность пар «культура + предшественник/запрет» (фильтры пикеров правил)
+predByCropPair = GROUP AGGR CropPredecessor p BY crop(p), predecessor(p);
+tabooByCropPair = GROUP AGGR CropTaboo t BY crop(t), taboo(t);
+
+// ===================== Справочники атрибутов v2.0 (выбор вместо текста) =====================
+// Фенологические стадии BBCH — единый справочник; на карточке культуры —
+// выбор (много-к-многому через CropBbchStage), а не свободный текст
+CLASS BbchStage 'Фенологическая стадия (BBCH)';
+TABLE bbchStage (BbchStage);
+bsCode 'Код BBCH' = DATA ISTRING[8] (BbchStage) NONULL;
+name 'Наименование' = DATA ISTRING[100] (BbchStage) NONULL IN id;
+bsDescription 'Описание' = DATA TEXT (BbchStage);
+bsByCode = GROUP AGGR BbchStage bs BY bsCode(bs);
+bsSource 'Источник' = DATA ISTRING[100] (BbchStage);
+
+CLASS CropBbchStage 'Стадия культуры';
+TABLE cropBbchStage (CropBbchStage);
+cbsCrop 'Культура' = DATA Crop (CropBbchStage) AUTOSET;
+cbsStage 'Стадия' = DATA BbchStage (CropBbchStage) NONULL;
+nameCbsStage 'Стадия' (CropBbchStage cs) = bsCode(cbsStage(cs)) + ' — ' + name(cbsStage(cs));
+nameCbsCropStage 'Культура' (CropBbchStage cs) = OVERRIDE nameCrop(cbsCrop(cs)), '';
+// культуры, к которым стадия применена (для карточки стадии и справочника)
+bsCultures 'Культуры (применяется)' (BbchStage st) =
+    GROUP CONCAT nameCrop(cbsCrop(CropBbchStage cs)) IF cbsStage(cs) = st, ', ' ORDER cbsCrop(cs);
+cbsByCropStage = GROUP AGGR CropBbchStage cs BY cbsCrop(cs), cbsStage(cs);   // уникальность пары
+
+// Показатели стресса и пороги по культуре
+CLASS StressIndicator 'Показатель стресса';
+TABLE stressIndicator (StressIndicator);
+siCode 'Код' = DATA ISTRING[20] (StressIndicator) NONULL;
+name 'Наименование' = DATA ISTRING[100] (StressIndicator) NONULL IN id;
+siUnit 'Ед. изм.' = DATA ISTRING[20] (StressIndicator);
+siDescription 'Описание' = DATA TEXT (StressIndicator);
+siByCode = GROUP AGGR StressIndicator si BY siCode(si);
+
+// ===================== Типы стресса (КФ-А4: класс перенесён из KuSimulation —
+// на него ссылается база знаний KuYield; код/группа — по спеке 09.10) =====================
+CLASS StressType 'Тип стресса';
+TABLE stressType (StressType);
+stName 'Наименование' = DATA ISTRING[60] (StressType) NONULL IN id;
+stCode 'Код' = DATA ISTRING[20] (StressType);
+stGroup 'Группа' = DATA ISTRING[30] (StressType);
+stDescription 'Описание' = DATA TEXT (StressType);
+stStatus 'Статус' = DATA ISTRING[20] (StressType);
+stressByName = GROUP AGGR StressType s BY stName(s);
+stByCode = GROUP AGGR StressType s BY stCode(s);
+stArchived (StressType s) = stStatus(s) = 'Архив';
+// КФ-С5 (11.10): гипотеза по умолчанию «показатель → тип стресса»
+// (NDVI_* — NULL: универсальный триггер, диагноз не ставит; SCOUT_ALERT —
+// гипотезу задаёт эксперт в наблюдении)
+siStressType 'Гипотеза типа (умолчание)' = DATA StressType (StressIndicator);
+nameSiStressType (StressIndicator si) = OVERRIDE stName(siStressType(si)), '—';
+WHEN SET(StressType s IS StressType) DO stStatus(s) <- 'Активен';
+FORM pickStressType 'Выбор типа стресса'
+    OBJECTS st = StressType
+    PROPERTIES (st) READONLY stName, stCode, stGroup
+    FILTERS NOT stArchived(st)
+;
+
+
+CLASS LimitSign 'Условие порога' { atLeast 'не менее', atMost 'не более' }
+
+CLASS CropStressLimit 'Порог стресса культуры';
+TABLE cropStressLimit (CropStressLimit);
+cslCrop 'Культура' = DATA Crop (CropStressLimit) AUTOSET;
+cslIndicator 'Показатель' = DATA StressIndicator (CropStressLimit) NONULL;
+nameCslIndicator 'Показатель' (CropStressLimit l) = OVERRIDE name(cslIndicator(l)), '';
+cslSign 'Условие' = DATA LimitSign (CropStressLimit) NONULL;
+nameCslSign 'Условие' (CropStressLimit l) = staticCaption(cslSign(l));
+cslValue 'Порог' = DATA NUMERIC[10,2] (CropStressLimit) NONULL;
+cslByCropIndicator = GROUP AGGR CropStressLimit l BY cslCrop(l), cslIndicator(l);   // уникальность
+
+// ===================== Пороги культуры в модели (КФ-А1/А2) =====================
+// lookup значений CropStressLimit по (культура, код показателя)
+cslValueOf (Crop c, ISTRING[20] siCodeVal) =
+    (GROUP MAX cslValue(CropStressLimit l) IF cslCrop(l) = c AND cslIndicator(l) = siByCode(siCodeVal));
+cropDevThreshold 'Порог NDVI (обнаружение), %' (Crop c) =
+    OVERRIDE cslValueOf(c, 'NDVI_DEV'), 15.0;
+cropCritThreshold 'Порог NDVI (критично), %' (Crop c) =
+    OVERRIDE cslValueOf(c, 'NDVI_CRIT'), 35.0;
+cropPrecip10 'Осадки за декаду, мм (мин)' (Crop c) =
+    OVERRIDE cslValueOf(c, 'PRECIP10'), 20.0;
+
+CONSTRAINT CropStressLimit l IS CropStressLimit AND cslValue(l) <= 0 CHECKED BY cslValue MESSAGE 'Порог должен быть положительным числом';
+
+// Регионы допуска (12 регионов РФ по реестру ГСС)
+CLASS AdmissionRegion 'Регион допуска';
+TABLE admissionRegion (AdmissionRegion);
+arCode 'Код' = DATA INTEGER (AdmissionRegion) NONULL;
+name 'Наименование' = DATA ISTRING[100] (AdmissionRegion) NONULL IN id;
+arByCode = GROUP AGGR AdmissionRegion ar BY arCode(ar);
+
+// Субъекты РФ в составе регионов допуска ГСС (для таблицы и карточки региона)
+CLASS SubjectRf 'Субъект РФ';
+TABLE subjectRf (SubjectRf);
+srName 'Наименование Субъекта РФ' = DATA ISTRING[100] (SubjectRf) NONULL IN id;
+srRegion 'Регион допуска' = DATA AdmissionRegion (SubjectRf) NONULL;
+nameSrRegion 'Регион допуска' (SubjectRf s) =
+    OVERRIDE (('' + arCode(srRegion(s))) + '. ' + name(srRegion(s))), '—';
+arSubjects 'Субъекты РФ' (AdmissionRegion r) =
+    GROUP CONCAT srName(SubjectRf s) IF srRegion(s) = r, ', ' ORDER srName(s);
+
+CLASS CropRegion 'Регион допуска культуры';
+TABLE cropRegion (CropRegion);
+crCrop 'Культура' = DATA Crop (CropRegion) AUTOSET;
+crRegion 'Регион' = DATA AdmissionRegion (CropRegion) NONULL;
+nameCrRegion 'Регион' (CropRegion r) = ('' + arCode(crRegion(r))) + '. ' + name(crRegion(r));
+crByCropRegion = GROUP AGGR CropRegion r BY crCrop(r), crRegion(r);   // уникальность
+nameCbsCropRegion 'Культура' (CropRegion r) = OVERRIDE nameCrop(crCrop(r)), '';
+
+
+// «Изменено»: правка полей культуры или её связей v2.0 обновляет отметку;
+// системные поля сида (source/actualized/gostLink, legacy-тексты) не отслеживаются.
+WHEN CHANGED(name(Crop c)) OR CHANGED(code(c)) OR CHANGED(registryCode(c))
+    OR CHANGED(variety(c)) OR CHANGED(vegetationDays(c)) OR CHANGED(targetYield(c))
+    OR CHANGED(returnYears(c)) OR CHANGED(status(c)) OR CHANGED(image(c))
+    OR CHANGED(description(c)) OR CHANGED(note(c))
+    OR CHANGED(phMin(c)) OR CHANGED(phMax(c)) OR CHANGED(humusMin(c)) OR CHANGED(humusMax(c))
+    OR CHANGED(nMin(c)) OR CHANGED(nMax(c)) OR CHANGED(pMin(c)) OR CHANGED(pMax(c))
+    OR CHANGED(kMin(c)) OR CHANGED(kMax(c)) OR CHANGED(moistMin(c)) OR CHANGED(moistMax(c))
+    OR CHANGED(tempMin(c)) OR CHANGED(tempMax(c))
+    OR CHANGED(removalN(c)) OR CHANGED(removalP(c)) OR CHANGED(removalK(c))
+    OR CHANGED(genGdd(c)) OR CHANGED(genBiomassMax(c)) OR CHANGED(genStressResist(c))
+    DO updated(c) <- currentDateTime();
+
+WHEN CHANGED(cbsStage(CropBbchStage s)) DO updated(cbsCrop(s)) <- currentDateTime();
+WHEN CHANGED(cslIndicator(CropStressLimit l)) OR CHANGED(cslSign(l)) OR CHANGED(cslValue(l))
+    DO updated(cslCrop(l)) <- currentDateTime();
+WHEN CHANGED(crRegion(CropRegion r)) DO updated(crCrop(r)) <- currentDateTime();
+
+// ===================== Выбор объектов: пикеры =====================
+// В этой сборке платформы объектные свойства в ячейках форм показывают
+// числовой id объекта (а не представление), поэтому: отображение ссылок —
+// только вычисляемыми именами (nameCropType и т.п.), а изменение ссылки —
+// диалоговым выбором из списка со строковыми колонками (DIALOG ... INPUT).
+
+nameCropTypeItem 'Тип' (CropType t) = staticCaption(t);
+nameSeasonItem 'Сезонность' (SeasonKind s) = staticCaption(s);
+nameLimitSignItem 'Условие' (LimitSign s) = staticCaption(s);
+
+FORM pickCropType 'Выбор типа культуры'
+    OBJECTS t = CropType
+    PROPERTIES (t) READONLY nameCropTypeItem
+;
+FORM pickSeasonKind 'Выбор сезонности'
+    OBJECTS k = SeasonKind
+    PROPERTIES (k) READONLY nameSeasonItem
+;
+
+// КФ-А7.2: статусы агро-НСИ {Активен,Архив} (фильтры пикеров ниже)
+bsStatus 'Статус' = DATA ISTRING[20] (BbchStage);
+bsArchived (BbchStage b) = bsStatus(b) = 'Архив';
+WHEN SET(BbchStage b IS BbchStage) DO bsStatus(b) <- 'Активен';
+siStatus 'Статус' = DATA ISTRING[20] (StressIndicator);
+siArchived (StressIndicator s) = siStatus(s) = 'Архив';
+WHEN SET(StressIndicator s IS StressIndicator) DO siStatus(s) <- 'Активен';
+arStatus 'Статус' = DATA ISTRING[20] (AdmissionRegion);
+arArchived (AdmissionRegion a) = arStatus(a) = 'Архив';
+WHEN SET(AdmissionRegion a IS AdmissionRegion) DO arStatus(a) <- 'Активен';
+FORM pickBbchStage 'Выбор стадии BBCH'
+    OBJECTS st = BbchStage
+    PROPERTIES (st) READONLY bsCode, name, bsDescription
+    ORDERS bsCode(st)
+    FILTERS NOT bsArchived(st)
+;
+FORM pickStressIndicator 'Выбор показателя стресса'
+    OBJECTS i = StressIndicator
+    PROPERTIES (i) READONLY siCode, name, siUnit
+    FILTERS NOT siArchived(i)
+;
+FORM pickLimitSign 'Выбор условия порога'
+    OBJECTS s = LimitSign
+    PROPERTIES (s) READONLY nameLimitSignItem
+;
+FORM pickAdmissionRegion 'Выбор региона допуска'
+    OBJECTS reg = AdmissionRegion
+    PROPERTIES (reg) READONLY arCode, name
+    ORDERS arCode(reg)
+    FILTERS NOT arArchived(reg)
+;
+FORM pickCrop 'Выбор культуры'
+    OBJECTS pc = Crop
+    PROPERTIES (pc) READONLY name, code, nameCropType
+    FILTERS NOT isArchived(pc)   // КФ-5: архивные не предлагаются
+    ORDERS name(pc)
+;
+
+setCropTypeAct 'Выбрать тип' (Crop c) {
+    DIALOG pickCropType OBJECTS t = cropType(c) INPUT t NULL DO cropType(c) <- t;
+}
+setSeasonAct 'Выбрать сезонность' (Crop c) {
+    DIALOG pickSeasonKind OBJECTS k = seasonKind(c) INPUT k NULL DO seasonKind(c) <- k;
+}
+
+// добавление строк v2.0 «одним кликом»: сразу пикер, отмена — ничего не
+// создаётся; уже связанные значения скрыты фильтром уникальности.
+// Строки буферизуются в сессии карточки (как и поля культуры) и применяются
+// по «ОК»; удаление — тоже в сессии формы, поэтому работает и по только
+// что добавленным строкам. NEWSESSION здесь нельзя: при создании новой
+// культуры объект ещё не применён в БД и вложенной сессии не виден.
+addBbchStageAct 'Добавить стадию…' (Crop c) {
+    DIALOG pickBbchStage OBJECTS st INPUT st NULL FILTERS NOT cbsByCropStage(c, st) DO
+        NEW s = CropBbchStage { cbsCrop(s) <- c; cbsStage(s) <- st; }
+}
+addStressLimitAct 'Добавить порог…' (Crop c) {
+    DIALOG pickStressIndicator OBJECTS i INPUT i NULL FILTERS NOT cslByCropIndicator(c, i) DO
+    DIALOG pickLimitSign OBJECTS s INPUT sg NULL DO
+        NEW l = CropStressLimit { cslCrop(l) <- c; cslIndicator(l) <- i; cslSign(l) <- sg; cslValue(l) <- 1; }
+}
+addRegionAct 'Добавить регион…' (Crop c) {
+    DIALOG pickAdmissionRegion OBJECTS reg INPUT reg NULL FILTERS NOT crByCropRegion(c, reg) DO
+        NEW r = CropRegion { crCrop(r) <- c; crRegion(r) <- reg; }
+}
+
+// Добавление правила на форме правил: культура-хозяин выбирается один раз
+// в панель (сессионный параметр), затем однодиалоговые кнопки (два DIALOG
+// подряд в одном действии в этой сборке платформы не выполняют второй DO —
+// поэтому хозяин вынесен в отдельный пикер).
+rulesHost 'Культура для добавления правил' = DATA Crop ();
+nameRulesHost 'Культура для добавления' () = name(rulesHost());
+setRulesHostAct 'Выбрать культуру…' () {
+    DIALOG pickCrop OBJECTS pc = rulesHost() INPUT pc NULL DO rulesHost() <- pc;
+}
+// NEWSESSION внутри DO-блока DIALOG в этой сборке платформы молча не
+// выполняется — поэтому создание buffered (NEW в сессии формы, как на
+// карточке культуры), применяется по «Сохранить»/OK формы правил
+addPredRuleAct 'Добавить допустимого предшественника' () {
+    DIALOG pickCrop OBJECTS pc INPUT p NULL FILTERS NOT predByCropPair(rulesHost(), p) DO
+        NEW pr = CropPredecessor { crop(pr) <- rulesHost(); predecessor(pr) <- p; }
+}
+addTabooRuleAct 'Добавить запрещённого предшественника' () {
+    DIALOG pickCrop OBJECTS pc INPUT t NULL FILTERS NOT tabooByCropPair(rulesHost(), t) DO
+        NEW tb = CropTaboo { crop(tb) <- rulesHost(); taboo(tb) <- t; }
+}
+
+namePredCrop 'Культура' (CropPredecessor p) = nameCrop(crop(p));
+nameTabooCrop 'Культура' (CropTaboo t) = nameCrop(crop(t));
+tabooAfter 'Нельзя после (сводно)' (Crop c) =
+    GROUP CONCAT nameCrop(taboo(CropTaboo t)) IF crop(t) = c, ', ' ORDER taboo(t), t;
+
+// Гриды предшественников/табу внутри карточки культуры платформа не
+// наполняет (класс правила ссылается на Crop дважды: культура + предшественник),
+// поэтому на карточке — сводные строки, правка — в отдельной форме правил.
+// NEW-псевдодействие открывает автоформу класса с сырым ИД — добавление
+// только кнопками «Добавить …» (пикеры), покнопочные пикеры строк убраны.
+// п.4 UI-обзора: явное удаление (платформенный NEWSESSION DELETE по грид-
+// строке молча не срабатывал — «кнопка Удалить не работает»)
+delPredRuleAct 'Удалить' (CropPredecessor pr) {
+    DELETE pr;
+    APPLY;
+}
+delTabooRuleAct 'Удалить' (CropTaboo tb) {
+    DELETE tb;
+    APPLY;
+}
+FORM cropRules 'Правила севооборота'
+    // культура-хозяин: нередактируемое отображение + кнопка выбора пикером
+    // (READONLY в общем списке гасил и действие — кнопка не работала)
+    PROPERTIES () READONLY nameRulesHost
+    PROPERTIES () setRulesHostAct
+    PROPERTIES () addPredRuleAct SHOWIF rulesHost(), addTabooRuleAct SHOWIF rulesHost()
+    OBJECTS pr = CropPredecessor
+    PROPERTIES (pr) READONLY namePredCrop, namePredecessor
+    PROPERTIES (pr) delPredRuleAct
+    FILTERS crop(pr) = rulesHost()
+    OBJECTS tb = CropTaboo
+    PROPERTIES (tb) READONLY nameTabooCrop, nameTaboo
+    PROPERTIES (tb) delTabooRuleAct
+    FILTERS crop(tb) = rulesHost()
+;
+DESIGN cropRules {
+    NEW addBox {
+        caption = 'Добавление правил севооборота';
+        NEW hostRow {
+            horizontal = TRUE;
+            MOVE PROPERTY(nameRulesHost());
+            MOVE PROPERTY(setRulesHostAct());
+        }
+        NEW addRow {
+            horizontal = TRUE;
+            MOVE PROPERTY(addPredRuleAct());
+            MOVE PROPERTY(addTabooRuleAct());
+        }
+    }
+    // таблицы бок о бок: допустимые — слева, запрещённые — правее,
+    // обе тянутся до низа формы
+    NEW tablesRow {
+        horizontal = TRUE;
+        NEW predRules {
+            caption = 'Допустимые предшественники';
+            MOVE BOX(pr);
+        }
+        NEW tabooRules {
+            caption = 'Запрещённые предшественники';
+            MOVE BOX(tb);
+        }
+    }
+    BOX(pr) { caption = ''; }
+    BOX(tb) { caption = ''; }
+}
+openCropRulesAct 'Ведение севооборота…' (Crop c) {
+    rulesHost() <- c;
+    SHOW cropRules;
+}
+
+// ===================== Справочник сортов/гибридов (спецификация v2.0) =====================
+// Связан с культурами; несёт генетические коэффициенты для модели KuGDD —
+// подставляются вместо общих по культуре при наличии сорта в комплексном плане.
+CLASS Variety 'Сорт/гибрид';
+TABLE variety (Variety);
+varCode 'Код' = DATA ISTRING[24] (Variety) NONULL IN id;
+varName 'Наименование сорта' = DATA ISTRING[100] (Variety) NONULL;
+varCrop 'Культура' = DATA Crop (Variety) NONULL;
+nameVarCrop 'Культура сорта' (Variety v) = OVERRIDE nameCrop(varCrop(v)), '';
+// генетические коэффициенты (переопределяют культурные при наличии)
+varGdd 'САТ до созревания, °C·дн' = DATA NUMERIC[10,1] (Variety);
+varBiomassMax 'Макс. биомасса, т/га' = DATA NUMERIC[8,2] (Variety);
+varStressResist 'Устойчивость к стрессам (0-1)' = DATA NUMERIC[5,2] (Variety);
+varDescription 'Описание' = DATA TEXT (Variety);
+varByCode = GROUP AGGR Variety v BY varCode(v);
+
+// (effGdd/effBiomassMax — мёртвый дубль, удалён; генетика сорта теперь
+// через kuFieldGdd/kuFieldBiomassMax ABSTRACT-хуки, КФ-9)
+// культура сорта: сырая ссылка платформа показывает числовым id —
+// вычисляемым именем + пикером (pickCrop из KuCrop)
+FORM pickVariety 'Выбор сорта/гибрида'
+    OBJECTS pv = Variety
+    PROPERTIES (pv) READONLY varName, varCode, nameVarCrop, varGdd
+    ORDERS varName(pv)
+;
+setVarCropAct 'Выбрать культуру' (Variety v) {
+    DIALOG pickCrop OBJECTS pc = varCrop(v) INPUT pc NULL DO varCrop(v) <- pc;
+}
+FORM varieties 'Сорта/гибриды'
+    OBJECTS v = Variety
+    PROPERTIES (v) READONLY varCode, varName, varDescription, nameVarCrop, varGdd, varBiomassMax, varStressResist
+    PROPERTIES (v) NEWSESSION NEW, EDIT, DELETE
+    ORDERS varName(v)
+;
+DESIGN varieties {
+    // «Описание» рядом с «Наименования сорта» — но не на всю ширину списка
+    PROPERTY(varDescription(v)) { charWidth = 60; }
+    PROPERTY(varStressResist(v)) {
+        comment = '0 — неустойчив, 1 — максимально устойчив (ГСС)';
+    }
+}
+// карточка сорта: двойной клик по строке реестра открывает её на редактирование
+FORM variety 'Сорт/гибрид'
+    OBJECTS v = Variety PANEL
+    PROPERTIES (v) varCode, varName
+    PROPERTIES (v) READONLY nameVarCrop
+    PROPERTIES (v) setVarCropAct SHOWIF NOT varCrop(v)
+    PROPERTIES (v) varGdd, varBiomassMax, varStressResist
+    PROPERTIES (v) varDescription
+    EDIT Variety OBJECT v
+;
+DESIGN variety {
+    // П.2: описание — шире вправо
+    PROPERTY(varDescription(v)) { charWidth = 100; }
+    // П.2: расшифровка шкалы — серым под полем
+    PROPERTY(varStressResist(v)) {
+        comment = '0 — неустойчив к стресс-факторам, 1 — максимально устойчив (справочник ГСС); учитывается моделью в стрессовых сценариях';
+    }
+}
+DESIGN varieties {
+    // компактные ключевые колонки, «Описание» — во всю ширину
+    PROPERTY(nameVarCrop(v)) { charWidth = 18; }
+    PROPERTY(varCode(v)) { charWidth = 10; }
+    PROPERTY(varName(v)) { charWidth = 22; }
+    PROPERTY(varGdd(v)) { charWidth = 9; }
+    PROPERTY(varBiomassMax(v)) { charWidth = 9; }
+    PROPERTY(varStressResist(v)) { charWidth = 9; }
+    PROPERTY(varDescription(v)) { charWidth = 80; }
+}
+
+// сид сортов (перенесён из KuIntegration — КФ-9: класс в корне REQUIRE-цепочки,
+// чтобы на него ссылались KuYield и KuSimulation через общего предка)
+varietySeed () {
+    // миграция: демо-коды прототипа СРТ-00x → реальные номера Реестра ГСС
+    FOR Variety v IS Variety AND varCode(v) LIKE 'СРТ-%' DO DELETE v;
+    // реальные сорта из Реестра ГСС (офиц. изд. 2024, gossortrf.ru);
+    // код = реестровый номер сорта. САТ/биомасса — коэффициенты модели
+    // KuGDD (в реестре их нет): заданы только там, где уже калиброваны,
+    // остальные используют подстановку «сорт > культура» (effGdd)
+    IF NOT varByCode('9501070') THEN NEW v = Variety { varCode(v) <- '9501070'; varName(v) <- 'Московская 39'; varCrop(v) <- cropByCode('ЗЕР-001'); varGdd(v) <- 1150.0; varBiomassMax(v) <- 11.5; varStressResist(v) <- 0.7; varDescription(v) <- 'Реестр ГСС-2024: включён 1999, регионы 2,3,4,5,7,9, патент. Озимая мягкая пшеница, интенсивный тип'; }   // A5: varGdd 1150 = глобальный (календарь 1209)
+    IF NOT varByCode('9360103') THEN NEW v = Variety { varCode(v) <- '9360103'; varName(v) <- 'Гром'; varCrop(v) <- cropByCode('ЗЕР-001'); varGdd(v) <- 1550.0; varBiomassMax(v) <- 12.5; varStressResist(v) <- 0.6; varDescription(v) <- 'Реестр ГСС-2024: включён 2010, регионы 3,5,6,7,8, патент. Озимая мягкая пшеница'; }
+    IF NOT varByCode('9502637') THEN NEW v = Variety { varCode(v) <- '9502637'; varName(v) <- 'Виконт'; varCrop(v) <- cropByCode('ЗЕР-002'); varDescription(v) <- 'Реестр ГСС-2024: включён 1997, регион 6. Ячмень яровой'; }
+    IF NOT varByCode('8953852') THEN NEW v = Variety { varCode(v) <- '8953852'; varName(v) <- 'РОСС 130 МВ'; varCrop(v) <- cropByCode('ЗЕР-003'); varGdd(v) <- 1750.0; varBiomassMax(v) <- 16.0; varStressResist(v) <- 0.5; varDescription(v) <- 'Реестр ГСС-2024: включён 2014, регионы 4,7,9,10,11, патент. Кукуруза, раннеспелый гибрид'; }
+    IF NOT varByCode('8756187') THEN NEW v = Variety { varCode(v) <- '8756187'; varName(v) <- 'ЛГ 5377'; varCrop(v) <- cropByCode('ТЕХ-001'); varGdd(v) <- 1900.0; varBiomassMax(v) <- 14.0; varStressResist(v) <- 0.4; varDescription(v) <- 'Реестр ГСС-2024: включён 2015, регионы 8,10. Подсолнечник среднеспелый (Limagrain)'; }
+    IF NOT varByCode('8261472') THEN NEW v = Variety { varCode(v) <- '8261472'; varName(v) <- 'Селегор'; varCrop(v) <- cropByCode('ТЕХ-002'); varDescription(v) <- 'Реестр ГСС-2024: включён 2020, регионы 3,5,6, патент. Рапс озимый'; }
+    IF NOT varByCode('9810170') THEN NEW v = Variety { varCode(v) <- '9810170'; varName(v) <- 'Лидия'; varCrop(v) <- cropByCode('ЗЕР-004'); varDescription(v) <- 'Реестр ГСС-2024: включён 2005, регионы 11,12, патент. Соя'; }
+    IF NOT varByCode('9358801') THEN NEW v = Variety { varCode(v) <- '9358801'; varName(v) <- 'РМС 120'; varCrop(v) <- cropByCode('ТЕХ-003'); varDescription(v) <- 'Реестр ГСС-2024: включён 2008, регионы 5,6,9. Сахарная свёкла, гибрид'; }
+    IF NOT varByCode('9705642') THEN NEW v = Variety { varCode(v) <- '9705642'; varName(v) <- 'Гала'; varCrop(v) <- cropByCode('ОВО-001'); varDescription(v) <- 'Реестр ГСС-2024: включён 2008, регионы 2,3,4,7,8,9, патент. Картофель'; }
+    IF NOT varByCode('9810228') THEN NEW v = Variety { varCode(v) <- '9810228'; varName(v) <- 'Бычье сердце'; varCrop(v) <- cropByCode('ОВО-002'); varDescription(v) <- 'Реестр ГСС-2024: включён 2003, допуск по всем регионам (*). Томат'; }
+    IF NOT varByCode('8057361') THEN NEW v = Variety { varCode(v) <- '8057361'; varName(v) <- 'Батист'; varCrop(v) <- cropByCode('ЗЕР-005'); varDescription(v) <- 'Реестр ГСС-2024: включён 2023, регионы 1,4, патент. Рожь озимая'; }
+    IF NOT varByCode('8057632') THEN NEW v = Variety { varCode(v) <- '8057632'; varName(v) <- 'Азиль'; varCrop(v) <- cropByCode('ЗЕР-006'); varDescription(v) <- 'Реестр ГСС-2024: включён 2022, регионы 2,3,4,7,9, патент. Овёс яровой'; }
+    IF NOT varByCode('7853130') THEN NEW v = Variety { varCode(v) <- '7853130'; varName(v) <- 'Даная'; varCrop(v) <- cropByCode('ЗЕР-007'); varDescription(v) <- 'Реестр ГСС-2024: включён 2024, регионы 3,5,6,7,8,9, патент. Гречиха'; }
+    IF NOT varByCode('7853444') THEN NEW v = Variety { varCode(v) <- '7853444'; varName(v) <- 'Казачок'; varCrop(v) <- cropByCode('БОБ-001'); varDescription(v) <- 'Реестр ГСС-2024: включён 2024, регионы 3,4,5,6,7,9, патент. Горох посевной'; }
+    IF NOT varByCode('7853080') THEN NEW v = Variety { varCode(v) <- '7853080'; varName(v) <- 'Удалец'; varCrop(v) <- cropByCode('ТЕХ-004'); varDescription(v) <- 'Реестр ГСС-2024: включён 2024, регионы 2,3,4. Лён-долгунец'; }
+    IF NOT varByCode('7509413') THEN NEW v = Variety { varCode(v) <- '7509413'; varName(v) <- 'Родничок F1'; varCrop(v) <- cropByCode('ОВО-003'); varDescription(v) <- 'Реестр ГСС-2024: включён 1979, регионы 1,2,4,6,7,9. Огурец, классический консервный гибрид'; }
+    IF NOT varByCode('7953543') THEN NEW v = Variety { varCode(v) <- '7953543'; varName(v) <- 'Антиповка'; varCrop(v) <- cropByCode('ЗЕР-001'); varDescription(v) <- 'Реестр ГСС-2024: включён 2024, регионы 5,8, патент. Пшеница мягкая озимая'; }
+    IF NOT varByCode('7953500') THEN NEW v = Variety { varCode(v) <- '7953500'; varName(v) <- 'Дебют F1'; varCrop(v) <- cropByCode('ТЕХ-002'); varDescription(v) <- 'Реестр ГСС-2024: включён 2024, регионы 2,3,5,6. Рапс озимый, гибрид 00-типа (ВНИИМК)'; }
+    APPLY;
+    // Обогащение описаний полными характеристиками из офиц. издания
+    // «Характеристики сортов растений, впервые включённых в 2024 году в
+    // Госреестр» (gossortrf.ru, OCR-выписка). Идемпотентно: срабатывает один
+    // раз для описаний, начинающихся со стандартного префикса сида.
+    FOR Variety v IS Variety AND varDescription(v) LIKE 'Реестр ГСС-2024: включён%' DO {
+        IF varCode(v) = '7953543' THEN varDescription(v) <- 'Пшеница озимая Антиповка. Характеристики ГСС-2024: среднеспелая (274-296 дн), эритроспермум, родословная Дон 107 х Зустрич; урожайность ЦЧ 72,6 ц/га (прибавки +3,5…+11,4 к стандартам), НВ 47,5 ц/га; макс 100,6 ц/га (Липецкая обл., 2023); морозо-/зимостойкость повышенные, засухоустойчива; устойчива к твёрдой головне, умеренно восприимчива к бурой ржавчине. Реестр: 2024, регионы 5,8, патент';
+        ELSE IF varCode(v) = '7853130' THEN varDescription(v) <- 'Гречиха Даная. Характеристики ГСС-2024: среднеспелая (75-106 дн), диплоид, детерминантный рост, родословная Агидель х Д-13; урожайность по регионам 8,6-24,0 ц/га, в Уральском +3,2 к стандарту; макс 60,4 ц/га (Челябинская обл., 2023); полегание/осыпание/засуха выше средней; аскохитоз и фузариоз — слабое поражение. Реестр: 2024, регионы 3,5,6,7,8,9,10, патент';
+        ELSE IF varCode(v) = '7853444' THEN varDescription(v) <- 'Горох посевной Казачок. Характеристики ГСС-2024: среднеспелый (64-88 дн), безлисточковый, жёлтые семядоли; урожайность по регионам 16,7-36,2 ц/га (ВВолж 31,4, +2,4 к стандарту); макс 58,4 ц/га (Курская обл., 2022); белок до 29,8%, масса 1000 семян 188-290 г; высокоустойчив к полеганию и осыпанию; антракноз/аскохитоз — слабо. Реестр: 2024, регионы 3,4,5,6,7,9, патент';
+        ELSE IF varCode(v) = '7953500' THEN varDescription(v) <- 'Рапс озимый Дебют F1. Характеристики ГСС-2024: гибрид 00-типа (ВНИИМК), регионы 2,3,5,6; урожайность 15,3-48,6 ц/га, в Северо-Западном +8,2 к стандарту; макс 60,2 ц/га (Калининград, 2023); вегетация 273-325 дн; зимостойкость 2,7-5,0 балла; масса 1000 семян 4,3-5,3 г; жир 45,5-46,5%. Реестр: 2024';
+        ELSE IF varCode(v) = '7853080' THEN varDescription(v) <- 'Лён-долгунец Удалец. Характеристики ГСС-2024: среднеспелый (64-69 дн); льносолома 35,1-49,8 ц/га (регион 3: +6,1 к стандарту), семена 6,0-6,8 ц/га; всего волокна 27,1%, выход длинного 20,4%, номер 13,2; полегание 4,7-5 баллов; устойчив к фузариозному увяданию (2,3% на фоне) и ржавчине, среднеустойчив к пасмо. Реестр: 2024, регионы 2,3,4';
+        APPLY;
+    }
+}
+
+// ===================== Валидации =====================
+CONSTRAINT vegetationDays(Crop c) IS INTEGER AND vegetationDays(c) < 1 CHECKED BY vegetationDays MESSAGE 'Вегетация должна быть не меньше 1 дня';
+CONSTRAINT returnYears(Crop c) IS INTEGER AND returnYears(c) < 1 CHECKED BY returnYears MESSAGE 'Период возврата должен быть не меньше 1 года';
+CONSTRAINT targetYield(Crop c) IS NUMERIC AND targetYield(c) <= 0 CHECKED BY targetYield MESSAGE 'Целевая урожайность должна быть положительной';
+CONSTRAINT phMin(Crop c) > phMax(c) CHECKED BY phMax MESSAGE 'Мин. pH не может превышать максимальный';
+CONSTRAINT humusMin(Crop c) > humusMax(c) CHECKED BY humusMax MESSAGE 'Мин. гумус не может превышать максимальный';
+CONSTRAINT nMin(Crop c) > nMax(c) CHECKED BY nMax MESSAGE 'Мин. N не может превышать максимальный';
+CONSTRAINT pMin(Crop c) > pMax(c) CHECKED BY pMax MESSAGE 'Мин. P не может превышать максимальный';
+CONSTRAINT kMin(Crop c) > kMax(c) CHECKED BY kMax MESSAGE 'Мин. K не может превышать максимальный';
+CONSTRAINT moistMin(Crop c) > moistMax(c) CHECKED BY moistMax MESSAGE 'Мин. влажность не может превышать максимальную';
+CONSTRAINT tempMin(Crop c) > tempMax(c) CHECKED BY tempMax MESSAGE 'Мин. температура не может превышать максимальную';
+// ⚠ отклонение от 02/03-доков: само-табу и само-предшественник РАЗРЕШЕНЫ —
+// «подсолнечник нельзя после подсолнечника» и есть само-табу (период возврата);
+// «пшеница после пшеницы» при возврате 1 год — само-предшественник.
+CONSTRAINT CropPredecessor p IS CropPredecessor AND CropTaboo t IS CropTaboo
+    AND crop(p) = crop(t) AND predecessor(p) = taboo(t)
+    CHECKED BY taboo MESSAGE 'Культура уже входит в допустимые предшественники — уберите дубль из табу';
+
+// ===================== Формы =====================
+FORM crops 'Культуры'
+    OBJECTS c = Crop
+    PROPERTIES (c) READONLY name, code, registryCode, nameCropType, nameSeason, vegetationDays, targetYield, returnYears, climateZone, allowedAfter, status
+    PROPERTIES (c) NEWSESSION NEW, EDIT, DELETE
+    ORDERS name(c)
+;
+
+FORM cropCard 'Культура'
+    OBJECTS c = Crop PANEL
+    // объектные атрибуты — вычисляемыми именами (сырые ссылки платформа
+    // показывает числовым id); изменение — кнопками «Выбрать …» (пикеры)
+    PROPERTIES (c) name, code, registryCode, variety, nameCropType, nameSeason
+    PROPERTIES (c) setCropTypeAct SHOWIF NOT cropType(c), setSeasonAct SHOWIF NOT seasonKind(c)
+    PROPERTIES (c) vegetationDays, targetYield, returnYears
+    PROPERTIES (c) phMin, phMax, humusMin, humusMax, nMin, nMax, pMin, pMax, kMin, kMax, moistMin, moistMax, tempMin, tempMax
+    PROPERTIES (c) removalN, removalP, removalK
+    PROPERTIES (c) genGdd, genBiomassMax, genStressResist
+    PROPERTIES (c) source, actualized, gostLink, status
+    PROPERTIES (c) image, description, note
+    PROPERTIES (c) READONLY created, nameCreatedBy, updated
+
+    // атрибуты v2.0 — выбор из справочников (климат-зоны/стадии/стресс-пороги
+    // как текстовые поля climateZone/bbchStages/stressThresholds остаются в БД
+    // как legacy-маркеры сида, на форму не выводятся)
+    PROPERTIES (c) addBbchStageAct, addStressLimitAct, addRegionAct, openCropRulesAct
+
+    OBJECTS bs = CropBbchStage
+    PROPERTIES (bs) READONLY nameCbsStage
+    PROPERTIES (bs) DELETE   // буферизованно: вместе с добавленными здесь же строками
+    FILTERS cbsCrop(bs) = c
+    ORDERS bsCode(cbsStage(bs))
+
+    OBJECTS sl = CropStressLimit
+    PROPERTIES (sl) READONLY nameCslIndicator, nameCslSign
+    PROPERTIES (sl) cslValue
+    PROPERTIES (sl) DELETE
+    FILTERS cslCrop(sl) = c
+
+    OBJECTS rg = CropRegion
+    PROPERTIES (rg) READONLY nameCrRegion
+    PROPERTIES (rg) DELETE
+    FILTERS crCrop(rg) = c
+    ORDERS arCode(crRegion(rg))
+
+    EDIT Crop OBJECT c
+;
+
+DESIGN cropCard {
+    // парные окна «мин/макс» — в горизонтальных контейнерах, значения рядом
+    NEW soilWindows {
+        caption = 'Требования к почве и климату (мин / макс)';
+        NEW phPair { caption = 'pH'; horizontal = TRUE; MOVE PROPERTY(phMin(c)); MOVE PROPERTY(phMax(c)); }
+        NEW humusPair { caption = 'Гумус, %'; horizontal = TRUE; MOVE PROPERTY(humusMin(c)); MOVE PROPERTY(humusMax(c)); }
+        NEW nPair { caption = 'N, мг/кг'; horizontal = TRUE; MOVE PROPERTY(nMin(c)); MOVE PROPERTY(nMax(c)); }
+        NEW pPair { caption = 'P, мг/кг'; horizontal = TRUE; MOVE PROPERTY(pMin(c)); MOVE PROPERTY(pMax(c)); }
+        NEW kPair { caption = 'K, мг/кг'; horizontal = TRUE; MOVE PROPERTY(kMin(c)); MOVE PROPERTY(kMax(c)); }
+        NEW moistPair { caption = 'Влажность, %'; horizontal = TRUE; MOVE PROPERTY(moistMin(c)); MOVE PROPERTY(moistMax(c)); }
+        NEW tempPair { caption = 'Температура, °C'; horizontal = TRUE; MOVE PROPERTY(tempMin(c)); MOVE PROPERTY(tempMax(c)); }
+    }
+    NEW removalBox {
+        caption = 'Вынос элементов, кг/т';
+        horizontal = TRUE;
+        MOVE PROPERTY(removalN(c)); MOVE PROPERTY(removalP(c)); MOVE PROPERTY(removalK(c));
+    }
+    NEW genBox {
+        caption = 'Генетические коэффициенты модели';
+        horizontal = TRUE;
+        MOVE PROPERTY(genGdd(c)); MOVE PROPERTY(genBiomassMax(c)); MOVE PROPERTY(genStressResist(c));
+    }
+    NEW stages {
+        caption = 'Фенологические стадии (BBCH)';
+        MOVE BOX(bs);
+        MOVE PROPERTY(addBbchStageAct(c));
+    }
+    NEW limits {
+        caption = 'Пороговые значения стрессов';
+        MOVE BOX(sl);
+        MOVE PROPERTY(addStressLimitAct(c));
+    }
+    NEW regions {
+        caption = 'Регионы допуска (ГСС)';
+        MOVE BOX(rg);
+        MOVE PROPERTY(addRegionAct(c));
+    }
+    // внутренние авто-заголовки групп объектов дублируют внешние плашки — гасим;
+    // п. обзора 12.10(3-я порция): таблицы — на всю ширину карточки
+    BOX(bs) { caption = ''; alignment = STRETCH; }
+    BOX(sl) { caption = ''; alignment = STRETCH; }
+    BOX(rg) { caption = ''; alignment = STRETCH; }
+    // компактная серая подсказка у изображения (перенос по словам встроен)
+    PROPERTY(image(c)) { comment = 'PNG / JPEG / WebP, до 5 МБ'; }
+}
+
+// ===================== Формы справочников v2.0 =====================
+FORM bbchStages 'Фенологические стадии (BBCH)'
+    OBJECTS bs = BbchStage
+    PROPERTIES (bs) READONLY bsCode, name, bsSource, bsCultures
+    PROPERTIES (bs) NEWSESSION NEW, EDIT, DELETE
+    ORDERS bsCode(bs)
+;
+FORM bbchStage 'Фенологическая стадия'
+    OBJECTS bs = BbchStage PANEL
+    PROPERTIES (bs) bsCode, name, bsSource, bsDescription
+    // п.7 UI-обзора: культуры применения — таблицей (сводка bsCultures в реестре)
+    OBJECTS cbs = CropBbchStage
+    PROPERTIES (cbs) READONLY nameCbsCropStage
+    FILTERS cbsStage(cbs) = bs
+    EDIT BbchStage OBJECT bs
+;
+DESIGN bbchStage {
+    // источник и описание — на одной строке, описание шире вправо
+    NEW srcRow {
+        caption = '';
+        horizontal = TRUE;
+        MOVE PROPERTY(bsSource(bs));
+        MOVE PROPERTY(bsDescription(bs));
+    }
+    PROPERTY(bsSource(bs)) { charWidth = 40; }
+    PROPERTY(bsDescription(bs)) { charWidth = 90; }
+}
+
+// карточка связи «культура—стадия»: открывается двойным кликом по строке
+// в таблице стадий карточки культуры (иначе платформа показывает автоформу
+// с числовым id); все данные только для чтения
+nameBbsSource 'Источник' (CropBbchStage cs) = OVERRIDE bsSource(cbsStage(cs)), '';
+bsCulturesOfStage 'Культуры (применяется)' (CropBbchStage cs) = OVERRIDE bsCultures(cbsStage(cs)), '';
+FORM cbsInfo 'Стадия культуры'
+    OBJECTS cs = CropBbchStage PANEL
+    PROPERTIES (cs) READONLY nameCbsStage, nameCbsCropStage, nameBbsSource, bsCulturesOfStage
+    EDIT CropBbchStage OBJECT cs
+;
+
+FORM stressIndicators 'Показатели стресса'
+    OBJECTS si = StressIndicator
+    PROPERTIES (si) READONLY siCode, name, siUnit
+    PROPERTIES (si) NEWSESSION NEW, EDIT, DELETE
+    ORDERS siCode(si)
+;
+FORM stressIndicator 'Показатель стресса'
+    OBJECTS si = StressIndicator PANEL
+    PROPERTIES (si) siCode, name, siUnit, siDescription
+    EDIT StressIndicator OBJECT si
+;
+DESIGN stressIndicator {
+    PROPERTY(siDescription(si)) { charWidth = 100; }
+}
+
+FORM admissionRegions 'Регионы допуска (ГСС)'
+    OBJECTS ar = AdmissionRegion
+    PROPERTIES (ar) READONLY arCode, name, arSubjects
+    PROPERTIES (ar) NEWSESSION NEW, EDIT, DELETE
+    ORDERS arCode(ar)
+;
+DESIGN admissionRegions {
+    PROPERTY(arCode(ar)) { charWidth = 10; }
+    PROPERTY(name(ar)) { charWidth = 30; }
+    PROPERTY(arSubjects(ar)) { charWidth = 80; }
+}
+FORM admissionRegion 'Регион допуска'
+    OBJECTS ar = AdmissionRegion PANEL
+    PROPERTIES (ar) arCode, name
+    // состав региона — только чтение (сидируется; редактирование — БД/SQL)
+    OBJECTS s = SubjectRf
+    PROPERTIES (s) READONLY srName
+    FILTERS srRegion(s) = ar
+    ORDERS srName(s)
+    EDIT AdmissionRegion OBJECT ar
+;
+
+// карточка связи «культура—регион»: двойной клик по строке в таблице
+// «Регионы допуска» карточки культуры (вместо автоформы с числовым id)
+nameCrRegionSubjects 'Субъекты РФ' (CropRegion r) = OVERRIDE arSubjects(crRegion(r)), '';
+FORM crInfo 'Регион допуска культуры'
+    OBJECTS r = CropRegion PANEL
+    PROPERTIES (r) READONLY nameCrRegion, nameCbsCropRegion, nameCrRegionSubjects
+    EDIT CropRegion OBJECT r
+;
+DESIGN crInfo {
+    // список субъектов РФ длинный (до 82 строк ГСС) — без ширины обрезается
+    PROPERTY(nameCrRegionSubjects(r)) { charWidth = 100; }
+}
+
+// ===================== Сид (docs/03-logic-KuCrop.md §6) =====================
+// коды регионов допуска по культуре (реестр ГСС-2024; ОВО-002 — все регионы)
+cropRegionCodes (Crop c) =
+    IF code(c) = 'ЗЕР-001' THEN '2,3,4,5,7,9'
+    ELSE IF code(c) = 'ЗЕР-002' THEN '6'
+    ELSE IF code(c) = 'ЗЕР-003' THEN '4,7,9,10,11'
+    ELSE IF code(c) = 'ТЕХ-001' THEN '8,10'
+    ELSE IF code(c) = 'ТЕХ-002' THEN '3,5,6'
+    ELSE IF code(c) = 'ЗЕР-004' THEN '11,12'
+    ELSE IF code(c) = 'ТЕХ-003' THEN '5,6,9'
+    ELSE IF code(c) = 'ОВО-001' THEN '2,3,4,7,8,9'
+    ELSE IF code(c) = 'ОВО-002' THEN '1,2,3,4,5,6,7,8,9,10,11,12'
+    ELSE IF code(c) = 'ЗЕР-005' THEN '1,4'
+    ELSE IF code(c) = 'ЗЕР-006' THEN '2,3,4,7,9'
+    ELSE IF code(c) = 'ЗЕР-007' THEN '3,5,6,7,8,9,10'
+    ELSE IF code(c) = 'БОБ-001' THEN '3,4,5,6,7,9'
+    ELSE IF code(c) = 'ТЕХ-004' THEN '2,3,4'
+    ELSE IF code(c) = 'ОВО-003' THEN '1,2,4,6,7,9'
+    ELSE '';
+
+// КФ-А4: коды/группы типов стресса (сидируется после создания справочника)
+stressTypeCodesSeed () {
+    FOR StressType s IS StressType AND NOT stCode(s) DO {
+        IF stName(s) = 'Засуха' THEN { stCode(s) <- 'STRESS-WATER'; stGroup(s) <- 'Абиотические'; }
+        ELSE IF stName(s) = 'Заморозок' THEN { stCode(s) <- 'STRESS-COLD'; stGroup(s) <- 'Абиотические'; }
+        ELSE IF stName(s) = 'Дефицит азота' THEN { stCode(s) <- 'STRESS-NUTRITION'; stGroup(s) <- 'Абиотические'; }
+        ELSE IF stName(s) = 'Вредители' THEN { stCode(s) <- 'STRESS-PEST'; stGroup(s) <- 'Биотические'; }
+        ELSE IF stName(s) = 'Болезни' THEN { stCode(s) <- 'STRESS-DISEASE'; stGroup(s) <- 'Биотические'; }
+        ELSE IF stName(s) = 'Немоделируемый фактор' THEN { stCode(s) <- 'STRESS-UNMODELED'; stGroup(s) <- 'Немоделируемые'; }
+        ELSE { stCode(s) <- 'STRESS-' + (OVERRIDE ('' + (GROUP SUM 1 IF StressType x)), '0'); stGroup(s) <- 'Немоделируемые'; }
+    }
+    APPLY;
+}
+
+cropSeed () {
+    // создание идемпотентно по коду культуры — можно докладывать справочник
+    // на живую БД; агрономические константы (вынос NPK, pH-окна) — допущения
+    // прототипа (в реестре ГСС их нет), реестровые атрибуты актуализирует
+    // блок «актуализация по Реестру ГСС» ниже
+    IF NOT cropByCode('ЗЕР-001') THEN NEW c = Crop { code(c) <- 'ЗЕР-001'; registryCode(c) <- 'ГС-95001'; name(c) <- 'Пшеница озимая'; variety(c) <- 'Московская 39'; cropType(c) <- CropType.grain; seasonKind(c) <- SeasonKind.winter;
+            vegetationDays(c) <- 300; targetYield(c) <- 60.0; returnYears(c) <- 1;
+            phMin(c) <- 5.5; phMax(c) <- 7.5; nMin(c) <- 20.0; nMax(c) <- 40.0; removalN(c) <- 30.0; removalP(c) <- 12.0; removalK(c) <- 25.0; }
+    IF NOT cropByCode('ЗЕР-002') THEN NEW c = Crop { code(c) <- 'ЗЕР-002'; registryCode(c) <- 'ГС-95002'; name(c) <- 'Ячмень яровой'; variety(c) <- 'Виконт'; cropType(c) <- CropType.grain; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 100; targetYield(c) <- 50.0; returnYears(c) <- 1;
+            phMin(c) <- 5.5; phMax(c) <- 7.5; removalN(c) <- 25.0; removalP(c) <- 11.0; removalK(c) <- 22.0; }
+    IF NOT cropByCode('ЗЕР-003') THEN NEW c = Crop { code(c) <- 'ЗЕР-003'; registryCode(c) <- 'ГС-95003'; name(c) <- 'Кукуруза на зерно'; variety(c) <- 'РОСС 130 МВ'; cropType(c) <- CropType.grain; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 130; targetYield(c) <- 80.0; returnYears(c) <- 1;
+            phMin(c) <- 5.5; phMax(c) <- 7.5; removalN(c) <- 25.0; removalP(c) <- 10.0; removalK(c) <- 18.0; }
+    IF NOT cropByCode('ТЕХ-001') THEN NEW c = Crop { code(c) <- 'ТЕХ-001'; registryCode(c) <- 'ГС-95004'; name(c) <- 'Подсолнечник'; variety(c) <- 'ЛГ 5377'; cropType(c) <- CropType.industrial; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 125; targetYield(c) <- 25.0; returnYears(c) <- 4;
+            phMin(c) <- 6.0; phMax(c) <- 7.5; removalN(c) <- 35.0; removalP(c) <- 15.0; removalK(c) <- 40.0; }
+    IF NOT cropByCode('ТЕХ-002') THEN NEW c = Crop { code(c) <- 'ТЕХ-002'; registryCode(c) <- 'ГС-95005'; name(c) <- 'Рапс озимый'; variety(c) <- 'Селегор'; cropType(c) <- CropType.industrial; seasonKind(c) <- SeasonKind.winter;
+            vegetationDays(c) <- 300; targetYield(c) <- 30.0; returnYears(c) <- 3;
+            phMin(c) <- 6.0; phMax(c) <- 7.5; removalN(c) <- 40.0; removalP(c) <- 18.0; removalK(c) <- 35.0; }
+    IF NOT cropByCode('ЗЕР-004') THEN NEW c = Crop { code(c) <- 'ЗЕР-004'; registryCode(c) <- 'ГС-95006'; name(c) <- 'Соя'; variety(c) <- 'Лидия'; cropType(c) <- CropType.other; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 120; targetYield(c) <- 25.0; returnYears(c) <- 2;
+            phMin(c) <- 5.5; phMax(c) <- 7.0; removalN(c) <- 60.0; removalP(c) <- 15.0; removalK(c) <- 30.0; }
+    IF NOT cropByCode('ТЕХ-003') THEN NEW c = Crop { code(c) <- 'ТЕХ-003'; registryCode(c) <- 'ГС-95007'; name(c) <- 'Сахарная свёкла'; variety(c) <- 'РМС 120'; cropType(c) <- CropType.industrial; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 160; targetYield(c) <- 450.0; returnYears(c) <- 3;
+            phMin(c) <- 6.0; phMax(c) <- 7.5; removalN(c) <- 4.0; removalP(c) <- 1.5; removalK(c) <- 6.0; }
+    IF NOT cropByCode('ОВО-001') THEN NEW c = Crop { code(c) <- 'ОВО-001'; registryCode(c) <- 'ГС-95008'; name(c) <- 'Картофель'; variety(c) <- 'Гала'; cropType(c) <- CropType.vegetable; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 100; targetYield(c) <- 300.0; returnYears(c) <- 2;
+            phMin(c) <- 4.5; phMax(c) <- 7.0; removalN(c) <- 5.0; removalP(c) <- 2.0; removalK(c) <- 8.0; }
+    IF NOT cropByCode('ОВО-002') THEN NEW c = Crop { code(c) <- 'ОВО-002'; registryCode(c) <- 'ГС-95009'; name(c) <- 'Томат'; variety(c) <- 'Бычье сердце'; cropType(c) <- CropType.vegetable; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 115; targetYield(c) <- 600.0; returnYears(c) <- 2;
+            phMin(c) <- 5.5; phMax(c) <- 7.0; removalN(c) <- 3.0; removalP(c) <- 1.0; removalK(c) <- 5.0; }
+    // КФ-7: вынос N/P/K пару не задаётся (агротехнически не определён)
+    IF NOT cropByCode('ПАР-001') THEN NEW c = Crop { code(c) <- 'ПАР-001'; registryCode(c) <- 'ГС-00000'; name(c) <- 'Чистый пар'; variety(c) <- '—'; cropType(c) <- CropType.other; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 180; returnYears(c) <- 1; }
+    // расширение до 15 реестровых культур (Госсорткомиссия, офиц. изд. 2024)
+    IF NOT cropByCode('ЗЕР-005') THEN NEW c = Crop { code(c) <- 'ЗЕР-005'; registryCode(c) <- '8057361'; name(c) <- 'Рожь озимая'; variety(c) <- 'Батист'; cropType(c) <- CropType.grain; seasonKind(c) <- SeasonKind.winter;
+            vegetationDays(c) <- 320; targetYield(c) <- 40.0; returnYears(c) <- 1;
+            phMin(c) <- 5.0; phMax(c) <- 7.0; removalN(c) <- 25.0; removalP(c) <- 11.0; removalK(c) <- 22.0; }
+    IF NOT cropByCode('ЗЕР-006') THEN NEW c = Crop { code(c) <- 'ЗЕР-006'; registryCode(c) <- '8057632'; name(c) <- 'Овёс яровой'; variety(c) <- 'Азиль'; cropType(c) <- CropType.grain; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 105; targetYield(c) <- 45.0; returnYears(c) <- 1;
+            phMin(c) <- 5.0; phMax(c) <- 7.5; removalN(c) <- 30.0; removalP(c) <- 12.0; removalK(c) <- 28.0; }
+    IF NOT cropByCode('ЗЕР-007') THEN NEW c = Crop { code(c) <- 'ЗЕР-007'; registryCode(c) <- '7853130'; name(c) <- 'Гречиха'; variety(c) <- 'Даная'; cropType(c) <- CropType.grain; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 90; targetYield(c) <- 20.0; returnYears(c) <- 1;
+            phMin(c) <- 5.5; phMax(c) <- 7.0; removalN(c) <- 30.0; removalP(c) <- 15.0; removalK(c) <- 40.0; }
+    IF NOT cropByCode('БОБ-001') THEN NEW c = Crop { code(c) <- 'БОБ-001'; registryCode(c) <- '7853444'; name(c) <- 'Горох посевной'; variety(c) <- 'Казачок'; cropType(c) <- CropType.grain; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 76; targetYield(c) <- 30.0; returnYears(c) <- 1;
+            phMin(c) <- 5.5; phMax(c) <- 7.5; removalN(c) <- 25.0; removalP(c) <- 14.0; removalK(c) <- 28.0; }
+    IF NOT cropByCode('ТЕХ-004') THEN NEW c = Crop { code(c) <- 'ТЕХ-004'; registryCode(c) <- '7853080'; name(c) <- 'Лён-долгунец'; variety(c) <- 'Удалец'; cropType(c) <- CropType.industrial; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 67; targetYield(c) <- 45.0; returnYears(c) <- 5;
+            phMin(c) <- 5.5; phMax(c) <- 6.5; removalN(c) <- 35.0; removalP(c) <- 15.0; removalK(c) <- 45.0; }
+    IF NOT cropByCode('ОВО-003') THEN NEW c = Crop { code(c) <- 'ОВО-003'; registryCode(c) <- '7509413'; name(c) <- 'Огурец'; variety(c) <- 'Родничок F1'; cropType(c) <- CropType.vegetable; seasonKind(c) <- SeasonKind.spring;
+            vegetationDays(c) <- 70; targetYield(c) <- 400.0; returnYears(c) <- 3;
+            phMin(c) <- 5.5; phMax(c) <- 7.0; removalN(c) <- 3.0; removalP(c) <- 1.0; removalK(c) <- 4.0; }
+    APPLY;
+    // дозаполнение атрибутов v2.0 (идемпотентно — только пустые поля)
+    FOR Crop c IS Crop AND NOT climateZone(c) DO {
+        climateZone(c) <- IF code(c) = 'ЗЕР-001' OR code(c) = 'ЗЕР-003' OR code(c) = 'ЗЕР-004' THEN 'Северокавказский, Центрально-Чернозёмный'
+            ELSE IF code(c) = 'ТЕХ-001' OR code(c) = 'ТЕХ-002' OR code(c) = 'ТЕХ-003' THEN 'Северокавказский, Поволжский'
+            ELSE IF code(c) = 'ОВО-001' OR code(c) = 'ОВО-002' THEN 'Центральный, Южный'
+            ELSE '—';
+        bbchStages(c) <- '10 всходы → 30 кущение/ветвление → 59 колошение/бутонизация → 73 цветение → 89 полная спелость';
+        stressThresholds(c) <- 'NDVI: отклонение от эталона −15% (обнаружение), −35% (критично); дефицит влаги: осадки < 20 мм за декаду в критическую фазу';
+        genGdd(c) <- IF cropType(c) = CropType.grain THEN 1500.0 ELSE IF cropType(c) = CropType.industrial THEN 1800.0 ELSE 1600.0;
+        genBiomassMax(c) <- IF cropType(c) = CropType.grain THEN 12.0 ELSE IF cropType(c) = CropType.industrial THEN 16.0 ELSE 10.0;
+        genStressResist(c) <- 0.6;
+        APPLY;
+    }
+    // Актуализация по Государственному реестру селекционных достижений
+    // (ФГБУ «Госсорткомиссия», официальное издание 2024 г., gossortrf.ru,
+    // том 1 «Сорта растений», состояние на 31.05.2024): реестровый номер
+    // опорного сорта, год включения, регионы допуска, наличие патента.
+    // Идемпотентно по actualized — применяется один раз к каждой культуре.
+    FOR Crop c IS Crop AND NOT actualized(c) DO {
+        IF code(c) = 'ЗЕР-001' THEN { variety(c) <- 'Московская 39'; registryCode(c) <- '9501070';
+            climateZone(c) <- 'Регионы допуска: 2, 3, 4, 5, 7, 9';
+            note(c) <- 'Реестр ГСС-2024 (Пшеница мягкая озимая, Triticum aestivum L.): сорт включён в 1999 г., патент, регионы 2,3,4,5,7,9 (СЗ, Центральный, ВВ, ЦЧ, СКав, Уральский)'; }
+        ELSE IF code(c) = 'ЗЕР-002' THEN { variety(c) <- 'Виконт'; registryCode(c) <- '9502637';
+            climateZone(c) <- 'Регионы допуска: 6';
+            note(c) <- 'Реестр ГСС-2024 (Ячмень яровой, Hordeum vulgare L.): включён в 1997 г., регион 6 (СКав)'; }
+        ELSE IF code(c) = 'ЗЕР-003' THEN { variety(c) <- 'РОСС 130 МВ'; registryCode(c) <- '8953852';
+            climateZone(c) <- 'Регионы допуска: 4, 7, 9, 10, 11';
+            note(c) <- 'Реестр ГСС-2024 (Кукуруза, Zea mays L.): гибрид включён в 2014 г., патент, регионы 4,7,9,10,11. Ранее сидированный РОСС 299 СВ в реестре отсутствует'; }
+        ELSE IF code(c) = 'ТЕХ-001' THEN { variety(c) <- 'ЛГ 5377'; registryCode(c) <- '8756187';
+            climateZone(c) <- 'Регионы допуска: 8, 10';
+            note(c) <- 'Реестр ГСС-2024 (Подсолнечник, Helianthus annuus L.): гибрид включён в 2015 г., регионы 8,10 (НВ, ЗС). Ранее сидированные ЛГ 5582 и ЕР 425 в реестре отсутствуют'; }
+        ELSE IF code(c) = 'ТЕХ-002' THEN { variety(c) <- 'Селегор'; registryCode(c) <- '8261472';
+            climateZone(c) <- 'Регионы допуска: 3, 5, 6';
+            note(c) <- 'Реестр ГСС-2024 (Рапс озимый, Brassica napus var. napus L.): сорт включён в 2020 г., патент, регионы 3,5,6. Ранее сидированный Ратник в реестре озимого рапса отсутствует'; }
+        ELSE IF code(c) = 'ЗЕР-004' THEN { variety(c) <- 'Лидия'; registryCode(c) <- '9810170';
+            climateZone(c) <- 'Регионы допуска: 11, 12';
+            note(c) <- 'Реестр ГСС-2024 (Соя, Glycine max (L.) Merr.): включён в 2005 г., патент, регионы 11,12 (ВС, ДВ)'; }
+        ELSE IF code(c) = 'ТЕХ-003' THEN { variety(c) <- 'РМС 120'; registryCode(c) <- '9358801';
+            climateZone(c) <- 'Регионы допуска: 5, 6, 9';
+            note(c) <- 'Реестр ГСС-2024 (Свекла сахарная, Beta vulgaris var. saccharifera): гибрид включён в 2008 г., регионы 5,6,9'; }
+        ELSE IF code(c) = 'ОВО-001' THEN { variety(c) <- 'Гала'; registryCode(c) <- '9705642';
+            climateZone(c) <- 'Регионы допуска: 2, 3, 4, 7, 8, 9';
+            note(c) <- 'Реестр ГСС-2024 (Картофель, Solanum tuberosum L.): включён в 2008 г., патент, регионы 2,3,4,7,8,9'; }
+        ELSE IF code(c) = 'ОВО-002' THEN { variety(c) <- 'Бычье сердце'; registryCode(c) <- '9810228';
+            climateZone(c) <- 'Регионы допуска: * (все регионы)';
+            note(c) <- 'Реестр ГСС-2024 (Томат, Solanum lycopersicum L. var. lycopersicum): включён в 2003 г., допуск по всем регионам (*) для садово-огородного использования'; }
+        ELSE IF code(c) = 'ЗЕР-005' THEN { variety(c) <- 'Батист'; registryCode(c) <- '8057361';
+            climateZone(c) <- 'Регионы допуска: 1, 4';
+            note(c) <- 'Реестр ГСС-2024 (Рожь озимая, Secale cereale L.): включён в 2023 г., патент, регионы 1,4 (Северный, ВВ)'; }
+        ELSE IF code(c) = 'ЗЕР-006' THEN { variety(c) <- 'Азиль'; registryCode(c) <- '8057632';
+            climateZone(c) <- 'Регионы допуска: 2, 3, 4, 7, 9';
+            note(c) <- 'Реестр ГСС-2024 (Овес яровой, Avena sativa L.): включён в 2022 г., патент, регионы 2,3,4,7,9'; }
+        ELSE IF code(c) = 'ЗЕР-007' THEN { variety(c) <- 'Даная'; registryCode(c) <- '7853130';
+            climateZone(c) <- 'Регионы допуска: 3, 5, 6, 7, 8, 9';
+            note(c) <- 'Реестр ГСС-2024 (Гречиха, Fagopyrum esculentum Moench): включён в 2024 г., патент, регионы 3,5,6,7,8,9'; }
+        ELSE IF code(c) = 'БОБ-001' THEN { variety(c) <- 'Казачок'; registryCode(c) <- '7853444';
+            climateZone(c) <- 'Регионы допуска: 3, 4, 5, 6, 7, 9';
+            note(c) <- 'Реестр ГСС-2024 (Горох посевной, Pisum sativum L.): включён в 2024 г., патент, регионы 3,4,5,6,7,9'; }
+        ELSE IF code(c) = 'ТЕХ-004' THEN { variety(c) <- 'Удалец'; registryCode(c) <- '7853080';
+            climateZone(c) <- 'Регионы допуска: 2, 3, 4';
+            note(c) <- 'Реестр ГСС-2024 (Лен-долгунец, Linum usitatissimum L. f. elongata): включён в 2024 г., регионы 2,3,4'; }
+        ELSE IF code(c) = 'ОВО-003' THEN { variety(c) <- 'Родничок F1'; registryCode(c) <- '7509413';
+            climateZone(c) <- 'Регионы допуска: 1, 2, 4, 6, 7, 9';
+            note(c) <- 'Реестр ГСС-2024 (Огурец, Cucumis sativus L.): гибрид включён в 1979 г., регионы 1,2,4,6,7,9'; }
+        ELSE { note(c) <- 'Агротехнический приём, в реестре селекционных достижений не числится'; }
+        source(c) <- 'Реестр селекционных достижений ГСС (офиц. изд. 2024), gossortrf.ru';
+        actualized(c) <- currentDate();
+        APPLY;
+    }
+    // Уточнения из офиц. издания «Характеристики сортов растений, впервые
+    // включённых в 2024 году в Госреестр» (gossortrf.ru, OCR-выписка):
+    // вегетационный период и урожайность по данным ГСИ. Идемпотентно по
+    // маркеру «Характеристики ГСС-2024» в примечании.
+    FOR Crop c IS Crop AND note(c) LIKE 'Реестр ГСС-2024%'
+        AND NOT note(c) LIKE '%Характеристики ГСС-2024%' DO {
+        IF code(c) = 'ЗЕР-001' THEN
+            note(c) <- note(c) + '. Характеристики ГСС-2024 (Антиповка, 7953543): вегетация 274-296 дн, средняя урожайность ЦЧ 72,6 ц/га (макс 100,6, Липецкая обл.), НВ 47,5 ц/га; морозо-/зимостойкость повышенные, засухоустойчива, устойчива к твёрдой головне';
+        ELSE IF code(c) = 'ЗЕР-007' THEN {
+            climateZone(c) <- 'Регионы допуска: 3, 5, 6, 7, 8, 9, 10';
+            note(c) <- note(c) + '. Характеристики ГСС-2024 (Даная): регионы 3,5,6,7,8,9,10; вегетация 75-106 дн, урожайность по регионам 8,6-24,0 ц/га (в Уральском +3,2 к стандарту; макс 60,4, Челябинская обл.), качество ценное, полегание/осыпание/засуха выше средней'; }
+        ELSE IF code(c) = 'БОБ-001' THEN
+            note(c) <- note(c) + '. Характеристики ГСС-2024 (Казачок): вегетация 64-88 дн, урожайность по регионам 16,7-36,2 ц/га (ВВолж 31,4 +2,4; макс 58,4, Курская обл.), белок до 29,8%, безлисточковый тип, высокоустойчив к полеганию';
+        ELSE IF code(c) = 'ТЕХ-002' THEN
+            note(c) <- note(c) + '. Характеристики ГСС-2024 (Дебют F1, 7953500, регионы 2,3,5,6): вегетация 273-325 дн, урожайность 15,3-48,6 ц/га (Северо-Запад +8,2 к стандарту; макс 60,2, Калининград), зимостойкость 2,7-5,0 балла, жир 45,5-46,5%';
+        ELSE IF code(c) = 'ТЕХ-004' THEN
+            note(c) <- note(c) + '. Характеристики ГСС-2024 (Удалец): вегетация 64-69 дн, льносолома 35,1-49,8 ц/га (рег.3 +6,1 к стандарту), семена 6,0-6,8 ц/га, всего волокна 27,1%, устойчив к фузариозному увяданию и ржавчине';
+        ELSE note(c) <- note(c) + '. Характеристики ГСС-2024: полные данные издания отсутствуют (сорт включён до 2024 г.)';
+        // вегетация/урожайность по выверенным данным ГСИ (свежая БД получает их при создании)
+        IF code(c) = 'БОБ-001' AND vegetationDays(c) = 95 THEN vegetationDays(c) <- 76;
+        IF code(c) = 'ТЕХ-004' AND vegetationDays(c) = 90 THEN vegetationDays(c) <- 67;
+        IF code(c) = 'ТЕХ-004' AND targetYield(c) = 40.0 THEN targetYield(c) <- 45.0;
+        APPLY;
+    }
+    // правила: паслёновые — взаимное табу; подсолнечник/рапс — самозапрет
+    IF NOT (GROUP MAX CropTaboo t) THEN {
+        FOR code(Crop c) = 'ОВО-001' DO
+            NEW t = CropTaboo { crop(t) <- c; taboo(t) <- cropByCode('ОВО-002'); }
+        FOR code(Crop c) = 'ОВО-002' DO
+            NEW t = CropTaboo { crop(t) <- c; taboo(t) <- cropByCode('ОВО-001'); }
+        FOR code(Crop c) = 'ТЕХ-001' DO {
+            NEW t = CropTaboo { crop(t) <- c; taboo(t) <- cropByCode('ТЕХ-001'); }
+            NEW t = CropTaboo { crop(t) <- c; taboo(t) <- cropByCode('ТЕХ-002'); }
+        }
+        FOR code(Crop c) = 'ТЕХ-002' DO
+            NEW t = CropTaboo { crop(t) <- c; taboo(t) <- cropByCode('ТЕХ-002'); }
+        APPLY;
+    }
+    // допустимые предшественники пшеницы (томата в списке нет — демонстрация warning)
+    IF NOT (GROUP MAX CropPredecessor p) THEN {
+        FOR code(Crop c) = 'ЗЕР-001' DO
+            FOR pc IS Crop AND (code(pc) = 'ПАР-001' OR code(pc) = 'ЗЕР-003' OR code(pc) = 'ТЕХ-001' OR code(pc) = 'ТЕХ-002' OR code(pc) = 'ЗЕР-004' OR code(pc) = 'ТЕХ-003' OR code(pc) = 'ОВО-001') DO
+                NEW p = CropPredecessor { crop(p) <- c; predecessor(p) <- pc; }
+        APPLY;
+    }
+    // КФ-7: пар — допустимый предшественник остальных зерновых (спека 09.10;
+    // guard по ячменю — сработает только на чистой БД)
+    IF NOT (GROUP MAX CropPredecessor p2 IF code(crop(p2)) = 'ЗЕР-002' AND code(predecessor(p2)) = 'ПАР-001') THEN {
+        FOR Crop c IS Crop AND (code(c) = 'ЗЕР-002' OR code(c) = 'ЗЕР-005' OR code(c) = 'ЗЕР-006' OR code(c) = 'ЗЕР-007') DO
+            FOR pc IS Crop AND code(pc) = 'ПАР-001' DO
+                NEW p3 = CropPredecessor { crop(p3) <- c; predecessor(p3) <- pc; }
+        APPLY;
+    }
+    // описания культур (наполнение поля «Описание» — агрономическая справка)
+    FOR Crop c IS Crop AND NOT description(c) DO
+        description(c) <- IF code(c) = 'ЗЕР-001' THEN 'Основная зерновая культура озимого сева: высокие требования к предшественникам, отзывчивость на азотные подкормки; сев осенью, уборка в июле.'
+            ELSE IF code(c) = 'ЗЕР-002' THEN 'Раннеспелая яровая зерновая культура фуражного назначения: короткая вегетация, хорошая приспособленность к засушливым условиям.'
+            ELSE IF code(c) = 'ЗЕР-003' THEN 'Теплолюбивая культура с высоким потенциалом урожайности: сев при прогреве почвы до +12°C, чувствительна к весенним заморозкам.'
+            ELSE IF code(c) = 'ТЕХ-001' THEN 'Основная масличная культура: мощная корневая система и высокое потребление влаги, сильно истощает почву — строгий период возврата от 4 лет.'
+            ELSE IF code(c) = 'ТЕХ-002' THEN 'Масличная культура озимого сева: хороший предшественник для зерновых; требует защиты от крестоцветных блошек и слизистого пискунца.'
+            ELSE IF code(c) = 'ЗЕР-004' THEN 'Основная белково-масличная бобовая культура: азотфиксация 60–100 кг/га, чувствительна к засухе в период налива бобов.'
+            ELSE IF code(c) = 'ТЕХ-003' THEN 'Культура интенсивного типа с длительной вегетацией: высокие требования к обеспеченности влагой и калийному питанию.'
+            ELSE IF code(c) = 'ОВО-001' THEN 'Важнейшая овощная культура: требует рыхлых почв и окучивания, чувствительна к фитофторозу; уборка по мере созревания клубней.'
+            ELSE IF code(c) = 'ОВО-002' THEN 'Теплолюбивая овощная культура: в северных регионах — рассадный способ, пасынкование и защита от фитофтороза обязательны.'
+            ELSE IF code(c) = 'ПАР-001' THEN 'Агротехнический приём: поле без посева в течение сезона — накопление влаги, чистота от сорняков, восстановление плодородия.'
+            ELSE IF code(c) = 'ЗЕР-005' THEN 'Неприхотливая озимая зерновая культура: выдерживает кислые и лёгкие почвы; перекрёстноопыляемая.'
+            ELSE IF code(c) = 'ЗЕР-006' THEN 'Зернофуражная культура: нетребовательна к почвам, хороший предшественник; чувствительна к засухе в период налива.'
+            ELSE IF code(c) = 'ЗЕР-007' THEN 'Крупяная культура с короткой вегетацией: медонос; плохо переносит жару в цветение, зерно легко осыпается.'
+            ELSE IF code(c) = 'БОБ-001' THEN 'Зернобобовая культура: азотфиксатор и ценный предшественник; полегающая — нужны устойчивые сорта или десикация перед уборкой.'
+            ELSE IF code(c) = 'ТЕХ-004' THEN 'Волокнистая культура с короткой вегетацией: высокая потребность во влаге в «льняной» период, чувствительна к пестицидному фону.'
+            ELSE IF code(c) = 'ОВО-003' THEN 'Теплолюбивая овощная культура: защита от заморозков, регулярные сборы плодов; чувствительна к корневым гнилям.'
+            ELSE '';
+    APPLY;
+    // ===================== справочники v2.0 (выбор вместо текста) =====================
+    IF NOT (GROUP MAX BbchStage bs) THEN {
+        NEW bs = BbchStage { bsCode(bs) <- '10'; name(bs) <- 'Всходы'; bsDescription(bs) <- 'BBCH 10: появление всходов'; }
+        NEW bs = BbchStage { bsCode(bs) <- '30'; name(bs) <- 'Кущение / ветвление'; bsDescription(bs) <- 'BBCH 30'; }
+        NEW bs = BbchStage { bsCode(bs) <- '39'; name(bs) <- 'Конец кущения / рост стебля'; bsDescription(bs) <- 'BBCH 39'; }
+        NEW bs = BbchStage { bsCode(bs) <- '59'; name(bs) <- 'Колошение / бутонизация'; bsDescription(bs) <- 'BBCH 59'; }
+        NEW bs = BbchStage { bsCode(bs) <- '61'; name(bs) <- 'Начало цветения'; bsDescription(bs) <- 'BBCH 61'; }
+        NEW bs = BbchStage { bsCode(bs) <- '73'; name(bs) <- 'Цветение'; bsDescription(bs) <- 'BBCH 73'; }
+        NEW bs = BbchStage { bsCode(bs) <- '83'; name(bs) <- 'Восковая спелость'; bsDescription(bs) <- 'BBCH 83'; }
+        NEW bs = BbchStage { bsCode(bs) <- '89'; name(bs) <- 'Полная спелость'; bsDescription(bs) <- 'BBCH 89'; }
+        APPLY;
+    }
+    // источник справочника стадий (миграция существующих; идемпотентно)
+    FOR BbchStage bs IS BbchStage AND NOT bsSource(bs) DO
+        bsSource(bs) <- 'Шкала BBCH (Meier et al., 2001; ФАО/ГСС)';
+    IF NOT (GROUP MAX StressIndicator si) THEN {
+        NEW si = StressIndicator { siCode(si) <- 'NDVI_DEV'; name(si) <- 'Отклонение NDVI от эталона (обнаружение)'; siUnit(si) <- '%'; siDescription(si) <- 'Модуль отклонения фактического NDVI от эталонного прогноза: больше порога — вероятен стресс'; }
+        NEW si = StressIndicator { siCode(si) <- 'NDVI_CRIT'; name(si) <- 'Отклонение NDVI от эталона (критично)'; siUnit(si) <- '%'; siDescription(si) <- 'Превышение критического порога — гибель части урожая без вмешательства'; }
+        NEW si = StressIndicator { siCode(si) <- 'PRECIP10'; name(si) <- 'Осадки за декаду в критическую фазу'; siUnit(si) <- 'мм'; siDescription(si) <- 'Сумма осадков за декаду: меньше порога — водный стресс'; }
+        APPLY;
+    }
+    // КФ-С2/С4 (11.10): показатели датчика влажности и скаутинга — идемпотентно
+    IF NOT siByCode('SOIL_MOIST') THEN NEW si = StressIndicator { siCode(si) <- 'SOIL_MOIST'; name(si) <- 'Влажность почвы (датчик)'; siUnit(si) <- '%'; siDescription(si) <- 'Показание датчика KU-SOL ниже порога — водный стресс; порог единый для культур (⚠-допущение ADR-6)'; }
+    IF NOT siByCode('SCOUT_ALERT') THEN NEW si = StressIndicator { siCode(si) <- 'SCOUT_ALERT'; name(si) <- 'Полевое наблюдение (скаутинг)'; siUnit(si) <- ''; siDescription(si) <- 'Бинарный показатель: наблюдение скаута с типом «стресс»; гипотезу типа задаёт наблюдение'; }
+    APPLY;
+    // КФ-С5: маппинг «показатель → гипотеза» (NDVI_*/SCOUT_ALERT — без умолчания)
+    FOR StressIndicator si IS StressIndicator AND siCode(si) = 'PRECIP10' AND NOT siStressType(si) DO
+        siStressType(si) <- stressByName('Засуха');
+    FOR StressIndicator si IS StressIndicator AND siCode(si) = 'SOIL_MOIST' AND NOT siStressType(si) DO
+        siStressType(si) <- stressByName('Засуха');
+    APPLY;
+    // КФ-С2: порог влажности <15% для культур без него (⚠-допущение ADR-6)
+    FOR Crop c IS Crop AND NOT cslByCropIndicator(c, siByCode('SOIL_MOIST'))
+        AND c != cropByCode('ПАР-001')
+    DO
+        NEW l = CropStressLimit { cslCrop(l) <- c; cslIndicator(l) <- siByCode('SOIL_MOIST'); cslSign(l) <- LimitSign.atMost; cslValue(l) <- 15.0; }
+    APPLY;
+    IF NOT (GROUP MAX AdmissionRegion ar) THEN {
+        NEW ar = AdmissionRegion { arCode(ar) <- 1; name(ar) <- 'Северный'; }
+        NEW ar = AdmissionRegion { arCode(ar) <- 2; name(ar) <- 'Северо-Западный'; }
+        NEW ar = AdmissionRegion { arCode(ar) <- 3; name(ar) <- 'Центральный'; }
+        NEW ar = AdmissionRegion { arCode(ar) <- 4; name(ar) <- 'Волго-Вятский'; }
+        NEW ar = AdmissionRegion { arCode(ar) <- 5; name(ar) <- 'Центрально-Чернозёмный'; }
+        NEW ar = AdmissionRegion { arCode(ar) <- 6; name(ar) <- 'Северо-Кавказский'; }
+        NEW ar = AdmissionRegion { arCode(ar) <- 7; name(ar) <- 'Средневолжский'; }
+        NEW ar = AdmissionRegion { arCode(ar) <- 8; name(ar) <- 'Нижневолжский'; }
+        NEW ar = AdmissionRegion { arCode(ar) <- 9; name(ar) <- 'Уральский'; }
+        NEW ar = AdmissionRegion { arCode(ar) <- 10; name(ar) <- 'Западно-Сибирский'; }
+        NEW ar = AdmissionRegion { arCode(ar) <- 11; name(ar) <- 'Восточно-Сибирский'; }
+        NEW ar = AdmissionRegion { arCode(ar) <- 12; name(ar) <- 'Дальневосточный'; }
+        APPLY;
+    }
+    IF NOT (GROUP MAX SubjectRf s) THEN {
+        NEW s = SubjectRf { srName(s) <- 'Республика Карелия'; srRegion(s) <- arByCode(1); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Коми'; srRegion(s) <- arByCode(1); }
+        NEW s = SubjectRf { srName(s) <- 'Архангельская область'; srRegion(s) <- arByCode(1); }
+        NEW s = SubjectRf { srName(s) <- 'Ненецкий автономный округ'; srRegion(s) <- arByCode(1); }
+        NEW s = SubjectRf { srName(s) <- 'Мурманская область'; srRegion(s) <- arByCode(1); }
+        NEW s = SubjectRf { srName(s) <- 'Вологодская область'; srRegion(s) <- arByCode(2); }
+        NEW s = SubjectRf { srName(s) <- 'Калининградская область'; srRegion(s) <- arByCode(2); }
+        NEW s = SubjectRf { srName(s) <- 'Ленинградская область'; srRegion(s) <- arByCode(2); }
+        NEW s = SubjectRf { srName(s) <- 'Новгородская область'; srRegion(s) <- arByCode(2); }
+        NEW s = SubjectRf { srName(s) <- 'Псковская область'; srRegion(s) <- arByCode(2); }
+        NEW s = SubjectRf { srName(s) <- 'Санкт-Петербург'; srRegion(s) <- arByCode(2); }
+        NEW s = SubjectRf { srName(s) <- 'Брянская область'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Владимирская область'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Ивановская область'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Калужская область'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Костромская область'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Москва'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Московская область'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Орловская область'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Рязанская область'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Смоленская область'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Тверская область'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Тульская область'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Ярославская область'; srRegion(s) <- arByCode(3); }
+        NEW s = SubjectRf { srName(s) <- 'Кировская область'; srRegion(s) <- arByCode(4); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Марий Эл'; srRegion(s) <- arByCode(4); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Мордовия'; srRegion(s) <- arByCode(4); }
+        NEW s = SubjectRf { srName(s) <- 'Нижегородская область'; srRegion(s) <- arByCode(4); }
+        NEW s = SubjectRf { srName(s) <- 'Чувашская Республика'; srRegion(s) <- arByCode(4); }
+        NEW s = SubjectRf { srName(s) <- 'Белгородская область'; srRegion(s) <- arByCode(5); }
+        NEW s = SubjectRf { srName(s) <- 'Воронежская область'; srRegion(s) <- arByCode(5); }
+        NEW s = SubjectRf { srName(s) <- 'Курская область'; srRegion(s) <- arByCode(5); }
+        NEW s = SubjectRf { srName(s) <- 'Липецкая область'; srRegion(s) <- arByCode(5); }
+        NEW s = SubjectRf { srName(s) <- 'Тамбовская область'; srRegion(s) <- arByCode(5); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Адыгея'; srRegion(s) <- arByCode(6); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Дагестан'; srRegion(s) <- arByCode(6); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Ингушетия'; srRegion(s) <- arByCode(6); }
+        NEW s = SubjectRf { srName(s) <- 'Кабардино-Балкарская Республика'; srRegion(s) <- arByCode(6); }
+        NEW s = SubjectRf { srName(s) <- 'Калмыцкая Республика'; srRegion(s) <- arByCode(6); }
+        NEW s = SubjectRf { srName(s) <- 'Карачаево-Черкесская Республика'; srRegion(s) <- arByCode(6); }
+        NEW s = SubjectRf { srName(s) <- 'Краснодарский край'; srRegion(s) <- arByCode(6); }
+        NEW s = SubjectRf { srName(s) <- 'Ростовская область'; srRegion(s) <- arByCode(6); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Северная Осетия — Алания'; srRegion(s) <- arByCode(6); }
+        NEW s = SubjectRf { srName(s) <- 'Ставропольский край'; srRegion(s) <- arByCode(6); }
+        NEW s = SubjectRf { srName(s) <- 'Чеченская Республика'; srRegion(s) <- arByCode(6); }
+        NEW s = SubjectRf { srName(s) <- 'Пермский край'; srRegion(s) <- arByCode(7); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Башкортостан'; srRegion(s) <- arByCode(7); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Удмуртия'; srRegion(s) <- arByCode(7); }
+        NEW s = SubjectRf { srName(s) <- 'Самарская область'; srRegion(s) <- arByCode(7); }
+        NEW s = SubjectRf { srName(s) <- 'Саратовская область'; srRegion(s) <- arByCode(7); }
+        NEW s = SubjectRf { srName(s) <- 'Ульяновская область'; srRegion(s) <- arByCode(7); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Татарстан'; srRegion(s) <- arByCode(7); }
+        NEW s = SubjectRf { srName(s) <- 'Астраханская область'; srRegion(s) <- arByCode(8); }
+        NEW s = SubjectRf { srName(s) <- 'Волгоградская область'; srRegion(s) <- arByCode(8); }
+        NEW s = SubjectRf { srName(s) <- 'Оренбургская область'; srRegion(s) <- arByCode(8); }
+        NEW s = SubjectRf { srName(s) <- 'Курганская область'; srRegion(s) <- arByCode(9); }
+        NEW s = SubjectRf { srName(s) <- 'Свердловская область'; srRegion(s) <- arByCode(9); }
+        NEW s = SubjectRf { srName(s) <- 'Тюменская область'; srRegion(s) <- arByCode(9); }
+        NEW s = SubjectRf { srName(s) <- 'Ханты-Мансийский автономный округ — Югра'; srRegion(s) <- arByCode(9); }
+        NEW s = SubjectRf { srName(s) <- 'Челябинская область'; srRegion(s) <- arByCode(9); }
+        NEW s = SubjectRf { srName(s) <- 'Ямало-Ненецкий автономный округ'; srRegion(s) <- arByCode(9); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Алтай'; srRegion(s) <- arByCode(10); }
+        NEW s = SubjectRf { srName(s) <- 'Алтайский край'; srRegion(s) <- arByCode(10); }
+        NEW s = SubjectRf { srName(s) <- 'Кемеровская область'; srRegion(s) <- arByCode(10); }
+        NEW s = SubjectRf { srName(s) <- 'Новосибирская область'; srRegion(s) <- arByCode(10); }
+        NEW s = SubjectRf { srName(s) <- 'Омская область'; srRegion(s) <- arByCode(10); }
+        NEW s = SubjectRf { srName(s) <- 'Томская область'; srRegion(s) <- arByCode(10); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Бурятия'; srRegion(s) <- arByCode(11); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Тыва'; srRegion(s) <- arByCode(11); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Хакасия'; srRegion(s) <- arByCode(11); }
+        NEW s = SubjectRf { srName(s) <- 'Забайкальский край'; srRegion(s) <- arByCode(11); }
+        NEW s = SubjectRf { srName(s) <- 'Красноярский край'; srRegion(s) <- arByCode(11); }
+        NEW s = SubjectRf { srName(s) <- 'Иркутская область'; srRegion(s) <- arByCode(11); }
+        NEW s = SubjectRf { srName(s) <- 'Амурская область'; srRegion(s) <- arByCode(12); }
+        NEW s = SubjectRf { srName(s) <- 'Еврейская автономная область'; srRegion(s) <- arByCode(12); }
+        NEW s = SubjectRf { srName(s) <- 'Камчатский край'; srRegion(s) <- arByCode(12); }
+        NEW s = SubjectRf { srName(s) <- 'Магаданская область'; srRegion(s) <- arByCode(12); }
+        NEW s = SubjectRf { srName(s) <- 'Приморский край'; srRegion(s) <- arByCode(12); }
+        NEW s = SubjectRf { srName(s) <- 'Республика Саха (Якутия)'; srRegion(s) <- arByCode(12); }
+        NEW s = SubjectRf { srName(s) <- 'Сахалинская область'; srRegion(s) <- arByCode(12); }
+        NEW s = SubjectRf { srName(s) <- 'Хабаровский край'; srRegion(s) <- arByCode(12); }
+        NEW s = SubjectRf { srName(s) <- 'Чукотский автономный округ'; srRegion(s) <- arByCode(12); }
+        APPLY;
+    }
+    // миграция связей: культуры с legacy-текстами получают связи со справочниками
+    FOR Crop c IS Crop AND bbchStages(c) AND NOT (GROUP MAX 1 IF CropBbchStage cs AND cbsCrop(cs) = c) DO {
+        NEW cs = CropBbchStage { cbsCrop(cs) <- c; cbsStage(cs) <- bsByCode('10'); }
+        NEW cs = CropBbchStage { cbsCrop(cs) <- c; cbsStage(cs) <- bsByCode('30'); }
+        NEW cs = CropBbchStage { cbsCrop(cs) <- c; cbsStage(cs) <- bsByCode('59'); }
+        NEW cs = CropBbchStage { cbsCrop(cs) <- c; cbsStage(cs) <- bsByCode('73'); }
+        NEW cs = CropBbchStage { cbsCrop(cs) <- c; cbsStage(cs) <- bsByCode('89'); }
+    }
+    FOR Crop c IS Crop AND stressThresholds(c) AND NOT (GROUP MAX 1 IF CropStressLimit l AND cslCrop(l) = c) DO {
+        NEW l = CropStressLimit { cslCrop(l) <- c; cslIndicator(l) <- siByCode('NDVI_DEV'); cslSign(l) <- LimitSign.atMost; cslValue(l) <- 15.0; }
+        NEW l = CropStressLimit { cslCrop(l) <- c; cslIndicator(l) <- siByCode('NDVI_CRIT'); cslSign(l) <- LimitSign.atMost; cslValue(l) <- 35.0; }
+        NEW l = CropStressLimit { cslCrop(l) <- c; cslIndicator(l) <- siByCode('PRECIP10'); cslSign(l) <- LimitSign.atLeast; cslValue(l) <- 20.0; }
+    }
+    FOR Crop c IS Crop AND climateZone(c) AND NOT (GROUP MAX 1 IF CropRegion r AND crCrop(r) = c) DO
+        FOR AdmissionRegion ar IS AdmissionRegion AND isWordInCSV('' + arCode(ar), cropRegionCodes(c)) DO
+            NEW r = CropRegion { crCrop(r) <- c; crRegion(r) <- ar; }
+    APPLY;
+}
+
+// ===================== Бизнес-события (спецификация v2.0, событийная шина) =====================
+// Замена Kafka/RabbitMQ (раздел «Ограничения и рамки реализации» v2.0):
+// таблица событий + публикация из ключевых точек годового/сезонного контуров.
+// Объявлено в KuCrop — корне REQUIRE-цепочки Ku-модулей, чтобы было доступно
+// всем издателям (KuRotation..KuSimulation).
+CLASS KuEventKind 'Тип бизнес-события' {
+    planApproved 'План севооборота утверждён',
+    cardApproved 'Техкарта утверждена',
+    prodPlanApproved 'Годовой план утверждён',
+    scenarioApproved 'Сценарий цен утверждён',
+    harvestPosted 'Урожай учтён',
+    forecastDone 'Расчёт базового прогноза завершён',
+    scenarioDone 'Сценарный анализ завершён',
+    stressDetected 'Выявлен стресс',
+    jobDone 'Регламентное задание завершено',
+    fileImported 'Файл импортирован',
+    recyclingDone 'Расчёт переработки завершён',
+    budgetApproved 'Бюджет утверждён',
+    correctionApproved 'Корректирующее мероприятие утверждено'
+}
+CLASS KuEvent 'Бизнес-событие';
+TABLE kuEvent (KuEvent);
+eventKind 'Тип' = DATA KuEventKind (KuEvent) NONULL;
+nameEventKind 'Тип' (KuEvent e) = staticCaption(eventKind(e));
+eventAt 'Время публикации' = DATA DATETIME (KuEvent) NONULL INDEXED;
+eventUser 'Пользователь' = DATA ISTRING[80] (KuEvent);
+eventObjectKind 'Объект' = DATA ISTRING[40] (KuEvent);
+eventObjectId 'Код объекта' = DATA ISTRING[40] (KuEvent);
+eventPayload 'Состав события' = DATA ISTRING[500] (KuEvent);
+WHEN SET (KuEvent e IS KuEvent) DO {
+    eventAt(e) <- currentDateTime();
+    IF currentUser() THEN eventUser(e) <- login(currentUser());
+}
+// переключатель видимости наследия MITE (Мониторинг/StoreTask/MasterData):
+// по умолчанию скрыто — навигатор для комиссии содержит только «Код Урожая»
+// и системные разделы (ФТ7/ФТ8); включается на «Панели здоровья»
+
+showMiteNav 'Показывать разделы MITE' = DATA BOOLEAN ();   // NULL/выкл — скрыто
+
+// КФ-РП5: мост навигации kuHome → отчёты KuEtl (KuAnalytics не видит
+// формы нижнего модуля; реализация — в KuEtl)
+kuHomeShowReport (ISTRING[20] nm) ABSTRACT;
+
+kuPublish 'Опубликовать событие' (KuEventKind k, ISTRING[40] objKind, ISTRING[40] objId, ISTRING[500] payload) {
+    NEW e = KuEvent { eventKind(e) <- k; eventObjectKind(e) <- objKind; eventObjectId(e) <- objId; eventPayload(e) <- payload; }
+}
+
+// ===================== Канал уведомлений (Волна 4) =====================
+// Единый журнал + два внешних канала (решение пользователя 08.10):
+// Telegram — живая отправка платформенным sendMessageTelegram (контур
+// Messenger/Telegram, паттерн MachineBot) при заполненных токене/чате;
+// MAX — контракт второго этапа (доступа к API нет): live-выключатель
+// kuMaxEnabled + токен/чат; при включении — POST botapi.max.ru (form-
+// encoded; при реальном подключении уточнить контракт JSON у оператора).
+// Внутренний канал — сам журнал (виден всем ролям через форму).
+
+CLASS KuNotification 'Уведомление';
+TABLE kuNotification (KuNotification);
+knKind 'Тип' = DATA ISTRING[24] (KuNotification) NONULL;
+knText 'Текст' = DATA TEXT (KuNotification) NONULL;
+knAt 'Время' = DATA DATETIME (KuNotification) NONULL;
+knTgStatus 'Telegram' = DATA ISTRING[60] (KuNotification);
+knMaxStatus 'MAX' = DATA ISTRING[60] (KuNotification);
+WHEN SET (KuNotification n IS KuNotification) DO knAt(n) <- currentDateTime();
+
+kuTgToken 'Telegram: токен бота' = DATA ISTRING[100] ();
+kuTgChatId 'Telegram: chat id' = DATA ISTRING[30] ();
+kuMaxEnabled 'MAX: включить (live)' = DATA BOOLEAN ();
+kuMaxToken 'MAX: токен бота' = DATA ISTRING[100] ();
+kuMaxChatId 'MAX: chat id' = DATA ISTRING[30] ();
+
+kuMaxSend (ISTRING[500] txt) {
+    EXTERNAL HTTP POST 'https://botapi.max.ru/messages?access_token=' + (OVERRIDE kuMaxToken(), '')
+        BODYURL 'chat_id=' + (OVERRIDE kuMaxChatId(), '') + '&text=' + txt TO exportFile;
+}
+
+// главное действие: журнал + диспетчеризация по включённым каналам
+kuNotify (ISTRING[24] kind, ISTRING[500] txt) {
+    NEW n = KuNotification {
+        knKind(n) <- kind;
+        knText(n) <- txt;
+        knTgStatus(n) <- IF kuTgToken() AND kuTgChatId() THEN 'попытка' ELSE 'выключен';
+        knMaxStatus(n) <- IF kuMaxEnabled() AND kuMaxToken() AND kuMaxChatId() THEN 'попытка' ELSE IF kuMaxEnabled() THEN 'нет токена/чата' ELSE 'контракт (выкл)';
+    }
+    APPLY;
+    // свежая запись этого вызова (за минуту; LOCAL после APPLY не живёт)
+    FOR KuNotification n IS KuNotification AND knAt(n) >= currentDateTime() - 60 AND knKind(n) = kind DO {
+        IF kuTgToken() AND kuTgChatId() THEN
+            TRY {
+                LOCAL tgr = JSONFILE ();
+                EXTERNAL HTTP GET 'https://api.telegram.org/bot' + kuTgToken() + '/sendMessage?chat_id=' + kuTgChatId() + '&text=' + (OVERRIDE txt, '') TO tgr;
+                knTgStatus(n) <- 'отправлено';
+            } CATCH {
+                knTgStatus(n) <- 'ошибка: ' + (OVERRIDE messageCaughtException(), 'нет связи');
+            }
+        IF kuMaxEnabled() AND kuMaxToken() AND kuMaxChatId() THEN
+            TRY {
+                kuMaxSend(txt);
+                knMaxStatus(n) <- 'отправлено';
+            } CATCH {
+                knMaxStatus(n) <- 'ошибка: ' + (OVERRIDE messageCaughtException(), 'нет связи');
+            }
+        APPLY;
+    }
+}
+
+kuNotifyTest 'Тестовое уведомление' () {
+    kuNotify('Тест', 'Тест каналов уведомлений «Кода Урожая»: Telegram + MAX, ' + (OVERRIDE ('' + currentDateTime()), ''));
+}
+
+FORM kuNotifications 'Уведомления'
+    PROPERTIES () kuTgToken, kuTgChatId, kuMaxEnabled, kuMaxToken, kuMaxChatId
+    PROPERTIES () kuNotifyTest
+    OBJECTS n = KuNotification
+    PROPERTIES (n) READONLY knAt, knKind, knText, knTgStatus, knMaxStatus
+    ORDERS knAt(n) DESC
+;
+FORM kuEvents 'Бизнес-события (шина)'
+    OBJECTS e = KuEvent
+    PROPERTIES (e) READONLY nameEventKind, eventAt, eventUser, eventObjectKind, eventObjectId, eventPayload
+    ORDERS eventAt(e) DESC
+;
+
+// ===================== Реестр регламентных заданий (ФТ7.2) =====================
+// Журнал запусков суточных задач КУ; сами запуски — кнопки/суточный цикл
+// (перевод на планировщик платформы — промышленный контур).
+CLASS KuJob 'Регламентное задание';
+TABLE kuJob (KuJob);
+jobName 'Задание' = DATA ISTRING[60] (KuJob) NONULL;
+jobLastStart 'Последний запуск' = DATA DATETIME (KuJob);
+jobLastFinish 'Завершено' = DATA DATETIME (KuJob);
+jobStatus 'Статус' = DATA ISTRING[20] (KuJob);
+jobRuns 'Запусков' = DATA INTEGER (KuJob);
+jobMessage 'Сообщение' = DATA ISTRING[200] (KuJob);
+kuJobStart 'Зафиксировать старт' (ISTRING[60] jn) {
+    IF NOT (GROUP MAX KuJob j IF jobName(j) = jn) THEN NEW j = KuJob { jobName(j) <- jn; }
+    FOR KuJob j IS KuJob AND jobName(j) = jn DO jobLastStart(j) <- currentDateTime();
+    APPLY;
+}
+
+FORM kuJobs 'Регламентные задания'
+    OBJECTS j = KuJob
+    PROPERTIES (j) READONLY jobName, jobLastStart, jobLastFinish, jobStatus, jobRuns, jobMessage
+;
+
+// ===================== Алерты регламентных заданий (Волна 3 — ФТ7.3 / ТЗ 4.2.7.3) =====================
+// Проактивное оповещение: при ошибке/завершении конвейера — e-mail администратору
+// (EMAIL-оператор платформы; SMTP-аккаунт настраивается в системных формах
+// «Администрирование → E-mail аккаунты»). На стенде без релея — пишет событие
+// в шину + отправляет через настроенный аккаунт (синхронно, при ошибке — тихо).
+alertAdminEmail 'E-mail администратора для алертов' = DATA ISTRING[100] ();
+
+nlKu () = [FORMULA STRING[1] 'chr(10)']();
+
+sendJobAlert (ISTRING[60] jn, ISTRING[20] st, ISTRING[200] msg) {
+    kuPublish(KuEventKind.jobDone, 'Alert', jn,
+        'АЛЕРТ: ' + jn + ' — ' + st + ': ' + (OVERRIDE msg, ''));
+    kuNotify('Задание', 'АЛЕРТ: ' + jn + ' — ' + st + ': ' + (OVERRIDE msg, ''));
+    IF alertAdminEmail() AND st = 'Ошибка' THEN {
+        LOCAL subj = ISTRING[100] ();
+        LOCAL body = TEXT ();
+        subj() <- ('[КУ] ' + st) + (': ' + jn);
+        body() <- (('Задание: ' + jn) + nlKu()) + (('Статус: ' + st) + nlKu()) + ('Сообщение: ' + (OVERRIDE msg, '—'));
+        EMAIL FROM 'alert@ku.local'
+            SUBJECT subj()
+            TO alertAdminEmail()
+            BODY body();
+    }
+}
+
+kuJobFinish 'Зафиксировать завершение' (ISTRING[60] jn, ISTRING[20] st, ISTRING[200] msg) {
+    FOR KuJob j IS KuJob AND jobName(j) = jn DO {
+        jobLastFinish(j) <- currentDateTime();
+        jobStatus(j) <- st;
+        jobRuns(j) <- (OVERRIDE jobRuns(j), 0) + 1;
+        jobMessage(j) <- msg;
+    }
+    APPLY;   // фиксация гарантированно (действие — последний оператор обработчиков)
+}
+
+
+
+// ===================== Журнал изменений — версионирование (W1.6) =====================
+// ТЗ 4.2.3.1–2 (историческое хранение изменений участков и договоров) и
+// 4.2.5.2.2 (версионирование справочника коэффициентов): запись «кто/когда/
+// старое→новое» по ключевым полям. Объявлено в корне цепочки — хуки пишут
+// KuLand и KuSimulation.
+CLASS KuAuditLog 'Журнал изменений';
+TABLE kuAuditLog (KuAuditLog);
+alAt 'Время' = DATA DATETIME (KuAuditLog) NONULL INDEXED;
+alUser 'Пользователь' = DATA ISTRING[80] (KuAuditLog);
+alEntity 'Сущность' = DATA ISTRING[40] (KuAuditLog);
+alObject 'Объект' = DATA ISTRING[60] (KuAuditLog);
+alProperty 'Поле' = DATA ISTRING[60] (KuAuditLog);
+alOld 'Старое значение' = DATA ISTRING[100] (KuAuditLog);
+alNew 'Новое значение' = DATA ISTRING[100] (KuAuditLog);
+alIp 'IP-адрес' = DATA ISTRING[45] (KuAuditLog);
+alEventKind 'Тип события ИБ' = DATA ISTRING[40] (KuAuditLog);
+// Hash-chain (паттерн lot_event из KNP): каждая запись связана хешем с
+// предыдущей — журнал нельзя подправить задним числом незаметно.
+// ⚠ MVP на md5 (ядро PostgreSQL); sha256 — при установке pgcrypto.
+alSeq '№ в цепочке' = DATA INTEGER (KuAuditLog) INDEXED;
+alPrevHash 'Хеш предыдущей записи' = DATA ISTRING[32] (KuAuditLog);
+alHash 'Хеш записи (md5)' = DATA ISTRING[32] (KuAuditLog);
+// NULL в полях записи обнулял конкатенацию → md5(NULL)=NULL → разрыв цепочки
+alChainPayload (KuAuditLog a) =
+    (OVERRIDE alPrevHash(a), 'genesis') + '|' + ('' + alSeq(a)) + '|' + (OVERRIDE alUser(a), '-')
+    + '|' + (OVERRIDE alEntity(a), '') + '|' + (OVERRIDE alObject(a), '') + '|' + (OVERRIDE alProperty(a), '')
+    + '|' + (OVERRIDE alOld(a), '') + '=>' + (OVERRIDE alNew(a), '');
+alHashStr (KuAuditLog a) = [FORMULA ISTRING[32] 'md5($1)'](alChainPayload(a));
+WHEN SET (KuAuditLog a IS KuAuditLog) DO {
+    alAt(a) <- currentDateTime();
+    IF currentUser() THEN alUser(a) <- login(currentUser());
+    alSeq(a) <- (OVERRIDE (GROUP MAX alSeq(KuAuditLog x) IF x != a), 0) + 1;
+    alPrevHash(a) <- GROUP MAX alHash(KuAuditLog x) IF alSeq(x) = alSeq(a) - 1;
+    alHash(a) <- alHashStr(a);
+}
+clientIP () = (OVERRIDE hostname(currentComputer()), '');
+
+// КФ-ИН2: реестр аудируемых сущностей (hash-chain): участок (lpvSnapshot),
+// договор, контрагент (КФ-З4), культура и агросвойства (КФ-6 осн.),
+// коэффициенты модели (ModelCoeff/калибровка), ведомость (строки, КФ-З20),
+// FieldSeason — по мере расширения контуров
+kuAuditChange (ISTRING[40] entity, ISTRING[60] obj, ISTRING[60] prop, ISTRING[100] oldV, ISTRING[100] newV) {
+    IF (OVERRIDE oldV, '—') != (OVERRIDE newV, '—') THEN
+        NEW a = KuAuditLog { alEntity(a) <- entity; alObject(a) <- obj; alProperty(a) <- prop; alOld(a) <- oldV; alNew(a) <- newV; alIp(a) <- clientIP(); }
+    APPLY;
+}
+
+// КФ-6: неизменяемый аудит ключевых агросвойств (hash-chain KuAuditLog, ФТ8.3);
+// каждое свойство — отдельным WHEN CHANGED (запись специфична для поля)
+WHEN CHANGED(removalN(Crop c)) AND c IS Crop DO
+    kuAuditChange('Crop', (OVERRIDE name(c), ''), 'Вынос N, кг/т', (OVERRIDE ('' + PREV(removalN(c))), ''), (OVERRIDE ('' + removalN(c)), ''));
+WHEN CHANGED(removalP(Crop c)) AND c IS Crop DO
+    kuAuditChange('Crop', (OVERRIDE name(c), ''), 'Вынос P, кг/т', (OVERRIDE ('' + PREV(removalP(c))), ''), (OVERRIDE ('' + removalP(c)), ''));
+WHEN CHANGED(removalK(Crop c)) AND c IS Crop DO
+    kuAuditChange('Crop', (OVERRIDE name(c), ''), 'Вынос K, кг/т', (OVERRIDE ('' + PREV(removalK(c))), ''), (OVERRIDE ('' + removalK(c)), ''));
+WHEN CHANGED(returnYears(Crop c)) AND c IS Crop DO
+    kuAuditChange('Crop', (OVERRIDE name(c), ''), 'Период возврата, лет', (OVERRIDE ('' + PREV(returnYears(c))), ''), (OVERRIDE ('' + returnYears(c)), ''));
+WHEN CHANGED(targetYield(Crop c)) AND c IS Crop DO
+    kuAuditChange('Crop', (OVERRIDE name(c), ''), 'Целевая урожайность, ц/га', (OVERRIDE ('' + PREV(targetYield(c))), ''), (OVERRIDE ('' + targetYield(c)), ''));
+WHEN CHANGED(vegetationDays(Crop c)) AND c IS Crop DO
+    kuAuditChange('Crop', (OVERRIDE name(c), ''), 'Вегетация, дней', (OVERRIDE ('' + PREV(vegetationDays(c))), ''), (OVERRIDE ('' + vegetationDays(c)), ''));
+WHEN CHANGED(phMin(Crop c)) AND c IS Crop DO
+    kuAuditChange('Crop', (OVERRIDE name(c), ''), 'pH мин', (OVERRIDE ('' + PREV(phMin(c))), ''), (OVERRIDE ('' + phMin(c)), ''));
+WHEN CHANGED(phMax(Crop c)) AND c IS Crop DO
+    kuAuditChange('Crop', (OVERRIDE name(c), ''), 'pH макс', (OVERRIDE ('' + PREV(phMax(c))), ''), (OVERRIDE ('' + phMax(c)), ''));
+WHEN CHANGED(humusMin(Crop c)) AND c IS Crop DO
+    kuAuditChange('Crop', (OVERRIDE name(c), ''), 'Гумус мин', (OVERRIDE ('' + PREV(humusMin(c))), ''), (OVERRIDE ('' + humusMin(c)), ''));
+WHEN CHANGED(humusMax(Crop c)) AND c IS Crop DO
+    kuAuditChange('Crop', (OVERRIDE name(c), ''), 'Гумус макс', (OVERRIDE ('' + PREV(humusMax(c))), ''), (OVERRIDE ('' + humusMax(c)), ''));
+// W3.3: отдельный хук для событий ИБ (вход/выход/права — при необходимости)
+kuAuditSecurity (ISTRING[40] evKind, ISTRING[60] obj, ISTRING[100] detail) {
+    NEW a = KuAuditLog { alEventKind(a) <- evKind; alObject(a) <- obj; alNew(a) <- detail; alIp(a) <- clientIP(); }
+}
+FORM kuAuditLog 'Журнал изменений (версионирование)'
+    OBJECTS a = KuAuditLog
+    PROPERTIES (a) READONLY alAt, alUser, alIp, alEntity, alObject, alProperty, alOld, alNew, alEventKind
+    ORDERS alAt(a) DESC
+;

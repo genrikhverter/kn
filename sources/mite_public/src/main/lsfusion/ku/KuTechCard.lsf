@@ -1,0 +1,980 @@
+MODULE KuTechCard;
+
+// Код Урожая: технологические карты + справочники (виды работ, фазы BBCH,
+// номенклатура, единицы, методы внесения, профессии).
+// Спецификация: docs/02-data-model.md §4; docs/03-logic-KuTechCard.md.
+REQUIRE KuCrop, KuLand, Organization, Authentication;
+
+NAMESPACE Ku;
+
+// ===================== Перечисления =====================
+CLASS TechCardStatus 'Статус карты' {
+    draft 'Черновик', approved 'Утверждена', archived 'Архивная'
+}
+CLASS NomType 'Тип номенклатуры' {
+    seeds 'Семена', fertilizer 'Удобрения', pesticide 'СЗР', fuel 'ГСМ',
+    spare 'Запчасти', product 'Готовая продукция', water 'Вода',
+    energy 'Электроэнергия', waste 'Отходы', other 'Прочее'
+}
+
+// ===================== Единицы измерения (ОКЕИ) =====================
+CLASS Unit 'Единица измерения';
+TABLE unit (Unit);
+okeiCode 'Код ОКЕИ' = DATA ISTRING[8] (Unit) NONULL IN id;
+unitLocal 'Вне ОКЕИ (локальная)' = DATA BOOLEAN (Unit);
+nameUnit 'Наименование' = DATA ISTRING[100] (Unit) NONULL;
+symbol 'Обозначение' = DATA ISTRING[10] (Unit) NONULL;
+unitGroup 'Группа' = DATA ISTRING[16] (Unit);
+unitKind 'Тип' = DATA ISTRING[12] (Unit);
+baseUnit 'Базовая единица' = DATA Unit (Unit);
+factor 'Коэф. к базовой' = DATA NUMERIC[14,6] (Unit);
+unitIsInteger 'Целые значения' = DATA BOOLEAN (Unit);
+unitDescription 'Описание' = DATA TEXT (Unit);
+unitStatus 'Статус' = DATA NsiStatus (Unit);
+unitByOkei = GROUP AGGR Unit u BY okeiCode(u);
+WHEN SET(Unit u IS Unit) DO unitStatus(u) <- NsiStatus.active;
+
+// ===================== Номенклатура =====================
+CLASS Nomenclature 'Номенклатура';
+TABLE nomenclature (Nomenclature);
+nomCode 'Код' = DATA ISTRING[20] (Nomenclature) NONULL IN id;
+nomName 'Наименование' = DATA ISTRING[255] (Nomenclature) NONULL;
+nomShortName 'Кратко' = DATA ISTRING[100] (Nomenclature);
+nomType 'Тип' = DATA NomType (Nomenclature) NONULL;
+nameNomType 'Тип' (Nomenclature n) = staticCaption(nomType(n));
+nomGroup 'Группа' = DATA ISTRING[60] (Nomenclature) NONULL;
+// КФ-8: продукция привязывается к культуре ССЫЛКОЙ (не именем — переименование
+// культуры рвёт доход БДР); для остальных типов номенклатуры — NULL
+prodCrop 'Культура продукции' = DATA Crop (Nomenclature);
+// КФ-П2: группы номенклатуры — справочник (была строка); код NG-001.. по
+// алфавиту уникальных имён (правило закреплено, миграция идемпотентна)
+CLASS NomGroup 'Группа номенклатуры';
+TABLE nomGroup (NomGroup);
+ngCode 'Код' = DATA ISTRING[10] (NomGroup) NONULL IN id;
+ngName 'Наименование' = DATA ISTRING[100] (NomGroup) NONULL;
+ngStatus 'Статус' = DATA NsiStatus (NomGroup);
+ngArchived (NomGroup g) = ngStatus(g) = NsiStatus.archived;
+WHEN SET(NomGroup g IS NomGroup) DO ngStatus(g) <- NsiStatus.active;
+ngByCode = GROUP AGGR NomGroup g BY ngCode(g);
+nomGroupRef 'Группа' = DATA NomGroup (Nomenclature);
+nameNomGroup 'Группа' (Nomenclature n) = OVERRIDE ngName(nomGroupRef(n)), '';
+FORM pickNomGroup 'Выбор группы номенклатуры'
+    OBJECTS g = NomGroup
+    PROPERTIES (g) READONLY ngCode, ngName
+    FILTERS NOT ngArchived(g)
+    ORDERS ngName(g)
+;
+nameNgStatus 'Статус' (NomGroup g) = nameNsiStatus(ngStatus(g));
+FORM nomGroups 'Группы номенклатуры'
+    OBJECTS g = NomGroup
+    PROPERTIES (g) READONLY ngCode, ngName, nameNgStatus
+    PROPERTIES (g) NEWSESSION NEW, EDIT, DELETE
+    ORDERS ngName(g)
+;
+setNomGroupAct 'Выбрать группу' (Nomenclature n) {
+    DIALOG pickNomGroup OBJECTS g = nomGroupRef(n) INPUT g NULL DO nomGroupRef(n) <- g;
+}
+nameProdCrop (Nomenclature n) = OVERRIDE nameCrop(prodCrop(n)), '';
+nomSubGroup 'Подгруппа' = DATA ISTRING[60] (Nomenclature);
+unit 'Ед. изм.' = DATA Unit (Nomenclature) NONULL;
+nameNomUnit 'Ед. изм.' (Nomenclature n) = OVERRIDE symbol(unit(n)), '';
+vatRate 'НДС, %' = DATA NUMERIC[5,2] (Nomenclature);
+basePrice 'Цена без НДС' = DATA NUMERIC[14,2] (Nomenclature);
+okpd2 'ОКПД2' = DATA ISTRING[20] (Nomenclature);
+minStock 'Мин. остаток' = DATA NUMERIC[12,3] (Nomenclature);
+shelfLifeDays 'Срок годности, дн' = DATA INTEGER (Nomenclature);
+storageTerms 'Условия хранения' = DATA TEXT (Nomenclature);
+activeIngredient 'Действующее вещество, %' = DATA NUMERIC[6,2] (Nomenclature);
+gosRegistryCode 'Код Госреестра/ФГИС' = DATA ISTRING[24] (Nomenclature);
+nomSpec 'Специфика (JSON)' = DATA TEXT (Nomenclature);
+nomDescription 'Описание' = DATA TEXT (Nomenclature);
+nomStatus 'Статус' = DATA NsiStatus (Nomenclature);
+nomCreated 'Создано' = DATA DATETIME (Nomenclature);
+nomCreatedBy 'Автор' = DATA CustomUser (Nomenclature);
+nomByCode = GROUP AGGR Nomenclature n BY nomCode(n);
+WHEN SET(Nomenclature n IS Nomenclature) DO {
+    nomStatus(n) <- NsiStatus.active;
+    nomCreated(n) <- currentDateTime();
+}
+
+// ===================== Виды работ =====================
+CLASS WorkType 'Вид работы';
+TABLE workType (WorkType);
+wtName 'Наименование' = DATA ISTRING[255] (WorkType) NONULL IN id;
+wtCode 'Код' = DATA ISTRING[12] (WorkType) NONULL;
+wtGroup 'Группа работ' = DATA ISTRING[20] (WorkType) NONULL;
+wtKind 'Тип операции' = DATA ISTRING[50] (WorkType);
+wtSeason 'Сезонность' = DATA ISTRING[16] (WorkType);
+wtBbch 'Фаза BBCH' = DATA ISTRING[8] (WorkType);
+wtTempMin 't мин' = DATA DOUBLE (WorkType);
+wtTempMax 't макс' = DATA DOUBLE (WorkType);
+wtGapMinDays 'Интервал мин, дн' = DATA INTEGER (WorkType);
+wtGapMaxDays 'Интервал макс, дн' = DATA INTEGER (WorkType);
+wtOutputRate 'Норма выработки' = DATA NUMERIC[10,2] (WorkType);
+wtOutputUnit 'Ед. изм.' = DATA Unit (WorkType);
+wtDescription 'Описание' = DATA TEXT (WorkType);
+wtStatus 'Статус' = DATA NsiStatus (WorkType);
+wtCreated 'Создано' = DATA DATETIME (WorkType);
+wtByCode = GROUP AGGR WorkType w BY wtCode(w);
+WHEN SET(WorkType w IS WorkType) DO {
+    wtStatus(w) <- NsiStatus.active;
+    wtCreated(w) <- currentDateTime();
+}
+
+// ===================== Фазы развития (BBCH) =====================
+CLASS Phase 'Фаза развития (BBCH)';
+TABLE phase (Phase);
+bbchCode 'Код BBCH' = DATA ISTRING[8] (Phase) NONULL IN id;
+phaseName 'Наименование' = DATA ISTRING[100] (Phase) NONULL;
+phaseGroup 'Группа фаз' = DATA ISTRING[40] (Phase) NONULL;
+phaseCrop 'Культура' = DATA Crop (Phase) NONULL;
+namePhaseCrop 'Культура' (Phase ph) = OVERRIDE nameCrop(phaseCrop(ph)), '';
+detailLevel 'Детализация (1-3)' = DATA INTEGER (Phase);
+phTempMin 't мин' = DATA DOUBLE (Phase);
+phTempMax 't макс' = DATA DOUBLE (Phase);
+gddDays 'Градусодни' = DATA INTEGER (Phase);
+photoperiod 'Фотопериод' = DATA ISTRING[100] (Phase);
+durationDays 'Длительность, дн' = DATA INTEGER (Phase);
+visualSigns 'Визуальные признаки' = DATA TEXT (Phase);
+agrotechNotes 'Рекомендации' = DATA TEXT (Phase);
+phaseDescription 'Описание' = DATA TEXT (Phase);
+phaseStatus 'Статус' = DATA NsiStatus (Phase);
+// Уникальность кода BBCH — в рамках культуры (фаза всегда привязана к cultureCrop),
+// глобальная уникальность кода была неверна: один код у разных культур.
+phaseByBbch (Crop cp, STRING[8] bc) = GROUP AGGR Phase ph BY phaseCrop(ph), bbchCode(ph);
+WHEN SET(Phase ph IS Phase) DO {
+    phaseStatus(ph) <- NsiStatus.active;
+    detailLevel(ph) <- 2;
+}
+
+// ===================== Методы внесения =====================
+CLASS ApplicationMethod 'Метод внесения';
+TABLE applicationMethod (ApplicationMethod);
+amCode 'Код' = DATA ISTRING[12] (ApplicationMethod) NONULL IN id;
+amName 'Наименование' = DATA ISTRING[100] (ApplicationMethod) NONULL;
+// КФ-П8: типы-енумы (были строки)
+CLASS ApplyKind 'Тип внесения' {
+    surface 'Поверхностное', deep 'Глубокое', ribbon 'Ленточное', point 'Точечное',
+    drip 'Капельное', aerial 'Воздушное', other 'Иное'
+}
+CLASS ResourceKind 'Категория ресурса' {
+    fertilizer 'Удобрения', pesticide 'СЗР', seed 'Семена', liming 'Известкование', other 'Иное'
+}
+applyKind 'Тип внесения' = DATA ApplyKind (ApplicationMethod) NONULL;
+resourceKind 'Категория ресурса' = DATA ResourceKind (ApplicationMethod) NONULL;
+nameApplyKind 'Тип внесения' (ApplicationMethod am) = staticCaption(applyKind(am));
+nameResourceKind 'Категория ресурса' (ApplicationMethod am) = staticCaption(resourceKind(am));
+amSeason 'Сезонность' = DATA ISTRING[16] (ApplicationMethod);
+// КФ-П6: диапазоны парами (были строки «10-20»); CONSTRAINT мин ≤ макс
+depthMin 'Глубина мин, см' = DATA NUMERIC[5,2] (ApplicationMethod);
+depthMax 'Глубина макс, см' = DATA NUMERIC[5,2] (ApplicationMethod);
+amSpeed 'Скорость, км/ч' = DATA NUMERIC[6,2] (ApplicationMethod);
+widthM 'Захват, м' = DATA NUMERIC[8,2] (ApplicationMethod);
+amTempMin 't мин' = DATA DOUBLE (ApplicationMethod);
+amTempMax 't макс' = DATA DOUBLE (ApplicationMethod);
+moistMinAm 'Влажность мин, %' = DATA NUMERIC[5,2] (ApplicationMethod);
+moistMaxAm 'Влажность макс, %' = DATA NUMERIC[5,2] (ApplicationMethod);
+CONSTRAINT (depthMin(ApplicationMethod am) AND depthMax(am) AND depthMin(am) > depthMax(am))
+    OR (moistMinAm(am) AND moistMaxAm(am) AND moistMinAm(am) > moistMaxAm(am))
+    CHECKED BY depthMin, depthMax, moistMinAm, moistMaxAm MESSAGE 'Минимум не может превышать максимум (глубина/влажность)';
+amDescription 'Описание' = DATA TEXT (ApplicationMethod);
+amStatus 'Статус' = DATA NsiStatus (ApplicationMethod);
+amByCode = GROUP AGGR ApplicationMethod am BY amCode(am);
+WHEN SET(ApplicationMethod am IS ApplicationMethod) DO amStatus(am) <- NsiStatus.active;
+
+// ===================== Профессии =====================
+CLASS Profession 'Профессия';
+TABLE profession (Profession);
+profCode 'Код' = DATA ISTRING[16] (Profession) NONULL IN id;
+profName 'Наименование' = DATA ISTRING[100] (Profession) NONULL;
+profShortName 'Кратко' = DATA ISTRING[50] (Profession);
+profCategory 'Категория' = DATA ISTRING[30] (Profession) NONULL;
+profGroup 'Группа' = DATA ISTRING[40] (Profession) NONULL;
+qualGroup 'Квалификация' = DATA ISTRING[16] (Profession);
+okzCode 'ОКЗ' = DATA ISTRING[12] (Profession);
+education 'Образование' = DATA ISTRING[40] (Profession) NONULL;
+speciality 'Специальность' = DATA ISTRING[100] (Profession);
+experience 'Опыт' = DATA ISTRING[60] (Profession);
+skills 'Навыки' = DATA TEXT (Profession);
+duties 'Обязанности' = DATA TEXT (Profession);
+baseRate 'Ставка, руб/ч' = DATA NUMERIC[12,2] (Profession);
+rateUnit 'Ед. изм. ставки' = DATA Unit (Profession);
+profDescription 'Описание' = DATA TEXT (Profession);
+profStatus 'Статус' = DATA NsiStatus (Profession);
+profByCode = GROUP AGGR Profession pr BY profCode(pr);
+WHEN SET(Profession pr IS Profession) DO profStatus(pr) <- NsiStatus.active;
+
+// КФ-П5: единый статус НСИ + фильтры пикеров/подборов
+unitArchived (Unit u) = unitStatus(u) = NsiStatus.archived;
+nameUnitStatus 'Статус' (Unit u) = nameNsiStatus(unitStatus(u));
+nomArchived (Nomenclature n) = nomStatus(n) = NsiStatus.archived;
+nameNomStatus 'Статус' (Nomenclature n) = nameNsiStatus(nomStatus(n));
+wtArchived (WorkType w) = wtStatus(w) = NsiStatus.archived;
+nameWtStatus 'Статус' (WorkType w) = nameNsiStatus(wtStatus(w));
+phaseArchived (Phase ph) = phaseStatus(ph) = NsiStatus.archived;
+namePhaseStatus 'Статус' (Phase ph) = nameNsiStatus(phaseStatus(ph));
+amArchived (ApplicationMethod am) = amStatus(am) = NsiStatus.archived;
+nameAmStatus 'Статус' (ApplicationMethod am) = nameNsiStatus(amStatus(am));
+profArchived (Profession pr) = profStatus(pr) = NsiStatus.archived;
+nameProfStatus 'Статус' (Profession pr) = nameNsiStatus(profStatus(pr));
+
+// ===================== Технологическая карта =====================
+CLASS TechCard 'Техкарта';
+TABLE techCard (TechCard);
+tcName 'Наименование' = DATA ISTRING[150] (TechCard) NONULL IN id;
+tcVersion 'Версия' = DATA INTEGER (TechCard) NONULL;
+cardStatus 'Статус' = DATA TechCardStatus (TechCard) NONULL;
+nameCardStatus 'Статус' (TechCard c) = staticCaption(cardStatus(c));
+tcCrop 'Культура' = DATA Crop (TechCard) NONULL;
+nameTcCrop 'Культура' (TechCard c) = OVERRIDE nameCrop(tcCrop(c)), '';
+tcOrganization 'Организация' = DATA Organization (TechCard) NONULL;
+tcAuthor 'Автор' = DATA CustomUser (TechCard);
+nameTcAuthor 'Автор' (TechCard c) = OVERRIDE nameKuUser(tcAuthor(c)), '';
+tcCreatedAt 'Создана' = DATA DATETIME (TechCard);
+tcApprovedAt 'Утверждена' = DATA DATETIME (TechCard);
+tcApprovedBy 'Утвердивший' = DATA CustomUser (TechCard);
+nameTcApprovedBy 'Утвердивший' (TechCard c) = OVERRIDE nameKuUser(tcApprovedBy(c)), '';
+tcValidFrom 'Действует с' = DATA DATE (TechCard);
+tcValidTo 'Действует по' = DATA DATE (TechCard);
+tcBasedOn 'На основе' = DATA TechCard (TechCard);
+tcDescription 'Описание' = DATA TEXT (TechCard);
+WHEN SET(TechCard c IS TechCard) DO {
+    cardStatus(c) <- TechCardStatus.draft;
+    tcVersion(c) <- 1;
+    tcCreatedAt(c) <- currentDateTime();
+}
+CONSTRAINT TechCard c IS TechCard AND tcValidFrom(c) > tcValidTo(c) CHECKED BY tcValidTo MESSAGE 'Начало периода больше окончания';
+CONSTRAINT TechCard c IS TechCard AND cardStatus(c) = TechCardStatus.approved
+    AND (CHANGED(tcName(c)) OR CHANGED(tcCrop(c)) OR CHANGED(tcOrganization(c)))
+    CHECKED BY tcName MESSAGE 'Утверждённая карта не редактируется — создайте новую версию';
+
+// ===================== Операции =====================
+CLASS TechOperation 'Операция';
+TABLE techOperation (TechOperation);
+card 'Техкарта' = DATA TechCard (TechOperation) AUTOSET;
+seqNo '№' = DATA INTEGER (TechOperation) NONULL;
+workType 'Вид работы' = DATA WorkType (TechOperation) NONULL;
+nameWorkType 'Вид работы' (TechOperation o) = OVERRIDE wtName(workType(o)), '';
+phaseTrigger 'Фено-триггер' = DATA Phase (TechOperation);
+opTempMin 't мин' = DATA DOUBLE (TechOperation);
+opTempMax 't макс' = DATA DOUBLE (TechOperation);
+gapMinDays 'Интервал мин, дн' = DATA INTEGER (TechOperation);
+gapMaxDays 'Интервал макс, дн' = DATA INTEGER (TechOperation);
+opDateFrom 'Срок с' = DATA DATE (TechOperation);
+opDateTo 'Срок по' = DATA DATE (TechOperation);
+outputRate 'Норма выработки' = DATA NUMERIC[10,2] (TechOperation);
+outputUnit 'Ед. изм.' = DATA Unit (TechOperation);
+opByCardSeq = GROUP AGGR TechOperation o BY card(o), seqNo(o);
+CONSTRAINT TechOperation o IS TechOperation AND seqNo(o) < 1 CHECKED BY seqNo MESSAGE 'Номер операции должен быть >= 1';
+CONSTRAINT TechOperation o IS TechOperation AND phaseTrigger(o) IS Phase AND phaseCrop(phaseTrigger(o)) != tcCrop(card(o))
+    CHECKED BY phaseTrigger MESSAGE 'Фаза относится к другой культуре';
+
+// ===================== Материалы / ГСМ / трудозатраты =====================
+CLASS OperationMaterial 'Материал операции';
+TABLE operationMaterial (OperationMaterial);
+operation 'Операция' = DATA TechOperation (OperationMaterial) AUTOSET;
+nomenclature 'Номенклатура' = DATA Nomenclature (OperationMaterial) NONULL;
+nameMaterial 'Номенклатура' (OperationMaterial m) = OVERRIDE nomName(nomenclature(m)), '';
+matRate 'Норма расхода' = DATA NUMERIC[12,3] (OperationMaterial) NONULL;
+matUnit 'Ед. изм.' = DATA Unit (OperationMaterial) NONULL;
+nameMatUnit 'Ед.' (OperationMaterial m) = OVERRIDE symbol(matUnit(m)), '';
+method 'Метод внесения' = DATA ApplicationMethod (OperationMaterial);
+matDepth 'Глубина, см' = DATA NUMERIC[6,1] (OperationMaterial);
+matNote 'Указания' = DATA TEXT (OperationMaterial);
+WHEN SET(OperationMaterial m IS OperationMaterial) DO matUnit(m) <- unit(nomenclature(m));
+CONSTRAINT OperationMaterial m IS OperationMaterial
+    AND matRate(m) <= 0 CHECKED BY matRate MESSAGE 'Норма расхода должна быть положительной';
+CONSTRAINT OperationMaterial m IS OperationMaterial
+    AND nomType(nomenclature(m)) != NomType.seeds
+    AND nomType(nomenclature(m)) != NomType.fertilizer
+    AND nomType(nomenclature(m)) != NomType.pesticide
+    CHECKED BY nomenclature MESSAGE 'Материалом может быть только семена/удобрения/СЗР';
+
+CLASS OperationFuel 'ГСМ операции';
+TABLE operationFuel (OperationFuel);
+operation 'Операция' = DATA TechOperation (OperationFuel) AUTOSET;
+fuelNomenclature 'ГСМ' = DATA Nomenclature (OperationFuel) NONULL;
+nameFuel 'ГСМ' (OperationFuel f) = OVERRIDE nomName(fuelNomenclature(f)), '';
+fuelRate 'Норма расхода' = DATA NUMERIC[12,3] (OperationFuel) NONULL;
+fuelUnit 'Ед. изм.' = DATA Unit (OperationFuel) NONULL;
+usageFactor 'Коэф. использования' = DATA DOUBLE (OperationFuel);
+WHEN SET(OperationFuel f IS OperationFuel) DO fuelUnit(f) <- unit(fuelNomenclature(f));
+CONSTRAINT OperationFuel f IS OperationFuel AND nomType(fuelNomenclature(f)) != NomType.fuel
+    CHECKED BY fuelNomenclature MESSAGE 'Строкой ГСМ может быть только номенклатура типа ГСМ';
+
+CLASS OperationLabor 'Трудозатраты';
+TABLE operationLabor (OperationLabor);
+operation 'Операция' = DATA TechOperation (OperationLabor) AUTOSET;
+profession 'Профессия' = DATA Profession (OperationLabor) NONULL;
+nameProfession 'Профессия' (OperationLabor l) = OVERRIDE profName(profession(l)), '';
+timeRate 'Норма времени' = DATA NUMERIC[10,2] (OperationLabor) NONULL;
+laborUnit 'Ед. изм.' = DATA Unit (OperationLabor) NONULL;
+workersCount 'Кол-во работников' = DATA INTEGER (OperationLabor);
+CONSTRAINT OperationLabor l IS OperationLabor AND timeRate(l) <= 0 CHECKED BY timeRate MESSAGE 'Норма времени должна быть положительной';
+
+// ===================== Выбор объектов: пикеры =====================
+// Сырые объектные свойства платформа показывает числовым id — отображение
+// вычисляемыми именами, изменение ссылки — диалоговым выбором из списка.
+nameTcOrganization 'Организация' (TechCard c) = OVERRIDE name(tcOrganization(c)), '';
+nameTcBasedOn 'На основе' (TechCard c) = OVERRIDE tcName(tcBasedOn(c)), '';
+namePhaseTrigger 'Фено-триггер' (TechOperation o) = OVERRIDE bbchCode(phaseTrigger(o)) + ' — ' + phaseName(phaseTrigger(o)), '';
+nameMatMethod 'Метод внесения' (OperationMaterial m) = OVERRIDE amName(method(m)), '';
+nameFuelUnit 'Ед.' (OperationFuel f) = OVERRIDE symbol(fuelUnit(f)), '';
+nameLaborUnit 'Ед.' (OperationLabor l) = OVERRIDE symbol(laborUnit(l)), '';
+
+FORM pickWorkType 'Выбор вида работы'
+    OBJECTS w = WorkType
+    PROPERTIES (w) READONLY wtCode, wtName, wtGroup
+    ORDERS wtCode(w)
+    FILTERS NOT wtArchived(w)
+;
+FORM pickPhase 'Выбор фазы развития'
+    OBJECTS sel = Phase
+    PROPERTIES (sel) READONLY bbchCode, phaseName, namePhaseCrop
+    ORDERS bbchCode(sel)
+    FILTERS NOT phaseArchived(sel)
+;
+FORM pickApplicationMethod 'Выбор метода внесения'
+    OBJECTS am = ApplicationMethod
+    PROPERTIES (am) READONLY amCode, amName
+    ORDERS amCode(am)
+    FILTERS NOT amArchived(am)
+;
+FORM pickNomenclature 'Выбор номенклатуры'
+    OBJECTS nm = Nomenclature
+    PROPERTIES (nm) READONLY nomName, unit
+    ORDERS nomName(nm)
+    FILTERS NOT nomArchived(nm)
+;
+FORM pickUnit 'Выбор единицы измерения'
+    OBJECTS u = Unit
+    PROPERTIES (u) READONLY symbol
+    FILTERS NOT unitArchived(u)
+;
+FORM pickProfession 'Выбор профессии'
+    OBJECTS pr = Profession
+    PROPERTIES (pr) READONLY profCode, profName
+    ORDERS profName(pr)
+    FILTERS NOT profArchived(pr)
+;
+
+setTcCropAct 'Выбрать культуру' (TechCard c) {
+    DIALOG pickCrop OBJECTS pc = tcCrop(c) INPUT pc NULL DO tcCrop(c) <- pc;
+}
+setTcOrgAct 'Выбрать организацию' (TechCard c) {
+    DIALOG pickOrganization OBJECTS o = tcOrganization(c) INPUT o NULL DO tcOrganization(c) <- o;
+}
+setPhaseCropAct 'Выбрать культуру' (Phase ph) {
+    DIALOG pickCrop OBJECTS pc = phaseCrop(ph) INPUT pc NULL DO phaseCrop(ph) <- pc;
+}
+setWorkTypeAct 'Выбрать вид работы' (TechOperation o) {
+    DIALOG pickWorkType OBJECTS w = workType(o) INPUT w NULL DO workType(o) <- w;
+}
+setPhaseTriggerAct 'Выбрать фазу' (TechOperation o) {
+    DIALOG pickPhase OBJECTS sel = phaseTrigger(o) INPUT sel NULL FILTERS phaseCrop(sel) = tcCrop(card(o)) DO phaseTrigger(o) <- sel;
+}
+setMatNomAct 'Выбрать номенклатуру' (OperationMaterial m) {
+    DIALOG pickNomenclature OBJECTS nm = nomenclature(m) INPUT nm NULL DO {
+        nomenclature(m) <- nm;
+        matUnit(m) <- unit(nm);
+    }
+}
+setMatMethodAct 'Выбрать метод' (OperationMaterial m) {
+    DIALOG pickApplicationMethod OBJECTS am = method(m) INPUT am NULL DO method(m) <- am;
+}
+setMatUnitAct 'Выбрать ед. изм.' (OperationMaterial m) {
+    DIALOG pickUnit OBJECTS u = matUnit(m) INPUT u NULL DO matUnit(m) <- u;
+}
+setFuelNomAct 'Выбрать ГСМ' (OperationFuel f) {
+    DIALOG pickNomenclature OBJECTS nm = fuelNomenclature(f) INPUT nm NULL DO fuelNomenclature(f) <- nm;
+}
+setFuelUnitAct 'Выбрать ед. изм.' (OperationFuel f) {
+    DIALOG pickUnit OBJECTS u = fuelUnit(f) INPUT u NULL DO fuelUnit(f) <- u;
+}
+setProfessionAct 'Выбрать профессию' (OperationLabor l) {
+    DIALOG pickProfession OBJECTS pr = profession(l) INPUT pr NULL DO profession(l) <- pr;
+}
+setLaborUnitAct 'Выбрать ед. изм.' (OperationLabor l) {
+    DIALOG pickUnit OBJECTS u = laborUnit(l) INPUT u NULL DO laborUnit(l) <- u;
+}
+
+// ===================== Вычисляемые =====================
+opCount 'Операций' (TechCard c) = GROUP SUM 1 IF card(TechOperation o) = c;
+laborTotal 'Трудозатрат, ч/га' (TechCard c) = GROUP SUM timeRate(OperationLabor l) IF card(operation(l)) = c;
+materialSummary 'Материалы' (TechCard c) =
+    GROUP CONCAT nomName(nomenclature(OperationMaterial m)) IF card(operation(m)) = c, ', ' ORDER m;
+
+// ===================== Действия =====================
+approveTechCard 'Утвердить' (TechCard c) {
+    // NOT вместо = 0: GROUP SUM по пустому множеству — NULL, NULL = 0 не TRUE
+    IF NOT opCount(c) THEN {
+        MESSAGE 'Нельзя утвердить: в карте нет операций';
+    } ELSE {
+        cardStatus(c) <- TechCardStatus.approved;
+        tcApprovedAt(c) <- currentDateTime();
+        IF currentUser() THEN tcApprovedBy(c) <- currentUser();
+        IF tcBasedOn(c) IS TechCard AND cardStatus(tcBasedOn(c)) = TechCardStatus.approved THEN
+            cardStatus(tcBasedOn(c)) <- TechCardStatus.archived;
+        kuPublish(KuEventKind.cardApproved, 'TechCard', tcName(c), 'Операций в карте: ' + (OVERRIDE ('' + opCount(c)), '0'));
+        APPLY;
+    }
+}
+
+copyTechCard 'Копировать' (TechCard src) {
+    LOCAL nc = TechCard ();
+    NEW c = TechCard {
+        tcName(c) <- tcName(src) + ' (копия)';
+        tcCrop(c) <- tcCrop(src);
+        tcOrganization(c) <- tcOrganization(src);
+        tcBasedOn(c) <- src;
+        nc() <- c;
+    }
+    FOR TechOperation o IS TechOperation AND card(o) = src DO {
+        LOCAL no = TechOperation ();
+        NEW n = TechOperation {
+            card(n) <- nc();
+            seqNo(n) <- seqNo(o);
+            workType(n) <- workType(o);
+            phaseTrigger(n) <- phaseTrigger(o);
+            opTempMin(n) <- opTempMin(o);
+            opTempMax(n) <- opTempMax(o);
+            gapMinDays(n) <- gapMinDays(o);
+            gapMaxDays(n) <- gapMaxDays(o);
+            opDateFrom(n) <- opDateFrom(o);
+            opDateTo(n) <- opDateTo(o);
+            outputRate(n) <- outputRate(o);
+            outputUnit(n) <- outputUnit(o);
+            no() <- n;
+        }
+        FOR OperationMaterial m IS OperationMaterial AND operation(m) = o DO
+            NEW nm = OperationMaterial {
+                operation(nm) <- no();
+                nomenclature(nm) <- nomenclature(m);
+                matRate(nm) <- matRate(m);
+                matUnit(nm) <- matUnit(m);
+                method(nm) <- method(m);
+                matDepth(nm) <- matDepth(m);
+                matNote(nm) <- matNote(m);
+            }
+        FOR OperationFuel f IS OperationFuel AND operation(f) = o DO
+            NEW nf = OperationFuel {
+                operation(nf) <- no();
+                fuelNomenclature(nf) <- fuelNomenclature(f);
+                fuelRate(nf) <- fuelRate(f);
+                fuelUnit(nf) <- fuelUnit(f);
+                usageFactor(nf) <- usageFactor(f);
+            }
+        FOR OperationLabor l IS OperationLabor AND operation(l) = o DO
+            NEW nl = OperationLabor {
+                operation(nl) <- no();
+                profession(nl) <- profession(l);
+                timeRate(nl) <- timeRate(l);
+                laborUnit(nl) <- laborUnit(l);
+                workersCount(nl) <- workersCount(l);
+            }
+    }
+    APPLY;
+}
+
+newTechCardVersion 'Новая версия' (TechCard src) {
+    LOCAL nc = TechCard ();
+    NEW c = TechCard {
+        tcName(c) <- tcName(src);
+        tcCrop(c) <- tcCrop(src);
+        tcOrganization(c) <- tcOrganization(src);
+        tcBasedOn(c) <- src;
+        tcVersion(c) <- tcVersion(src) + 1;
+        nc() <- c;
+    }
+    FOR TechOperation o IS TechOperation AND card(o) = src DO {
+        LOCAL no = TechOperation ();
+        NEW n = TechOperation {
+            card(n) <- nc();
+            seqNo(n) <- seqNo(o);
+            workType(n) <- workType(o);
+            phaseTrigger(n) <- phaseTrigger(o);
+            opTempMin(n) <- opTempMin(o);   // потеря полей ломала агро-параметры новой версии
+            opTempMax(n) <- opTempMax(o);
+            gapMinDays(n) <- gapMinDays(o);
+            gapMaxDays(n) <- gapMaxDays(o);
+            opDateFrom(n) <- opDateFrom(o);
+            opDateTo(n) <- opDateTo(o);
+            outputRate(n) <- outputRate(o);
+            outputUnit(n) <- outputUnit(o);
+            no() <- n;
+        }
+        FOR OperationMaterial m IS OperationMaterial AND operation(m) = o DO
+            NEW nm = OperationMaterial { operation(nm) <- no(); nomenclature(nm) <- nomenclature(m); matRate(nm) <- matRate(m); matUnit(nm) <- matUnit(m); method(nm) <- method(m); matDepth(nm) <- matDepth(m); matNote(nm) <- matNote(m); }
+        FOR OperationFuel f IS OperationFuel AND operation(f) = o DO
+            NEW nf = OperationFuel { operation(nf) <- no(); fuelNomenclature(nf) <- fuelNomenclature(f); fuelRate(nf) <- fuelRate(f); fuelUnit(nf) <- fuelUnit(f); }
+        FOR OperationLabor l IS OperationLabor AND operation(l) = o DO
+            NEW nl = OperationLabor { operation(nl) <- no(); profession(nl) <- profession(l); timeRate(nl) <- timeRate(l); laborUnit(nl) <- laborUnit(l); workersCount(nl) <- workersCount(l); }
+    }
+    APPLY;
+}
+
+// ===================== Формы =====================
+
+// кнопки Excel-выгрузки (реализации — после объявления форм)
+exportTechCardsXls 'Выгрузить в Excel' () ABSTRACT;
+FORM units 'Единицы измерения'
+    OBJECTS u = Unit
+    PROPERTIES (u) READONLY okeiCode, nameUnit, symbol, unitGroup, unitKind, unitLocal
+    PROPERTIES (u) NEWSESSION NEW, EDIT, DELETE
+    ORDERS okeiCode(u)
+;
+DESIGN units {
+    PROPERTY(okeiCode(u)) { charWidth = 8; }
+    PROPERTY(nameUnit(u)) { charWidth = 28; }
+    PROPERTY(symbol(u)) { charWidth = 10; }
+}
+
+FORM unit 'Единица'
+    OBJECTS u = Unit PANEL
+    PROPERTIES (u) okeiCode, nameUnit, symbol, unitGroup, unitKind, baseUnit, factor, unitIsInteger, unitDescription
+    EDIT Unit OBJECT u
+;
+
+FORM nomenclatures 'Номенклатура'
+    OBJECTS n = Nomenclature
+    PROPERTIES (n) READONLY nomCode, nomName, nameNomType, nomGroup, nameNomUnit, basePrice
+    PROPERTIES (n) NEWSESSION NEW, EDIT, DELETE
+;
+
+setProdCropAct 'Выбрать культуру продукции' (Nomenclature n) {
+    DIALOG pickCrop OBJECTS pc = prodCrop(n) INPUT pc NULL DO prodCrop(n) <- pc;
+}
+FORM nomenclature 'Номенклатура'
+    OBJECTS n = Nomenclature PANEL
+    PROPERTIES (n) nomCode, nomName, nomShortName, nomType, nomGroup, nomSubGroup, unit
+    PROPERTIES (n) READONLY nameNomType, nameNomUnit
+    PROPERTIES (n) basePrice, okpd2, minStock, shelfLifeDays, storageTerms, vatRate
+    PROPERTIES (n) activeIngredient, gosRegistryCode, nomSpec, nomDescription
+    PROPERTIES (n) READONLY nameProdCrop
+    PROPERTIES (n) setProdCropAct SHOWIF nomType(n) = NomType.product AND NOT prodCrop(n)
+    EDIT Nomenclature OBJECT n
+;
+
+FORM workTypes 'Виды работ'
+    OBJECTS w = WorkType
+    PROPERTIES (w) READONLY wtCode, wtName, wtGroup, wtKind
+    PROPERTIES (w) NEWSESSION NEW, EDIT, DELETE
+;
+
+FORM workType 'Вид работы'
+    OBJECTS w = WorkType PANEL
+    PROPERTIES (w) wtCode, wtName, wtGroup, wtKind, wtSeason, wtBbch
+    PROPERTIES (w) wtTempMin, wtTempMax, wtGapMinDays, wtGapMaxDays, wtOutputRate, wtOutputUnit, wtDescription
+    EDIT WorkType OBJECT w
+;
+
+FORM phases 'Фазы развития (BBCH)'
+    OBJECTS ph = Phase
+    PROPERTIES (ph) READONLY bbchCode, phaseName, namePhaseCrop, phaseGroup
+    PROPERTIES (ph) NEWSESSION NEW, EDIT, DELETE
+;
+
+FORM phase 'Фаза'
+    OBJECTS ph = Phase PANEL
+    PROPERTIES (ph) bbchCode, phaseName, phaseGroup
+    PROPERTIES (ph) READONLY namePhaseCrop, detailLevel
+    PROPERTIES (ph) setPhaseCropAct
+    PROPERTIES (ph) phTempMin, phTempMax, gddDays, photoperiod, durationDays
+    PROPERTIES (ph) visualSigns, agrotechNotes, phaseDescription
+    EDIT Phase OBJECT ph
+;
+
+FORM applicationMethods 'Методы внесения'
+    OBJECTS am = ApplicationMethod
+    PROPERTIES (am) READONLY amCode, amName, nameApplyKind, nameResourceKind
+    PROPERTIES (am) NEWSESSION NEW, EDIT, DELETE
+;
+
+FORM applicationMethod 'Метод внесения'
+    OBJECTS am = ApplicationMethod PANEL
+    PROPERTIES (am) amCode, amName, applyKind, resourceKind, amSeason
+    PROPERTIES (am) READONLY nameApplyKind, nameResourceKind
+    PROPERTIES (am) depthMin, depthMax, amSpeed, widthM, amTempMin, amTempMax, moistMinAm, moistMaxAm, amDescription
+    EDIT ApplicationMethod OBJECT am
+;
+
+nameProfRateUnit 'Ед. изм. ставки (имя)' (Profession pr) = OVERRIDE symbol(rateUnit(pr)), '';
+FORM professions 'Профессии'
+    OBJECTS pr = Profession
+    PROPERTIES (pr) READONLY profCode, profName, profCategory, profGroup
+    PROPERTIES (pr) NEWSESSION NEW, EDIT, DELETE
+;
+
+FORM profession 'Профессия'
+    OBJECTS pr = Profession PANEL
+    PROPERTIES (pr) profCode, profName, profShortName, profCategory, profGroup, qualGroup, okzCode
+    PROPERTIES (pr) education, speciality, experience, skills, duties, baseRate, rateUnit, profDescription
+    PROPERTIES (pr) READONLY nameProfRateUnit
+    EDIT Profession OBJECT pr
+;
+
+
+FORM techCards 'Техкарты'
+    OBJECTS c = TechCard
+    PROPERTIES (c) READONLY tcName, nameTcCrop, nameCardStatus, tcVersion, opCount, laborTotal, tcApprovedAt
+    PROPERTIES (c) NEWSESSION NEW, EDIT, DELETE, approveTechCard, copyTechCard, newTechCardVersion
+    PROPERTIES () exportTechCardsXls
+;
+
+FORM techCard 'Техкарта'
+    OBJECTS c = TechCard PANEL
+    PROPERTIES (c) tcName READONLYIF cardStatus(c) != TechCardStatus.draft,
+        tcValidFrom READONLYIF cardStatus(c) != TechCardStatus.draft,
+        tcValidTo READONLYIF cardStatus(c) != TechCardStatus.draft,
+        tcDescription READONLYIF cardStatus(c) != TechCardStatus.draft
+    PROPERTIES (c) READONLY nameTcCrop, nameTcOrganization
+    PROPERTIES (c) setTcCropAct, setTcOrgAct
+    PROPERTIES (c) READONLY nameCardStatus, tcVersion, nameTcBasedOn, nameTcAuthor, tcCreatedAt, tcApprovedAt, nameTcApprovedBy, opCount, laborTotal, materialSummary
+    PROPERTIES (c) approveTechCard, copyTechCard, newTechCardVersion
+
+    OBJECTS o = TechOperation
+    PROPERTIES (o) NEWSESSION NEW, DELETE
+    PROPERTIES (o) READONLY nameWorkType, namePhaseTrigger
+    PROPERTIES (o) setWorkTypeAct, setPhaseTriggerAct
+    PROPERTIES (o) seqNo READONLYIF cardStatus(card(o)) != TechCardStatus.draft,
+        opDateFrom READONLYIF cardStatus(card(o)) != TechCardStatus.draft,
+        opDateTo READONLYIF cardStatus(card(o)) != TechCardStatus.draft,
+        outputRate READONLYIF cardStatus(card(o)) != TechCardStatus.draft,
+        outputUnit READONLYIF cardStatus(card(o)) != TechCardStatus.draft
+    FILTERS card(o) = c
+    ORDERS seqNo(o)
+
+    OBJECTS m = OperationMaterial
+    PROPERTIES (m) NEWSESSION NEW, DELETE
+    PROPERTIES (m) READONLY nameMaterial, nameMatUnit, nameMatMethod
+    PROPERTIES (m) setMatNomAct, setMatUnitAct, setMatMethodAct
+    PROPERTIES (m) matRate READONLYIF cardStatus(card(operation(m))) != TechCardStatus.draft,
+        matDepth READONLYIF cardStatus(card(operation(m))) != TechCardStatus.draft,
+        matNote READONLYIF cardStatus(card(operation(m))) != TechCardStatus.draft
+    FILTERS operation(m) = o
+
+    OBJECTS f = OperationFuel
+    PROPERTIES (f) NEWSESSION NEW, DELETE
+    PROPERTIES (f) READONLY nameFuel, nameFuelUnit
+    PROPERTIES (f) setFuelNomAct, setFuelUnitAct
+    PROPERTIES (f) fuelRate READONLYIF cardStatus(card(operation(f))) != TechCardStatus.draft,
+        usageFactor READONLYIF cardStatus(card(operation(f))) != TechCardStatus.draft
+    FILTERS operation(f) = o
+
+    OBJECTS l = OperationLabor
+    PROPERTIES (l) NEWSESSION NEW, DELETE
+    PROPERTIES (l) READONLY nameProfession, nameLaborUnit
+    PROPERTIES (l) setProfessionAct, setLaborUnitAct
+    PROPERTIES (l) timeRate READONLYIF cardStatus(card(operation(l))) != TechCardStatus.draft,
+        workersCount READONLYIF cardStatus(card(operation(l))) != TechCardStatus.draft
+    FILTERS operation(l) = o
+
+    EDIT TechCard OBJECT c
+;
+
+
+// ===================== REST-ручки (sync-методы СТ) =====================
+kuOrgTc () = GROUP MAX Organization o IF name(o) = 'Омский АНЦ';
+
+apiTechCardCreate 'API: создать ТК' (ISTRING[150] cardName, ISTRING[16] cropCode, ISTRING opsJson) {
+    // opsJson: [{"seqNo":1,"wt":"АГРО-001"}, ...]
+    IF NOT cardName OR NOT (GROUP MAX Crop cp IF code(cp) = cropCode) THEN {
+        EXPORT JSON FROM error = 'не задано имя карты или культура с кодом не найдена';
+    } ELSE {
+        NEW c = TechCard {
+            tcName(c) <- cardName;
+            tcCrop(c) <- GROUP MAX Crop cp IF code(cp) = cropCode;
+            tcOrganization(c) <- kuOrgTc();
+        }
+        APPLY;
+        IF canceled() THEN
+            EXPORT JSON FROM error = applyMessage();
+        ELSE {
+            IMPORT JSON FROM opsJson FIELDS INTEGER seqNo, ISTRING wt DO
+                FOR WorkType w IS WorkType AND wtCode(w) = wt DO
+                    NEW o = TechOperation {
+                        card(o) <- GROUP MAX TechCard c IF tcName(c) = cardName;
+                        seqNo(o) <- seqNo;
+                        workType(o) <- w;
+                    }
+            APPLY;
+            EXPORT JSON FROM name = tcName(TechCard c), version = tcVersion(c), status = nameCardStatus(c)
+            WHERE tcName(c) = cardName;
+        }
+    }
+    RETURN JSONFILE(exportFile());
+}
+
+apiTechCardApprove 'API: утвердить ТК' (ISTRING[150] cardName) {
+    // NOT opCount — NULL-безопасная проверка пустой карты (GROUP SUM пустого = NULL)
+    IF (GROUP MAX TechCard c IF tcName(c) = cardName AND NOT opCount(c)) THEN {
+        EXPORT JSON FROM error = 'в карте нет операций';
+    } ELSE {
+        FOR TechCard c IS TechCard AND tcName(c) = cardName DO {
+            cardStatus(c) <- TechCardStatus.approved;
+            tcApprovedAt(c) <- currentDateTime();
+        }
+        APPLY;
+        EXPORT JSON FROM name = tcName(TechCard c), version = tcVersion(c), status = nameCardStatus(c), approvedAt = tcApprovedAt(c)
+        WHERE tcName(c) = cardName;
+    }
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== Excel-выгрузка =====================
+exportTechCardsXls () + {
+    PRINT techCards XLSX SHEET 'Техкарты' TO exportFile;
+    open(exportFile());
+}
+
+// ===================== Сид =====================
+uKg () = GROUP MAX Unit u IF okeiCode(u) = '054';
+uT () = GROUP MAX Unit u IF okeiCode(u) = '168';
+uL () = GROUP MAX Unit u IF okeiCode(u) = '112';
+uHa () = GROUP MAX Unit u IF okeiCode(u) = '061';
+uPc () = GROUP MAX Unit u IF okeiCode(u) = '796';
+uC () = GROUP MAX Unit u IF okeiCode(u) = '236';
+wheatTc () = GROUP MAX Crop c IF code(c) = 'ЗЕР-001';
+cornTc () = GROUP MAX Crop c IF code(c) = 'ЗЕР-003';
+fallowTc () = GROUP MAX Crop c IF code(c) = 'ПАР-001';
+wtBy (ISTRING[12] cd) = GROUP MAX WorkType w IF wtCode(w) = cd;
+nomBy (ISTRING[20] cd) = GROUP MAX Nomenclature n IF nomCode(n) = cd;
+amBy (ISTRING[12] cd) = GROUP MAX ApplicationMethod am IF amCode(am) = cd;
+profBy (ISTRING[16] cd) = GROUP MAX Profession pr IF profCode(pr) = cd;
+
+// п.12 UI-обзора: дозаправка базовых единиц ОКЕИ (идемпотентно по коду;
+// существующие 054/061/112/168/236/796 не трогаем — на них завязаны lookup'ы.
+// ⚠-допущение ADR-6: мнемокоды/коэффициенты — по тексту ОК 015-94 для базовых
+// величин; агропроизводные (кг/га и т.п.) — локальные в стиле существующего
+// 112a=л/га; полный классификатор — при передаче файла владельцем
+unitSeed () {
+    IF NOT unitByOkei('006') THEN NEW u = Unit { okeiCode(u) <- '006'; nameUnit(u) <- 'Метр'; symbol(u) <- 'м'; unitGroup(u) <- 'Единицы длины'; unitKind(u) <- 'базовая'; unitIsInteger(u) <- NULL; }
+    IF NOT unitByOkei('008') THEN NEW u = Unit { okeiCode(u) <- '008'; nameUnit(u) <- 'Километр'; symbol(u) <- 'км'; unitGroup(u) <- 'Единицы длины'; unitKind(u) <- 'производная'; baseUnit(u) <- unitByOkei('006'); factor(u) <- 1000.0; }
+    IF NOT unitByOkei('055') THEN NEW u = Unit { okeiCode(u) <- '055'; nameUnit(u) <- 'Квадратный метр'; symbol(u) <- 'м2'; unitGroup(u) <- 'Единицы площади'; unitKind(u) <- 'базовая'; }
+    IF NOT unitByOkei('113') THEN NEW u = Unit { okeiCode(u) <- '113'; nameUnit(u) <- 'Кубический метр'; symbol(u) <- 'м3'; unitGroup(u) <- 'Единицы объёма'; unitKind(u) <- 'базовая'; }
+    IF NOT unitByOkei('163') THEN NEW u = Unit { okeiCode(u) <- '163'; nameUnit(u) <- 'Грамм'; symbol(u) <- 'г'; unitGroup(u) <- 'Единицы массы'; unitKind(u) <- 'производная'; baseUnit(u) <- unitByOkei('054'); factor(u) <- 0.001; }
+    IF NOT unitByOkei('206') THEN NEW u = Unit { okeiCode(u) <- '206'; nameUnit(u) <- 'Центнер'; symbol(u) <- 'ц'; unitGroup(u) <- 'Единицы массы'; unitKind(u) <- 'производная'; baseUnit(u) <- unitByOkei('168'); factor(u) <- 0.1; }
+    IF NOT unitByOkei('003') THEN NEW u = Unit { okeiCode(u) <- '003'; nameUnit(u) <- 'Миллиметр'; symbol(u) <- 'мм'; unitGroup(u) <- 'Единицы длины'; unitKind(u) <- 'производная'; baseUnit(u) <- unitByOkei('006'); factor(u) <- 0.001; }
+    IF NOT unitByOkei('359') THEN NEW u = Unit { okeiCode(u) <- '359'; nameUnit(u) <- 'Сутки'; symbol(u) <- 'сут'; unitGroup(u) <- 'Единицы времени'; unitKind(u) <- 'производная'; baseUnit(u) <- unitByOkei('236'); factor(u) <- 24.0; }
+    IF NOT unitByOkei('355') THEN NEW u = Unit { okeiCode(u) <- '355'; nameUnit(u) <- 'Секунда'; symbol(u) <- 'с'; unitGroup(u) <- 'Единицы времени'; unitKind(u) <- 'производная'; baseUnit(u) <- unitByOkei('236'); factor(u) <- 0.000277778; }
+    IF NOT unitByOkei('054a') THEN NEW u = Unit { okeiCode(u) <- '054a'; nameUnit(u) <- 'Килограмм на гектар'; symbol(u) <- 'кг/га'; unitGroup(u) <- 'Агрономические'; unitKind(u) <- 'производная'; unitLocal(u) <- TRUE; }
+    IF NOT unitByOkei('168a') THEN NEW u = Unit { okeiCode(u) <- '168a'; nameUnit(u) <- 'Тонна на гектар'; symbol(u) <- 'т/га'; unitGroup(u) <- 'Агрономические'; unitKind(u) <- 'производная'; unitLocal(u) <- TRUE; }
+    IF NOT unitByOkei('206a') THEN NEW u = Unit { okeiCode(u) <- '206a'; nameUnit(u) <- 'Центнер на гектар'; symbol(u) <- 'ц/га'; unitGroup(u) <- 'Агрономические'; unitKind(u) <- 'производная'; unitLocal(u) <- TRUE; }
+    IF NOT unitByOkei('PCT') THEN NEW u = Unit { okeiCode(u) <- 'PCT'; nameUnit(u) <- 'Процент'; symbol(u) <- '%'; unitGroup(u) <- 'Относительные'; unitKind(u) <- 'базовая'; unitLocal(u) <- TRUE; unitDescription(u) <- 'локальный код PCT (канонический код ОКЕИ уточнить по классификатору)'; }
+    APPLY;
+}
+
+techCardSeed () {
+    IF NOT (GROUP MAX Unit u) THEN {
+        NEW u = Unit { okeiCode(u) <- '054'; nameUnit(u) <- 'Килограмм'; symbol(u) <- 'кг'; unitGroup(u) <- 'масса'; unitKind(u) <- 'основная'; }
+        NEW u = Unit { okeiCode(u) <- '168'; nameUnit(u) <- 'Тонна'; symbol(u) <- 'т'; unitGroup(u) <- 'масса'; unitKind(u) <- 'производная'; baseUnit(u) <- uKg(); factor(u) <- 1000.0; }
+        NEW u = Unit { okeiCode(u) <- '112'; nameUnit(u) <- 'Литр'; symbol(u) <- 'л'; unitGroup(u) <- 'объем'; unitKind(u) <- 'основная'; }
+        NEW u = Unit { okeiCode(u) <- '061'; nameUnit(u) <- 'Гектар'; symbol(u) <- 'га'; unitGroup(u) <- 'площадь'; unitKind(u) <- 'основная'; }
+        NEW u = Unit { okeiCode(u) <- '796'; nameUnit(u) <- 'Штука'; symbol(u) <- 'шт'; unitGroup(u) <- 'прочее'; unitKind(u) <- 'основная'; }
+        NEW u = Unit { okeiCode(u) <- '236'; nameUnit(u) <- 'Час'; symbol(u) <- 'ч'; unitGroup(u) <- 'время'; unitKind(u) <- 'основная'; }
+        NEW u = Unit { okeiCode(u) <- '112a'; nameUnit(u) <- 'Литр на гектар'; symbol(u) <- 'л/га'; unitGroup(u) <- 'прочее'; unitKind(u) <- 'производная'; }
+        APPLY;
+    }
+    IF NOT (GROUP MAX WorkType w) THEN {
+        NEW w = WorkType { wtCode(w) <- 'АГРО-001'; wtName(w) <- 'Вспашка'; wtGroup(w) <- 'агротехнические'; wtKind(w) <- 'обработка почвы'; wtSeason(w) <- 'осенняя'; wtOutputRate(w) <- 8.0; wtOutputUnit(w) <- uHa(); }
+        NEW w = WorkType { wtCode(w) <- 'АГРО-002'; wtName(w) <- 'Культивация'; wtGroup(w) <- 'агротехнические'; wtKind(w) <- 'обработка почвы'; wtSeason(w) <- 'весенняя'; wtOutputRate(w) <- 30.0; wtOutputUnit(w) <- uHa(); }
+        NEW w = WorkType { wtCode(w) <- 'АГРО-003'; wtName(w) <- 'Посев'; wtGroup(w) <- 'агротехнические'; wtKind(w) <- 'посев'; wtSeason(w) <- 'весенняя'; wtOutputRate(w) <- 25.0; wtOutputUnit(w) <- uHa(); }
+        NEW w = WorkType { wtCode(w) <- 'АГРО-004'; wtName(w) <- 'Прикатывание'; wtGroup(w) <- 'агротехнические'; wtKind(w) <- 'обработка почвы'; wtSeason(w) <- 'весенняя'; wtOutputRate(w) <- 40.0; wtOutputUnit(w) <- uHa(); }
+        NEW w = WorkType { wtCode(w) <- 'АГРО-005'; wtName(w) <- 'Азотная подкормка'; wtGroup(w) <- 'агротехнические'; wtKind(w) <- 'внесение удобрений'; wtSeason(w) <- 'весенняя'; wtBbch(w) <- '25'; }
+        NEW w = WorkType { wtCode(w) <- 'АГРО-006'; wtName(w) <- 'Комплексная подкормка'; wtGroup(w) <- 'агротехнические'; wtKind(w) <- 'внесение удобрений'; wtSeason(w) <- 'весенняя'; wtBbch(w) <- '30'; }
+        NEW w = WorkType { wtCode(w) <- 'АГРО-007'; wtName(w) <- 'Гербицидная обработка'; wtGroup(w) <- 'агротехнические'; wtKind(w) <- 'внесение СЗР'; wtSeason(w) <- 'весенняя'; wtBbch(w) <- '13'; }
+        NEW w = WorkType { wtCode(w) <- 'АГРО-008'; wtName(w) <- 'Фунгицидная обработка'; wtGroup(w) <- 'агротехнические'; wtKind(w) <- 'внесение СЗР'; wtSeason(w) <- 'летняя'; wtBbch(w) <- '59'; }
+        NEW w = WorkType { wtCode(w) <- 'АГРО-009'; wtName(w) <- 'Инсектицидная обработка'; wtGroup(w) <- 'агротехнические'; wtKind(w) <- 'внесение СЗР'; wtSeason(w) <- 'летняя'; }
+        NEW w = WorkType { wtCode(w) <- 'АГРО-010'; wtName(w) <- 'Уборка'; wtGroup(w) <- 'агротехнические'; wtKind(w) <- 'уборка'; wtSeason(w) <- 'летняя'; wtOutputRate(w) <- 12.0; wtOutputUnit(w) <- uHa(); }
+        NEW w = WorkType { wtCode(w) <- 'АГРО-011'; wtName(w) <- 'Дискование'; wtGroup(w) <- 'агротехнические'; wtKind(w) <- 'обработка почвы'; wtSeason(w) <- 'осенняя'; wtOutputRate(w) <- 25.0; wtOutputUnit(w) <- uHa(); }
+        NEW w = WorkType { wtCode(w) <- 'АГРО-012'; wtName(w) <- 'Боронование'; wtGroup(w) <- 'агротехнические'; wtKind(w) <- 'обработка почвы'; wtSeason(w) <- 'весенняя'; }
+        NEW w = WorkType { wtCode(w) <- 'ЛОГ-001'; wtName(w) <- 'Перевозка зерна'; wtGroup(w) <- 'логистические'; wtKind(w) <- 'транспортировка'; wtSeason(w) <- 'летняя'; }
+        APPLY;
+    }
+    IF NOT (GROUP MAX Phase ph) THEN {
+        NEW ph = Phase { bbchCode(ph) <- '00'; phaseName(ph) <- 'Посев (сухое семя)'; phaseGroup(ph) <- 'прорастание'; phaseCrop(ph) <- wheatTc(); gddDays(ph) <- 0; }
+        NEW ph = Phase { bbchCode(ph) <- '10'; phaseName(ph) <- 'Начало прорастания'; phaseGroup(ph) <- 'прорастание'; phaseCrop(ph) <- wheatTc(); gddDays(ph) <- 80; }
+        NEW ph = Phase { bbchCode(ph) <- '13'; phaseName(ph) <- '3 листа'; phaseGroup(ph) <- 'рост побегов'; phaseCrop(ph) <- wheatTc(); gddDays(ph) <- 180; }
+        NEW ph = Phase { bbchCode(ph) <- '25'; phaseName(ph) <- 'Кущение'; phaseGroup(ph) <- 'кущение'; phaseCrop(ph) <- wheatTc(); gddDays(ph) <- 320; }
+        NEW ph = Phase { bbchCode(ph) <- '30'; phaseName(ph) <- 'Начало выхода в трубку'; phaseGroup(ph) <- 'стеблевание'; phaseCrop(ph) <- wheatTc(); gddDays(ph) <- 420; }
+        NEW ph = Phase { bbchCode(ph) <- '59'; phaseName(ph) <- 'Колошение 50%'; phaseGroup(ph) <- 'колошение'; phaseCrop(ph) <- wheatTc(); gddDays(ph) <- 750; }
+        NEW ph = Phase { bbchCode(ph) <- '77'; phaseName(ph) <- 'Молочная спелость'; phaseGroup(ph) <- 'созревание'; phaseCrop(ph) <- wheatTc(); gddDays(ph) <- 1050; }
+        NEW ph = Phase { bbchCode(ph) <- '90'; phaseName(ph) <- 'Полная спелость'; phaseGroup(ph) <- 'созревание'; phaseCrop(ph) <- wheatTc(); gddDays(ph) <- 1400; }
+        NEW ph = Phase { bbchCode(ph) <- '13'; phaseName(ph) <- '3 листа (кукуруза)'; phaseGroup(ph) <- 'рост побегов'; phaseCrop(ph) <- cornTc(); gddDays(ph) <- 200; }
+        NEW ph = Phase { bbchCode(ph) <- '59'; phaseName(ph) <- 'Цветение (кукуруза)'; phaseGroup(ph) <- 'цветение'; phaseCrop(ph) <- cornTc(); gddDays(ph) <- 700; }
+        APPLY;
+    }
+    IF NOT (GROUP MAX Nomenclature n) THEN {
+        NEW n = Nomenclature { nomCode(n) <- 'N-00001'; nomName(n) <- 'Семена пшеницы (элита)'; nomType(n) <- NomType.seeds; nomGroup(n) <- 'Пшеница озимая'; unit(n) <- uT(); basePrice(n) <- 32000.0; minStock(n) <- 10.0; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00002'; nomName(n) <- 'Семена кукурузы (гибрид)'; nomType(n) <- NomType.seeds; nomGroup(n) <- 'Кукуруза'; unit(n) <- uT(); basePrice(n) <- 95000.0; minStock(n) <- 5.0; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00003'; nomName(n) <- 'Карбамид (N 46%)'; nomType(n) <- NomType.fertilizer; nomGroup(n) <- 'Азотные'; unit(n) <- uT(); basePrice(n) <- 24500.0; activeIngredient(n) <- 46.0; minStock(n) <- 5.0; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00004'; nomName(n) <- 'Аммиачная селитра'; nomType(n) <- NomType.fertilizer; nomGroup(n) <- 'Азотные'; unit(n) <- uT(); basePrice(n) <- 22000.0; activeIngredient(n) <- 34.5; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00005'; nomName(n) <- 'NPK-комплекс 16-16-16'; nomType(n) <- NomType.fertilizer; nomGroup(n) <- 'Комплексные'; unit(n) <- uT(); basePrice(n) <- 38000.0; activeIngredient(n) <- 48.0; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00006'; nomName(n) <- 'Суперфосфат двойной'; nomType(n) <- NomType.fertilizer; nomGroup(n) <- 'Фосфорные'; unit(n) <- uT(); basePrice(n) <- 33000.0; activeIngredient(n) <- 46.0; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00007'; nomName(n) <- 'Сульфат калия'; nomType(n) <- NomType.fertilizer; nomGroup(n) <- 'Калийные'; unit(n) <- uT(); basePrice(n) <- 36000.0; activeIngredient(n) <- 50.0; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00008'; nomName(n) <- 'Гербицид «Гранстар»'; nomType(n) <- NomType.pesticide; nomGroup(n) <- 'Гербициды'; unit(n) <- uKg(); basePrice(n) <- 1800.0; activeIngredient(n) <- 75.0; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00009'; nomName(n) <- 'Фунгицид «Рекс Дуо»'; nomType(n) <- NomType.pesticide; nomGroup(n) <- 'Фунгициды'; unit(n) <- uL(); basePrice(n) <- 2400.0; activeIngredient(n) <- 50.0; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00010'; nomName(n) <- 'Инсектицид «Децис»'; nomType(n) <- NomType.pesticide; nomGroup(n) <- 'Инсектициды'; unit(n) <- uL(); basePrice(n) <- 2100.0; activeIngredient(n) <- 25.0; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00011'; nomName(n) <- 'Дизельное топливо ЕВРО'; nomType(n) <- NomType.fuel; nomGroup(n) <- 'Топливо'; unit(n) <- uL(); basePrice(n) <- 62.0; minStock(n) <- 2000.0; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00012'; nomName(n) <- 'Масло моторное'; nomType(n) <- NomType.fuel; nomGroup(n) <- 'Смазочные'; unit(n) <- uL(); basePrice(n) <- 480.0; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00013'; nomName(n) <- 'Зерно пшеницы 3 класса'; nomType(n) <- NomType.product; nomGroup(n) <- 'Пшеница озимая'; unit(n) <- uT(); basePrice(n) <- 14500.0; }
+        NEW n = Nomenclature { nomCode(n) <- 'N-00014'; nomName(n) <- 'Зерно кукурузы'; nomType(n) <- NomType.product; nomGroup(n) <- 'Кукуруза'; unit(n) <- uT(); basePrice(n) <- 12800.0; }
+        APPLY;
+    }
+    IF NOT (GROUP MAX ApplicationMethod am) THEN {
+        NEW am = ApplicationMethod { amCode(am) <- 'MV-001'; amName(am) <- 'Сплошное поверхностное'; applyKind(am) <- ApplyKind.surface; resourceKind(am) <- ResourceKind.fertilizer; amSeason(am) <- 'весенняя'; amSpeed(am) <- 12.0; widthM(am) <- 18.0; }
+        NEW am = ApplicationMethod { amCode(am) <- 'MV-002'; amName(am) <- 'Глубокое заделывание'; applyKind(am) <- ApplyKind.deep; resourceKind(am) <- ResourceKind.fertilizer; depthMin(am) <- 10.0; depthMax(am) <- 20.0; amSpeed(am) <- 8.0; widthM(am) <- 4.0; }
+        NEW am = ApplicationMethod { amCode(am) <- 'MV-003'; amName(am) <- 'Ленточное припосевное'; applyKind(am) <- ApplyKind.ribbon; resourceKind(am) <- ResourceKind.fertilizer; depthMin(am) <- 5.0; depthMax(am) <- 8.0; }
+        NEW am = ApplicationMethod { amCode(am) <- 'MV-004'; amName(am) <- 'Опрыскивание'; applyKind(am) <- ApplyKind.surface; resourceKind(am) <- ResourceKind.pesticide; amSpeed(am) <- 14.0; widthM(am) <- 21.0; }
+        NEW am = ApplicationMethod { amCode(am) <- 'MV-005'; amName(am) <- 'Точечное внесение'; applyKind(am) <- ApplyKind.point; resourceKind(am) <- ResourceKind.pesticide; }
+        NEW am = ApplicationMethod { amCode(am) <- 'MV-006'; amName(am) <- 'Известкование'; applyKind(am) <- ApplyKind.surface; resourceKind(am) <- ResourceKind.liming; }
+        APPLY;
+    }
+    IF NOT (GROUP MAX Profession pr) THEN {
+        NEW pr = Profession { profCode(pr) <- 'PROF-001'; profName(pr) <- 'Агроном'; profCategory(pr) <- 'специалисты'; profGroup(pr) <- 'агрономическая служба'; education(pr) <- 'высшее'; baseRate(pr) <- 550.0; rateUnit(pr) <- uC(); }
+        NEW pr = Profession { profCode(pr) <- 'PROF-002'; profName(pr) <- 'Агроном по защите растений'; profCategory(pr) <- 'специалисты'; profGroup(pr) <- 'агрономическая служба'; education(pr) <- 'высшее'; baseRate(pr) <- 550.0; rateUnit(pr) <- uC(); }
+        NEW pr = Profession { profCode(pr) <- 'PROF-003'; profName(pr) <- 'Механизатор'; profCategory(pr) <- 'рабочие'; profGroup(pr) <- 'механизаторская служба'; education(pr) <- 'среднее профессиональное'; baseRate(pr) <- 480.0; rateUnit(pr) <- uC(); }
+        NEW pr = Profession { profCode(pr) <- 'PROF-004'; profName(pr) <- 'Водитель'; profCategory(pr) <- 'рабочие'; profGroup(pr) <- 'механизаторская служба'; education(pr) <- 'среднее профессиональное'; baseRate(pr) <- 420.0; rateUnit(pr) <- uC(); }
+        NEW pr = Profession { profCode(pr) <- 'PROF-005'; profName(pr) <- 'Экономист'; profCategory(pr) <- 'специалисты'; profGroup(pr) <- 'финансовая служба'; education(pr) <- 'высшее'; baseRate(pr) <- 500.0; rateUnit(pr) <- uC(); }
+        APPLY;
+    }
+    IF NOT (GROUP MAX TechCard c) THEN {
+        LOCAL wcard = TechCard ();
+        NEW c = TechCard {
+            tcName(c) <- 'Пшеница озимая — Интенсивная 2.0';
+            tcCrop(c) <- wheatTc();
+            tcOrganization(c) <- kuOrgTc();
+            tcValidFrom(c) <- 2027_01_01;
+            tcValidTo(c) <- 2029_12_31;
+            wcard() <- c;
+        }
+        NEW o = TechOperation { card(o) <- wcard(); seqNo(o) <- 1; workType(o) <- wtBy('АГРО-001'); outputRate(o) <- 8.0; outputUnit(o) <- uHa(); }
+        NEW o = TechOperation { card(o) <- wcard(); seqNo(o) <- 2; workType(o) <- wtBy('АГРО-003'); phaseTrigger(o) <- GROUP MAX Phase ph IF bbchCode(ph) = '00'; outputRate(o) <- 25.0; outputUnit(o) <- uHa(); }
+        NEW o = TechOperation { card(o) <- wcard(); seqNo(o) <- 3; workType(o) <- wtBy('АГРО-005'); phaseTrigger(o) <- GROUP MAX Phase ph IF bbchCode(ph) = '25'; }
+        NEW o = TechOperation { card(o) <- wcard(); seqNo(o) <- 4; workType(o) <- wtBy('АГРО-007'); phaseTrigger(o) <- GROUP MAX Phase ph IF bbchCode(ph) = '13'; }
+        NEW o = TechOperation { card(o) <- wcard(); seqNo(o) <- 5; workType(o) <- wtBy('АГРО-006'); phaseTrigger(o) <- GROUP MAX Phase ph IF bbchCode(ph) = '30'; }
+        NEW o = TechOperation { card(o) <- wcard(); seqNo(o) <- 6; workType(o) <- wtBy('АГРО-008'); phaseTrigger(o) <- GROUP MAX Phase ph IF bbchCode(ph) = '59'; }
+        NEW o = TechOperation { card(o) <- wcard(); seqNo(o) <- 7; workType(o) <- wtBy('АГРО-009'); }
+        NEW o = TechOperation { card(o) <- wcard(); seqNo(o) <- 8; workType(o) <- wtBy('АГРО-010'); phaseTrigger(o) <- GROUP MAX Phase ph IF bbchCode(ph) = '90'; outputRate(o) <- 12.0; outputUnit(o) <- uHa(); }
+        APPLY;
+        // статус approved — дозаправкой (WHEN SET даёт draft)
+        FOR TechCard c IS TechCard AND tcName(c) = 'Пшеница озимая — Интенсивная 2.0' DO {
+            cardStatus(c) <- TechCardStatus.approved;
+            tcApprovedAt(c) <- currentDateTime();
+        }
+        // кукуруза — стандарт (7 операций, approved)
+        LOCAL ccard = TechCard ();
+        NEW c = TechCard {
+            tcName(c) <- 'Кукуруза — стандарт';
+            tcCrop(c) <- cornTc();
+            tcOrganization(c) <- kuOrgTc();
+            ccard() <- c;
+        }
+        NEW o = TechOperation { card(o) <- ccard(); seqNo(o) <- 1; workType(o) <- wtBy('АГРО-011'); outputRate(o) <- 25.0; outputUnit(o) <- uHa(); }
+        NEW o = TechOperation { card(o) <- ccard(); seqNo(o) <- 2; workType(o) <- wtBy('АГРО-003'); outputRate(o) <- 20.0; outputUnit(o) <- uHa(); }
+        NEW o = TechOperation { card(o) <- ccard(); seqNo(o) <- 3; workType(o) <- wtBy('АГРО-006'); phaseTrigger(o) <- GROUP MAX Phase ph IF bbchCode(ph) = 'C-13'; }
+        NEW o = TechOperation { card(o) <- ccard(); seqNo(o) <- 4; workType(o) <- wtBy('АГРО-007'); }
+        NEW o = TechOperation { card(o) <- ccard(); seqNo(o) <- 5; workType(o) <- wtBy('АГРО-008'); phaseTrigger(o) <- GROUP MAX Phase ph IF bbchCode(ph) = 'C-59'; }
+        NEW o = TechOperation { card(o) <- ccard(); seqNo(o) <- 6; workType(o) <- wtBy('АГРО-009'); }
+        NEW o = TechOperation { card(o) <- ccard(); seqNo(o) <- 7; workType(o) <- wtBy('АГРО-010'); outputRate(o) <- 10.0; outputUnit(o) <- uHa(); }
+        APPLY;
+        FOR TechCard c IS TechCard AND tcName(c) = 'Кукуруза — стандарт' DO {
+            cardStatus(c) <- TechCardStatus.approved;
+            tcApprovedAt(c) <- currentDateTime();
+        }
+        // пар сидеральный — черновик (демо «утвердить нельзя: нет операций» -> тут 3 операции, утвердим позже)
+        LOCAL pcard = TechCard ();
+        NEW c = TechCard {
+            tcName(c) <- 'Пар сидеральный';
+            tcCrop(c) <- fallowTc();
+            tcOrganization(c) <- kuOrgTc();
+            pcard() <- c;
+        }
+        NEW o = TechOperation { card(o) <- pcard(); seqNo(o) <- 1; workType(o) <- wtBy('АГРО-011'); }
+        NEW o = TechOperation { card(o) <- pcard(); seqNo(o) <- 2; workType(o) <- wtBy('АГРО-012'); }
+        NEW o = TechOperation { card(o) <- pcard(); seqNo(o) <- 3; workType(o) <- wtBy('АГРО-001'); }
+        APPLY;
+    }
+    // материалы/ГСМ/трудозатраты — отдельным идемпотентным блоком
+    // (LOCAL обнуляется после APPLY, поэтому lookup по имени карты)
+    IF NOT (GROUP MAX OperationMaterial m) THEN {
+        FOR TechOperation o IS TechOperation AND tcName(card(o)) = 'Пшеница озимая — Интенсивная 2.0' AND seqNo(o) = 1 DO {
+            NEW l = OperationLabor { operation(l) <- o; profession(l) <- profBy('PROF-003'); timeRate(l) <- 0.9; laborUnit(l) <- uC(); workersCount(l) <- 1; }
+            NEW f = OperationFuel { operation(f) <- o; fuelNomenclature(f) <- nomBy('N-00011'); fuelRate(f) <- 18.0; fuelUnit(f) <- uL(); }
+        }
+        FOR TechOperation o IS TechOperation AND tcName(card(o)) = 'Пшеница озимая — Интенсивная 2.0' AND seqNo(o) = 2 DO {
+            NEW m = OperationMaterial { operation(m) <- o; nomenclature(m) <- nomBy('N-00001'); matRate(m) <- 0.22; matUnit(m) <- uT(); method(m) <- amBy('MV-003'); }
+            NEW m = OperationMaterial { operation(m) <- o; nomenclature(m) <- nomBy('N-00005'); matRate(m) <- 0.1; matUnit(m) <- uT(); method(m) <- amBy('MV-003'); }
+            NEW l = OperationLabor { operation(l) <- o; profession(l) <- profBy('PROF-003'); timeRate(l) <- 0.4; laborUnit(l) <- uC(); workersCount(l) <- 1; }
+            NEW f = OperationFuel { operation(f) <- o; fuelNomenclature(f) <- nomBy('N-00011'); fuelRate(f) <- 9.0; fuelUnit(f) <- uL(); }
+        }
+        FOR TechOperation o IS TechOperation AND tcName(card(o)) = 'Пшеница озимая — Интенсивная 2.0' AND seqNo(o) = 3 DO {
+            NEW m = OperationMaterial { operation(m) <- o; nomenclature(m) <- nomBy('N-00003'); matRate(m) <- 0.15; matUnit(m) <- uT(); method(m) <- amBy('MV-001'); }
+            NEW l = OperationLabor { operation(l) <- o; profession(l) <- profBy('PROF-003'); timeRate(l) <- 0.25; laborUnit(l) <- uC(); }
+        }
+        FOR TechOperation o IS TechOperation AND tcName(card(o)) = 'Пшеница озимая — Интенсивная 2.0' AND seqNo(o) = 4 DO {
+            NEW m = OperationMaterial { operation(m) <- o; nomenclature(m) <- nomBy('N-00008'); matRate(m) <- 0.02; matUnit(m) <- uKg(); method(m) <- amBy('MV-004'); }
+            NEW l = OperationLabor { operation(l) <- o; profession(l) <- profBy('PROF-003'); timeRate(l) <- 0.2; laborUnit(l) <- uC(); }
+            NEW f = OperationFuel { operation(f) <- o; fuelNomenclature(f) <- nomBy('N-00011'); fuelRate(f) <- 5.0; fuelUnit(f) <- uL(); }
+        }
+        FOR TechOperation o IS TechOperation AND tcName(card(o)) = 'Пшеница озимая — Интенсивная 2.0' AND seqNo(o) = 5 DO {
+            NEW m = OperationMaterial { operation(m) <- o; nomenclature(m) <- nomBy('N-00005'); matRate(m) <- 0.12; matUnit(m) <- uT(); method(m) <- amBy('MV-001'); }
+            NEW l = OperationLabor { operation(l) <- o; profession(l) <- profBy('PROF-003'); timeRate(l) <- 0.25; laborUnit(l) <- uC(); }
+        }
+        FOR TechOperation o IS TechOperation AND tcName(card(o)) = 'Пшеница озимая — Интенсивная 2.0' AND seqNo(o) = 6 DO {
+            NEW m = OperationMaterial { operation(m) <- o; nomenclature(m) <- nomBy('N-00009'); matRate(m) <- 0.5; matUnit(m) <- uL(); method(m) <- amBy('MV-004'); }
+            NEW l = OperationLabor { operation(l) <- o; profession(l) <- profBy('PROF-003'); timeRate(l) <- 0.2; laborUnit(l) <- uC(); }
+            NEW f = OperationFuel { operation(f) <- o; fuelNomenclature(f) <- nomBy('N-00011'); fuelRate(f) <- 5.0; fuelUnit(f) <- uL(); }
+        }
+        FOR TechOperation o IS TechOperation AND tcName(card(o)) = 'Пшеница озимая — Интенсивная 2.0' AND seqNo(o) = 8 DO {
+            NEW l = OperationLabor { operation(l) <- o; profession(l) <- profBy('PROF-003'); timeRate(l) <- 0.8; laborUnit(l) <- uC(); workersCount(l) <- 2; }
+            NEW f = OperationFuel { operation(f) <- o; fuelNomenclature(f) <- nomBy('N-00011'); fuelRate(f) <- 22.0; fuelUnit(f) <- uL(); }
+        }
+        APPLY;
+        FOR TechOperation o IS TechOperation AND tcName(card(o)) = 'Кукуруза — стандарт' AND seqNo(o) = 2 DO {
+            NEW m = OperationMaterial { operation(m) <- o; nomenclature(m) <- nomBy('N-00002'); matRate(m) <- 0.025; matUnit(m) <- uT(); method(m) <- amBy('MV-003'); }
+            NEW l = OperationLabor { operation(l) <- o; profession(l) <- profBy('PROF-003'); timeRate(l) <- 0.5; laborUnit(l) <- uC(); }
+            NEW f = OperationFuel { operation(f) <- o; fuelNomenclature(f) <- nomBy('N-00011'); fuelRate(f) <- 10.0; fuelUnit(f) <- uL(); }
+        }
+        APPLY;
+    }
+}
+
+// КФ-8: идемпотентная миграция продукция→культура (по имени; значения те же,
+// что использовал поиск по nomGroup — эталоны БДР не меняются)
+prodCropMigrate () {
+    FOR Nomenclature n IS Nomenclature AND nomType(n) = NomType.product AND NOT prodCrop(n) DO
+        prodCrop(n) <- GROUP MAX Crop c IF name(c) = nomGroup(n);
+    APPLY;
+}
+
+// КФ-П2: идемпотентная миграция групп номенклатуры: ссылки 1:1 по именам;
+// недостающие группы создаются с кодом NG-NNN
+// Урок (10.10, дорогой): второй цикл создавал NomGroup НА КАЖДУЮ строку
+// номенклатуры с ОДНИМ кодом (ngCount внутри неприменённой пачки не растёт)
+// → нарушение ngByCode GROUP AGGR → краш onStarted и откат ХВОСТА сида
+// (endpointSeed/refreshKuHome/refreshKuDash не выполнялись). Правильно:
+// одна группа на ОТСУТСТВУЮЩЕЕ имя (guard по GROUP MAX) + APPLY на итерацию,
+// ссылка — lookup'ом по имени ПОСЛЕ применения (LOCAL после APPLY неприменим).
+ngCount () = GROUP SUM 1 IF NomGroup x;
+// следующий код: МАКС. числовой суффикс + 1 (A6). Счётчик «count+1» на живой
+// БД давал коллизию с существующим NG-31 (дырка NG-14 после чистки 10.10)
+// → нарушение уникальности ngByCode → APPLY тихо откатывался целиком
+ngNextCode () = 'NG-' + ('' + ((OVERRIDE (GROUP MAX toInteger(substr(ngCode(NomGroup g), 3, 10))), 0) + 1));
+nomGroupMigrate () {
+    FOR Nomenclature n IS Nomenclature AND nomGroup(n) AND NOT nomGroupRef(n) DO
+        FOR NomGroup g IS NomGroup AND ngName(g) = nomGroup(n) DO
+            nomGroupRef(n) <- g;
+    APPLY;
+    FOR Nomenclature n IS Nomenclature AND nomGroup(n) AND NOT nomGroupRef(n) DO {
+        IF NOT (GROUP MAX NomGroup g IF ngName(g) = nomGroup(n)) THEN {
+            NEW g = NomGroup {
+                ngName(g) <- nomGroup(n);
+                ngCode(g) <- ngNextCode();
+            }
+            APPLY;   // закрепить группу: ниже только lookup по имени
+        }
+        nomGroupRef(n) <- GROUP MAX NomGroup g IF ngName(g) = nomGroup(n);
+        APPLY;
+    }
+}

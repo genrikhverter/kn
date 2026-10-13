@@ -1,0 +1,38 @@
+MODULE ExternalApp;
+
+// Каталог внешних приложений для главного экрана телефона (#36840): таблица,
+// форма и «ручка» apiExternalApps. Модуль поставлялся с артефактом
+// storetask-logics и намеренно не входит в StoreTaskLib — хост, которому
+// нужна фича, подключает его сам строкой REQUIRE (в mite — StoreTaskMite).
+//
+// ВНИМАНИЕ: исходный текст утрачен (Приложение Б инструкции от 29.08.2026
+// отсутствует). Модуль восстановлен по описанию «таблица + форма + ручка»
+// и демо-стенду из #36840 (терминал склада by.luxsoft.tsd и запись с
+// URI-шаблоном). Ничто в mite_public элементы модуля не использует —
+// для сборки достаточно самодостаточного контракта; при появлении
+// оригинального Приложения Б заменить файл целиком.
+
+CLASS ExternalApp 'Внешнее приложение';
+TABLE externalApp (ExternalApp);
+
+name 'Название' = DATA ISTRING[100] (ExternalApp);
+packageId 'Пакет (Android)' = DATA ISTRING[150] (ExternalApp);
+uriTemplate 'Шаблон URI' = DATA ISTRING[250] (ExternalApp);
+enabled 'Включено' = DATA BOOLEAN (ExternalApp);
+
+FORM externalApps 'Приложения'
+    OBJECTS a = ExternalApp
+    PROPERTIES(a) name, packageId, uriTemplate, enabled
+    PROPERTIES(a) NEWSESSION NEW, EDIT, DELETE
+;
+
+// Мобильный клиент получает отсюда список приложений главного экрана:
+// /exec?action=ExternalApp.apiExternalApps (паттерн — как в Export.lsf).
+apiExternalApps 'Приложения' () {
+    EXPORT JSON FROM
+        name = name(ExternalApp a),
+        packageId = packageId(a),
+        uriTemplate = uriTemplate(a)
+    WHERE enabled(a);
+    RETURN JSONFILE(exportFile());
+}

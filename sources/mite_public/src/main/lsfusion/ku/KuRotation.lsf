@@ -1,0 +1,709 @@
+MODULE KuRotation;
+
+// Код Урожая: долгосрочный план севооборота (ФТ1.1.1–1.1.4).
+// Спецификация: docs/02-data-model.md §3; docs/03-logic-KuRotation.md.
+REQUIRE KuCrop, KuLand, Authentication;
+
+NAMESPACE Ku;
+
+// ===================== Перечисления =====================
+CLASS RotationPlanStatus 'Статус плана' {
+    draft 'Черновик', approved 'Утверждён', archived 'Архивный'
+}
+CLASS RotationViolationType 'Тип нарушения' {
+    returnPeriod 'Период возврата', predecessor 'Предшественник'
+}
+CLASS Severity 'Критичность' {
+    info 'Информационное', warning 'Предупреждение', critical 'Критическое'
+}
+
+// ===================== План севооборота =====================
+CLASS RotationPlan 'План севооборота';
+TABLE rotationPlan (RotationPlan);
+number 'Номер' = DATA ISTRING[20] (RotationPlan) NONULL IN id;
+planDate 'Дата' = DATA DATE (RotationPlan) NONULL;
+planStatus 'Статус' = DATA RotationPlanStatus (RotationPlan) NONULL;
+namePlanStatus 'Статус' (RotationPlan p) = staticCaption(planStatus(p));
+author 'Автор' = DATA CustomUser (RotationPlan);
+organization 'Организация' = DATA Organization (RotationPlan) NONULL;
+namePlanOrg 'Организация' (RotationPlan p) = name(organization(p));
+startYear 'Год начала' = DATA INTEGER (RotationPlan) NONULL;
+horizonYears 'Горизонт, лет' = DATA INTEGER (RotationPlan) NONULL;
+version 'Версия' = DATA INTEGER (RotationPlan) NONULL;
+approvedAt 'Дата утверждения' = DATA DATETIME (RotationPlan);
+approvedBy 'Утвердивший' = DATA CustomUser (RotationPlan);
+basedOn 'На основе' = DATA RotationPlan (RotationPlan);
+nameBasedOn 'На основе' (RotationPlan p) = OVERRIDE number(basedOn(p)), '';
+setPlanOrgAct 'Выбрать организацию' (RotationPlan p) {
+    DIALOG pickOrganization OBJECTS o = organization(p) INPUT o NULL DO organization(p) <- o;
+}
+note 'Примечания' = DATA TEXT (RotationPlan);
+created 'Создано' = DATA DATETIME (RotationPlan);
+createdBy 'Автор (создал)' = DATA CustomUser (RotationPlan);
+namePlanAuthor 'Автор' (RotationPlan p) = OVERRIDE nameKuUser(author(p)), '';
+namePlanApprovedBy 'Утвердивший' (RotationPlan p) = OVERRIDE nameKuUser(approvedBy(p)), '';
+namePlanCreatedBy 'Автор (создал)' (RotationPlan p) = OVERRIDE nameKuUser(createdBy(p)), '';
+
+planNumberSeq 'Счётчик планов' = DATA INTEGER ();
+
+WHEN SET(RotationPlan p IS RotationPlan) DO {
+    planStatus(p) <- RotationPlanStatus.draft;
+    planDate(p) <- currentDate();
+    author(p) <- currentUser();
+    created(p) <- currentDateTime();
+    createdBy(p) <- currentUser();
+}
+// NOT CHANGED: копия плана задаёт версию/горизонт в NEW-блоке — умолчания
+// не должны затирать их на APPLY (копия 10-летнего плана становилась 5-летней)
+WHEN SET(RotationPlan p IS RotationPlan) AND NOT CHANGED(version(p)) DO version(p) <- 1;
+WHEN SET(RotationPlan p IS RotationPlan) AND NOT CHANGED(horizonYears(p)) DO horizonYears(p) <- 5;
+
+// КФ-С4: горизонт этапа 1 — 5 лет (>5 — второй этап, расширенная матрица)
+CONSTRAINT RotationPlan p IS RotationPlan AND (horizonYears(p) < 1 OR horizonYears(p) > 5) CHECKED BY horizonYears MESSAGE 'Горизонт планирования — от 1 до 5 лет (этап 1)';
+// КФ-С1: не более одного черновика на организацию (предусловие ФТ1.1.1)
+draftSibling (RotationPlan p) = GROUP MAX RotationPlan d IF d != p AND organization(d) = organization(p) AND planStatus(d) = RotationPlanStatus.draft;
+draftSiblingNumber (RotationPlan p) = (OVERRIDE number(draftSibling(p)), '');
+CONSTRAINT RotationPlan p IS RotationPlan AND SET(planStatus(p)) AND planStatus(p) = RotationPlanStatus.draft
+    AND draftSibling(p) IS RotationPlan
+    CHECKED BY planStatus MESSAGE 'Сначала завершите или удалите существующий черновик организации';
+CONSTRAINT startYear(RotationPlan p) < 2026 CHECKED BY startYear MESSAGE 'Год начала — не раньше 2026';
+
+// ===================== Строка плана (поле) и матрица культур =====================
+CLASS RotationPlanItem 'Строка плана';
+TABLE rotationPlanItem (RotationPlanItem);
+plan 'План' = DATA RotationPlan (RotationPlanItem) AUTOSET;
+field 'Поле' = DATA Field (RotationPlanItem) NONULL;
+nameItemField 'Поле' (RotationPlanItem i) = name(field(i));
+itemNote 'Примечание' = DATA TEXT (RotationPlanItem);
+
+// матрица «поле × год»: культура года N (N = 1..горизонта)
+cropYear (RotationPlanItem i, INTEGER yearNo) = DATA Crop;
+// КФ-С2: утверждённый план не редактируется — новая версия (кроме архивации)
+CONSTRAINT CHANGED(cropYear(RotationPlanItem i, INTEGER y)) AND planStatus(plan(i)) = RotationPlanStatus.approved
+    CHECKED BY cropYear MESSAGE 'Утверждённый план не редактируется — создайте новую версию (копия)';
+
+nameCell 'Культура' (RotationPlanItem i, INTEGER yearNo) = OVERRIDE nameCrop(cropYear(i, yearNo)), '';
+yearOf 'Год' (RotationPlanItem i, INTEGER yearNo) = startYear(plan(i)) + yearNo - 1;
+
+itemByPlanField = GROUP AGGR RotationPlanItem i BY plan(i), field(i);
+
+CONSTRAINT cropYear(RotationPlanItem i, INTEGER y) AND y > horizonYears(plan(i))
+    CHECKED BY cropYear MESSAGE 'Год за горизонтом планирования';
+
+// ===================== Нарушения =====================
+CLASS RotationViolation 'Нарушение севооборота';
+TABLE rotationViolation (RotationViolation);
+item 'Строка плана' = DATA RotationPlanItem (RotationViolation) NONULL;
+yearNo 'Год' = DATA INTEGER (RotationViolation) NONULL;
+vType 'Тип нарушения' = DATA RotationViolationType (RotationViolation) NONULL;
+nameVType 'Тип' (RotationViolation v) = staticCaption(vType(v));
+severity 'Критичность' = DATA Severity (RotationViolation) NONULL;
+nameSeverity 'Критичность' (RotationViolation v) = staticCaption(severity(v));
+violationMessage 'Описание' = DATA ISTRING[250] (RotationViolation) NONULL;
+
+planOf (RotationViolation v) = plan(item(v));
+violationField 'Поле' (RotationViolation v) = name(field(item(v)));
+// П.1: год — числом в логике (участвует в арифметике колонок матрицы),
+// но показывается строкой: GWT группирует разряды INTEGER («2 027»)
+startYearShow 'Год начала' (RotationPlan p) = '' + startYear(p);
+editStartYearAct 'Изменить год…' (RotationPlan p) {
+    INPUT y = INTEGER DO startYear(p) <- y;
+}
+criticalCount 'Критических предупреждений' (RotationPlan p) = GROUP SUM 1 IF severity(RotationViolation v) = Severity.critical AND plan(item(v)) = p;
+warningCount 'Предупреждений' (RotationPlan p) = GROUP SUM 1 IF severity(RotationViolation v) = Severity.warning AND plan(item(v)) = p;
+
+// маркеры ячеек (для матрицы на форме)
+cellCritical (RotationPlanItem i, INTEGER y) = GROUP MAX 1 IF item(RotationViolation v) = i AND yearNo(v) = y AND severity(v) = Severity.critical;
+cellWarning (RotationPlanItem i, INTEGER y) = GROUP MAX 1 IF item(RotationViolation v) = i AND yearNo(v) = y AND severity(v) = Severity.warning;
+cellMark (RotationPlanItem i, INTEGER y) = IF cellCritical(i, y) THEN '✖' ELSE IF cellWarning(i, y) THEN '⚠' ELSE '';
+cellViolationText (RotationPlanItem i, INTEGER y) = GROUP CONCAT violationMessage(RotationViolation v) IF item(v) = i AND yearNo(v) = y, '; ' ORDER v;
+
+// ===================== Правила: вспомогательные свойства =====================
+cropPrev (RotationPlanItem i, INTEGER y) = GROUP MAX cropYear(i, y2) IF y2 = y - 1;
+// КФ-И4: предшественник и период возврата читают историю FieldSeason
+// (глубина — вся история, не только матрица/lastCrop); последняя факт-
+// культура сезона до года; фолбэк lastCrop — демо-инвариант KH-004 живёт
+// и в истории (2026, томат), и во фолбэке
+fsFactOf (Field f, INTEGER yr) = GROUP LAST fsFactCrop(FieldSeason s)
+    ORDER fsYear(s), s IF fsField(s) = f AND fsYear(s) < yr AND fsFactCrop(s);
+predCrop 'Предшественник' (RotationPlanItem i, INTEGER y) =
+    OVERRIDE cropPrev(i, y),
+    fsFactOf(field(i), startYear(plan(i)) + y - 1),
+    (IF y = 1 THEN lastCrop(field(i)));
+namePredCrop (RotationPlanItem i, INTEGER y) = OVERRIDE nameCrop(predCrop(i, y)), '';
+// последний год факта той же культуры ДО календарного года клетки (за
+// пределами матрицы); внутри матрицы работает prevSameYear
+histSameYear (RotationPlanItem i, INTEGER y) = GROUP MAX fsYear(FieldSeason s)
+    IF fsField(s) = field(i) AND fsFactCrop(s) = cropYear(i, y)
+        AND fsYear(s) < startYear(plan(i)) + y - 1;
+
+allowedCount (Crop c) = GROUP SUM 1 IF crop(CropPredecessor cp) = c;
+allowedPair (Crop c, Crop pc) = GROUP MAX 1 IF crop(CropPredecessor cp) = c AND predecessor(cp) = pc;
+
+prevSameYear (RotationPlanItem i, INTEGER y1) = GROUP MIN y0 IF y0 < y1 AND cropYear(i, y0) = cropYear(i, y1);
+
+// ===================== Блокировка критических при сохранении (ФТ1.1.1) =====================
+// Эквивалент «система блокирует сохранение» для lsFusion: отклонение самого
+// изменения клетки, создающей КРИТИЧЕСКОЕ нарушение (период возврата / табу).
+// Warning-уровень (невхождение в допустимые) НЕ блокируется — только индикация.
+// КФ-И4: разрыв в годах до той же культуры — внутри матрицы (номера лет
+// матрицы = календарные годы), иначе от факта истории (OVERRIDE: NULL-ветка
+// уходит в историю; оба NULL — не критично)
+returnGap (RotationPlanItem i, INTEGER y) =
+    (OVERRIDE (IF prevSameYear(i, y) THEN y - prevSameYear(i, y)),
+        (startYear(plan(i)) + y - 1) - histSameYear(i, y));
+cellReturnCritical (RotationPlanItem i, INTEGER y) =
+    cropYear(i, y) AND returnGap(i, y)
+    AND returnGap(i, y) < returnYears(cropYear(i, y));
+cellTabooCritical (RotationPlanItem i, INTEGER y) =
+    cropYear(i, y)
+    AND (GROUP MAX 1 IF CropTaboo t IS CropTaboo AND crop(t) = cropYear(i, y) AND taboo(t) = predCrop(i, y));
+CONSTRAINT cellReturnCritical(RotationPlanItem i, INTEGER y) OR cellTabooCritical(i, y)
+    CHECKED BY cropYear MESSAGE 'Критическое нарушение севооборота (период возврата или запрещённый предшественник) — изменение отклонено';
+// ближайший предыдущий год той же культуры в строке плана
+
+
+// ===================== Действия =====================
+newRotationPlan 'Создать план севооборота' (Organization org) {
+    planNumberSeq() <- (OVERRIDE planNumberSeq(), 0) + 1;
+    LOCAL np = RotationPlan ();
+    NEW p = RotationPlan {
+        organization(p) <- org;
+        startYear(p) <- 2027;
+        number(p) <- 'СС-' + ('' + startYear(p)) + '-' + (OVERRIDE ('' + planNumberSeq()), '1');   // КФ-С1: номер от года начала
+        np() <- p;
+    }
+    FOR Field f IS Field AND organization(f) = org DO NEW i = RotationPlanItem {
+        plan(i) <- np();
+        field(i) <- f;
+    }
+    APPLY;
+}
+
+validateRotationPlan 'Проверить севооборот' (RotationPlan p) {
+    FOR RotationViolation v IS RotationViolation AND plan(item(v)) = p DO
+        DELETE v;
+    APPLY;
+    // A. Период возврата: та же культура ближе минимального срока — внутри
+    // плана ИЛИ от фактов истории (КФ-И4)
+    FOR cropYear(RotationPlanItem i, INTEGER y1) AND plan(i) = p
+        AND returnGap(i, y1)
+        AND returnGap(i, y1) < returnYears(cropYear(i, y1))
+    DO NEW v = RotationViolation {
+        item(v) <- i;
+        yearNo(v) <- y1;
+        vType(v) <- RotationViolationType.returnPeriod;
+        severity(v) <- Severity.critical;
+        violationMessage(v) <- 'Нарушен период возврата: ' + name(cropYear(i, y1)) + ' — не чаще раза в '
+            + ('' + returnYears(cropYear(i, y1))) + ' лет (год ' + (IF prevSameYear(i, y1) THEN '' + yearOf(i, prevSameYear(i, y1)) ELSE '' + histSameYear(i, y1)) + ')';
+    }
+    // B. Предшественники: табу и невхождение в допустимые (внутри плана и факт прошлого года)
+    FOR cropYear(RotationPlanItem i, INTEGER y1) AND plan(i) = p DO {
+        FOR CropTaboo t IS CropTaboo AND crop(t) = cropYear(i, y1) AND taboo(t) = predCrop(i, y1) DO
+            NEW v = RotationViolation {
+                item(v) <- i;
+                yearNo(v) <- y1;
+                vType(v) <- RotationViolationType.predecessor;
+                severity(v) <- Severity.critical;
+                violationMessage(v) <- 'Запрещённый предшественник: ' + namePredCrop(i, y1);
+            }
+        FOR Crop c IS Crop AND c = predCrop(i, y1)
+            AND allowedCount(cropYear(i, y1)) > 0 AND NOT allowedPair(cropYear(i, y1), c)
+        DO NEW v = RotationViolation {
+            item(v) <- i;
+            yearNo(v) <- y1;
+            vType(v) <- RotationViolationType.predecessor;
+            severity(v) <- Severity.warning;
+            violationMessage(v) <- 'Предшественник не входит в допустимые (допустимо после: ' + (OVERRIDE allowedAfter(cropYear(i, y1)), '') + ')';
+        }
+    }
+    APPLY;
+}
+
+// UI-203: немедленная перекраска — пересчёт нарушений при каждом изменении матрицы
+WHEN CHANGED (cropYear(RotationPlanItem i, INTEGER y)) DO
+    FOR RotationPlanItem i2 IS RotationPlanItem AND i2 = i DO
+        validateRotationPlan(plan(i2));
+
+emptyCellCount (RotationPlan p) = GROUP SUM 1 IF RotationPlanItem i IS RotationPlanItem
+    AND plan(i) = p AND y <= horizonYears(p) AND NOT cropYear(i, y);   // КФ-С5
+approveRotationPlan 'Утвердить план' (RotationPlan p) {
+    IF criticalCount(p) > 0 THEN {
+        MESSAGE 'Нельзя утвердить: критических нарушений — ' + (OVERRIDE ('' + criticalCount(p)), '0') + '. Исправьте матрицу.';
+    } ELSE {
+        // КФ-С5: предупреждение о пустых клетках (подтверждение, не блок)
+        IF emptyCellCount(p) > 0 THEN {
+            INPUT ok = BOOLEAN DO
+                IF NOT ok THEN RETURN;
+        }
+        planStatus(p) <- RotationPlanStatus.approved;
+        approvedAt(p) <- currentDateTime();
+        approvedBy(p) <- currentUser();
+        version(p) <- (OVERRIDE version(p), 1) + 1;
+        FOR RotationPlan old IS RotationPlan AND old != p AND planStatus(old) = RotationPlanStatus.approved AND organization(old) = organization(p) DO
+            planStatus(old) <- RotationPlanStatus.archived;
+        FOR RotationPlanItem i IS RotationPlanItem AND plan(i) = p DO
+            currentCrop(field(i)) <- cropYear(i, 1);
+        kuPublish(KuEventKind.planApproved, 'RotationPlan', number(p),
+            'Версия ' + (OVERRIDE ('' + version(p)), '1') + ', критических нарушений: 0');
+        APPLY;
+        // КФ-И1: пересобрать историю полей плана (статус уже применён)
+        FOR RotationPlanItem i IS RotationPlanItem AND plan(i) = p DO
+            rebuildFieldHistory(field(i));
+    }
+}
+
+copyRotationPlan 'Копия / новая версия' (RotationPlan src) {
+    INPUT newName = ISTRING[20] DO {
+        planNumberSeq() <- (OVERRIDE planNumberSeq(), 0) + 1;
+        LOCAL np = RotationPlan ();
+        NEW p = RotationPlan {
+            organization(p) <- organization(src);
+            startYear(p) <- startYear(src);
+            number(p) <- 'СС-' + ('' + startYear(p)) + '-' + (OVERRIDE ('' + planNumberSeq()), '1');   // КФ-С1
+            horizonYears(p) <- horizonYears(src);
+            basedOn(p) <- src;
+            note(p) <- newName;
+            version(p) <- (OVERRIDE version(src), 1) + 1;
+            np() <- p;
+        }
+        FOR RotationPlanItem i IS RotationPlanItem AND plan(i) = src DO {
+            NEW ni = RotationPlanItem {
+                plan(ni) <- np();
+                field(ni) <- field(i);
+                itemNote(ni) <- itemNote(i);
+            }
+            FOR cropYear(RotationPlanItem i2, INTEGER yy) AND i2 = i DO
+                cropYear(ni, yy) <- cropYear(i2, yy);
+        }
+        APPLY;
+    }
+}
+
+archiveRotationPlan 'В архив' (RotationPlan p) {
+    planStatus(p) <- RotationPlanStatus.archived;
+    APPLY;
+}
+
+// ===================== REST-ручки (паттерн ExternalApp.lsf) =====================
+kuOrgPlan () = GROUP MAX Organization o IF name(o) = 'Омский АНЦ';
+
+apiRotationGet 'API: план' (ISTRING[20] planCode) {
+    EXPORT JSON FROM
+        number = number(RotationPlan p),
+        status = namePlanStatus(p),
+        version = version(p),
+        startYear = startYear(p),
+        horizon = horizonYears(p)
+    WHERE number(p) = planCode;
+    RETURN JSONFILE(exportFile());
+}
+
+parseRows = DATA INTEGER ();
+// запись клетки матрицы через действие с ЯВНЫМИ параметрами: много-ключевая
+// DATA-запись (объект + год) из row-контекста в этом пине молча не работает
+rollbackCellAct (RotationPlanItem i, INTEGER y) {
+    cropYear(i, y) <- PREV(cropYear(i, y));
+}
+setCellAct (RotationPlanItem i, INTEGER y, Crop c) {
+    cropYear(i, y) <- c;
+}
+rotItemOf (ISTRING[20] planCode, ISTRING[16] fieldCode, INTEGER yearNo) =
+    GROUP MAX RotationPlanItem i IF number(plan(i)) = planCode AND code(field(i)) = fieldCode;
+apiRotationSave 'API: сохранить план' (ISTRING[20] planCode, INTEGER startYr, ISTRING cellsJson) {
+    // cellsJson: [{"field":"KH-001","yr":1,"crop":"ЗЕР-001"}, ...] (crop:"" — очистить клетку)
+    IF NOT (GROUP MAX RotationPlan p IF number(p) = planCode) THEN {
+        planNumberSeq() <- (OVERRIDE planNumberSeq(), 0) + 1;
+        NEW p = RotationPlan {
+            number(p) <- planCode;
+            organization(p) <- kuOrgPlan();
+            startYear(p) <- startYr;
+            note(p) <- 'создан через API';
+        }
+        APPLY;
+        // A8: APPLY мог откатиться (критично — CONSTRAINT «один черновик
+        // на организацию» КФ-С1): без маркера ответ «врал успех» из
+        // отменённой сессии (number/rows при несозданном плане)
+        IF canceled() OR NOT (GROUP MAX RotationPlan p IF number(p) = planCode) THEN {
+            EXPORT JSON FROM error = 'план не создан: у организации уже есть черновик (завершите или удалите его) либо нарушен ФЛК шапки';
+            RETURN JSONFILE(exportFile());
+        }
+        FOR Field f IS Field AND organization(f) = kuOrgPlan() DO
+            NEW i = RotationPlanItem {
+                plan(i) <- GROUP MAX RotationPlan p IF number(p) = planCode;
+                field(i) <- f;
+            }
+        APPLY;
+    }
+    // КФ-5/фикс дефекта 08.10: IMPORT … FIELDS…DO из строки не выполняет блок —
+    // рабочий паттерн: stringToFile → resultFile → IMPORT TO LOCAL NESTED,
+    // применение — FOR по объектному множеству (паттерн Mite.lsf)
+    LOCAL NESTED field = ISTRING[16] (INTEGER);
+    LOCAL NESTED yr = INTEGER (INTEGER);
+    LOCAL NESTED crop = ISTRING[16] (INTEGER);
+    stringToFile(cellsJson);
+    IMPORT JSON FROM resultFile() TO field, yr, crop;
+    parseRows () <- OVERRIDE (GROUP SUM 1 IF field(INTEGER row)), 0;
+    // КФ-5: архивные культуры не устанавливаются через API (история не трогается)
+    IF (GROUP SUM 1 IF field(INTEGER row) AND (GROUP MAX 1 IF Crop c IS Crop AND code(c) = crop(row) AND isArchived(c))) THEN {
+        EXPORT JSON FROM error = 'культура в архиве';
+        RETURN JSONFILE(exportFile());
+    }
+    // КФ-С3: несуществующие коды — errors[] (сейчас молчаливый пропуск)
+    LOCAL NESTED errRow = ISTRING[200] (INTEGER);
+    FOR field(INTEGER row) DO {
+        IF NOT (GROUP MAX 1 IF Field fd IS Field AND code(fd) = field(row)) THEN
+            errRow(row) <- 'поле ' + (OVERRIDE field(row), '—') + ' не найдено';
+        ELSE IF NOT (GROUP MAX 1 IF Crop cr IS Crop AND code(cr) = crop(row)) THEN
+            errRow(row) <- 'культура ' + (OVERRIDE crop(row), '—') + ' не найдено';
+    }
+    // КФ-С3/С2: утверждённый план не редактируется; startYear существующего иммутабелен
+    FOR RotationPlan existing IS RotationPlan AND number(existing) = planCode DO {
+        IF planStatus(existing) = RotationPlanStatus.approved THEN
+            errRow(9000) <- 'план утверждён — создайте новую версию (копия)';
+        IF startYr != startYear(existing) THEN
+            errRow(9001) <- 'год начала существующего плана не меняется';
+    }
+    IF (GROUP SUM 1 IF errRow(INTEGER r)) THEN {
+        EXPORT JSON FROM errors = errRow(INTEGER r);
+        RETURN JSONFILE(exportFile());
+    }
+    // применение: предвычисление ссылок + ПРОСТОЙ FOR по row (вложенные
+    // row→объект и APPLY FOR с много-ключевой записью в этом пине молчат)
+    LOCAL NESTED itemRef = RotationPlanItem (INTEGER);
+    LOCAL NESTED cropRef = Crop (INTEGER);
+    FOR field(INTEGER row) DO {
+        itemRef(row) <- rotItemOf(planCode, field(row), yr(row));
+        cropRef(row) <- cropByCode(crop(row));
+    }
+    // БЕЗ промежуточного APPLY: LOCAL после APPLY не живёт (quirks §6)
+    FOR itemRef(INTEGER row) DO
+        setCellAct(itemRef(row), yr(row), cropRef(row));
+    APPLY;
+
+    FOR RotationPlan p IS RotationPlan AND number(p) = planCode DO validateRotationPlan(p);
+    APPLY;
+    // серверная валидация перед сохранением (СТ): критические — откат клеток
+    // из payload в PREV-значение (обнулять ВСЮ матрицу нельзя — сохранённые годы)
+    IF (GROUP MAX criticalCount(RotationPlan p) IF number(p) = planCode) > 0 THEN {
+        FOR itemRef(INTEGER row) DO
+            rollbackCellAct(itemRef(row), yr(row));
+        FOR RotationViolation v IS RotationViolation AND number(plan(item(v))) = planCode DO
+            DELETE v;
+        APPLY;
+        EXPORT JSON FROM error = 'критические нарушения севооборота — клетки не сохранены';
+    } ELSE
+        EXPORT JSON FROM number = number(RotationPlan p), status = namePlanStatus(p), version = version(p), critical = criticalCount(p), rows = parseRows()
+        WHERE number(p) = planCode;
+    RETURN JSONFILE(exportFile());
+}
+
+apiRotationVersions 'API: версии плана' (ISTRING[20] planCode) {
+    // ⚪ упрощение: план + его прямые версии (basedOn, один уровень)
+    EXPORT JSON FROM version = version(RotationPlan p), status = namePlanStatus(p), approvalDate = approvedAt(p), note = note(p)
+    WHERE number(p) = planCode OR number(basedOn(p)) = planCode;
+    RETURN JSONFILE(exportFile());
+}
+
+apiRotationCopy 'API: копия плана' (ISTRING[20] planCode, ISTRING[20] newName) {
+    IF (GROUP MAX RotationPlan src IF number(src) = planCode) THEN {
+        LOCAL srcPlan = RotationPlan ();
+        LOCAL newPlan = RotationPlan ();
+        srcPlan() <- GROUP MAX RotationPlan src IF number(src) = planCode;
+        planNumberSeq() <- (OVERRIDE planNumberSeq(), 0) + 1;
+        NEW p = RotationPlan {
+            number(p) <- 'СС-' + ('' + startYear(srcPlan())) + '-' + ('' + (OVERRIDE planNumberSeq(), 1));   // КФ-С1
+            organization(p) <- organization(srcPlan());
+            startYear(p) <- startYear(srcPlan());
+            horizonYears(p) <- horizonYears(srcPlan());
+            note(p) <- newName;
+            basedOn(p) <- srcPlan();
+            version(p) <- version(srcPlan()) + 1;   // КФ-С3: версия от исходного (WHEN SET даёт 1)
+            newPlan() <- p;
+        }
+        APPLY;
+        FOR RotationPlanItem i IS RotationPlanItem AND plan(i) = srcPlan() DO {
+            NEW ni = RotationPlanItem {
+                plan(ni) <- newPlan();
+                field(ni) <- field(i);
+                itemNote(ni) <- itemNote(i);
+            }
+            FOR cropYear(RotationPlanItem i2, INTEGER yy) AND i2 = i DO
+                cropYear(ni, yy) <- cropYear(i2, yy);
+        }
+        APPLY;
+        // КФ-С3/С1: APPLY мог откатиться (один черновик) — canceled() как маркер
+        IF canceled() THEN
+            EXPORT JSON FROM error = 'копия не создана: у организации уже есть черновик (завершите или удалите его)';
+        ELSE
+            EXPORT JSON FROM newPlanId = number(RotationPlan p), status = namePlanStatus(p), version = version(p) WHERE p = newPlan();
+    } ELSE {
+        EXPORT JSON FROM error = 'план не найден';
+    }
+    RETURN JSONFILE(exportFile());
+}
+
+apiRotationViolations 'API: нарушения' (ISTRING[20] planCode) {
+    EXPORT JSON FROM
+        field = nameItemField(item(RotationViolation v)),
+        yearNo = yearNo(v),
+        type = nameVType(v),
+        severity = nameSeverity(v),
+        message = violationMessage(v)
+    WHERE number(plan(item(v))) = planCode;
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== Формы =====================
+FORM rotationVersions 'История версий плана'
+    OBJECTS base = RotationPlan PANEL
+    PROPERTIES (base) READONLY number, note
+    OBJECTS p = RotationPlan
+    PROPERTIES (p) READONLY number, note, namePlanStatus, version, approvedAt, criticalCount
+    FILTERS p = base OR basedOn(p) = base OR basedOn(basedOn(p)) = base
+    ORDERS version(p)
+;
+
+
+// кнопки Excel-выгрузки (реализации — после объявления форм)
+nextStepProdPlan '→ Годовой план' (RotationPlan p) ABSTRACT;
+exportRotationPlansXls 'Выгрузить в Excel' () ABSTRACT;
+exportRotationMatrixXls 'Выгрузить матрицу в Excel' (RotationPlan pl) ABSTRACT;
+newPlanForStand 'Создать план севооборота' () {
+    newRotationPlan(kuOrgPlan());
+}
+
+
+// КФ-С2: клетки матрицы — именованные (READONLYIF требует имя; inline
+// 'Год N' = cropYear(...) в PROPERTIES-строке с READONLYIF не парсится)
+k1 'Год 1' (RotationPlanItem i) = cropYear(i, 1);
+nameK1 'Год 1 (культура)' (RotationPlanItem i) = OVERRIDE nameCrop(cropYear(i, 1)), '';
+k2 'Год 2' (RotationPlanItem i) = cropYear(i, 2);
+nameK2 'Год 2 (культура)' (RotationPlanItem i) = OVERRIDE nameCrop(cropYear(i, 2)), '';
+k3 'Год 3' (RotationPlanItem i) = cropYear(i, 3);
+nameK3 'Год 3 (культура)' (RotationPlanItem i) = OVERRIDE nameCrop(cropYear(i, 3)), '';
+k4 'Год 4' (RotationPlanItem i) = cropYear(i, 4);
+nameK4 'Год 4 (культура)' (RotationPlanItem i) = OVERRIDE nameCrop(cropYear(i, 4)), '';
+k5 'Год 5' (RotationPlanItem i) = cropYear(i, 5);
+nameK5 'Год 5 (культура)' (RotationPlanItem i) = OVERRIDE nameCrop(cropYear(i, 5)), '';
+matrixLocked (RotationPlanItem i) = planStatus(plan(i)) != RotationPlanStatus.draft;
+FORM rotationPlans 'Планы севооборота'
+    OBJECTS p = RotationPlan
+    PROPERTIES (p) READONLY number, namePlanStatus, startYear, horizonYears, version, namePlanOrg, criticalCount, warningCount, approvedAt
+    PROPERTIES (p) NEWSESSION NEW, EDIT, DELETE, validateRotationPlan, approveRotationPlan, copyRotationPlan, archiveRotationPlan
+    ORDERS number(p)
+;
+
+FORM rotationPlan 'План севооборота'
+    OBJECTS p = RotationPlan PANEL
+    PROPERTIES (p) number, planDate
+    PROPERTIES (p) READONLY startYearShow
+    PROPERTIES (p) editStartYearAct SHOWIF planStatus(p) = RotationPlanStatus.draft
+    PROPERTIES (p) horizonYears READONLYIF planStatus(p) != RotationPlanStatus.draft   // КФ-С2
+    PROPERTIES (p) READONLY namePlanOrg
+    PROPERTIES (p) setPlanOrgAct
+    PROPERTIES (p) READONLY namePlanStatus, version, warningCount, criticalCount, approvedAt, namePlanApprovedBy, nameBasedOn
+    PROPERTIES (p) READONLY created, namePlanCreatedBy
+    PROPERTIES (p) note
+    PROPERTIES (p) validateRotationPlan, approveRotationPlan, copyRotationPlan, archiveRotationPlan, nextStepProdPlan
+
+    OBJECTS i = RotationPlanItem
+    PROPERTIES (i) NEWSESSION NEW, EDIT, DELETE
+    PROPERTIES (i) nameItemField
+    // КФ-С2: клетки иммутабельны вне черновика; C1.1: столбцы показываются
+    // по горизонту плана (1–5 лет) — скрытые годы не занимают место.
+    // п.21 UI-обзора: рядом с редактируемыми клетками (ИД) — имена культур
+    PROPERTIES (i) k1 READONLYIF planStatus(plan(i)) != RotationPlanStatus.draft,
+        k2 READONLYIF planStatus(plan(i)) != RotationPlanStatus.draft SHOWIF horizonYears(plan(i)) >= 2,
+        k3 READONLYIF planStatus(plan(i)) != RotationPlanStatus.draft SHOWIF horizonYears(plan(i)) >= 3,
+        k4 READONLYIF planStatus(plan(i)) != RotationPlanStatus.draft SHOWIF horizonYears(plan(i)) >= 4,
+        k5 READONLYIF planStatus(plan(i)) != RotationPlanStatus.draft SHOWIF horizonYears(plan(i)) >= 5
+    PROPERTIES (i) READONLY nameK1,
+        nameK2 SHOWIF horizonYears(plan(i)) >= 2,
+        nameK3 SHOWIF horizonYears(plan(i)) >= 3,
+        nameK4 SHOWIF horizonYears(plan(i)) >= 4,
+        nameK5 SHOWIF horizonYears(plan(i)) >= 5
+    PROPERTIES (i) itemNote
+    // П.3: служебные маркеры М1–М5 и тексты нарушений Г1–Г5 скрыты с формы
+    // (индикация — сводной таблицей «Нарушения» ниже)
+    FILTERS plan(i) = p
+    ORDERS nameItemField(i)
+
+    OBJECTS v = RotationViolation
+    PROPERTIES (v) READONLY violationField, yearNo, nameVType, nameSeverity, violationMessage
+    FILTERS plan(item(v)) = p
+
+    // история версий — только версии ЭТОГО плана (сам + производные копии)
+    OBJECTS ver = RotationPlan
+    PROPERTIES (ver) READONLY number, namePlanStatus, version, approvedAt, criticalCount, note
+    FILTERS ver = p OR basedOn(ver) = p OR basedOn(basedOn(ver)) = p
+    ORDERS version(ver)
+
+    EDIT RotationPlan OBJECT p
+;
+DESIGN rotationPlan {
+    NEW head {
+        caption = '';
+        NEW row1 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(number(p));
+            MOVE PROPERTY(planDate(p));
+            MOVE PROPERTY(startYearShow(p));
+            MOVE PROPERTY(editStartYearAct(p));
+            MOVE PROPERTY(horizonYears(p));
+        }
+        NEW row2 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(namePlanOrg(p));
+            MOVE PROPERTY(setPlanOrgAct(p));
+        }
+        NEW row3 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(namePlanStatus(p));
+            MOVE PROPERTY(version(p));
+            MOVE PROPERTY(warningCount(p));
+            MOVE PROPERTY(criticalCount(p));
+            MOVE PROPERTY(approvedAt(p));
+            MOVE PROPERTY(namePlanApprovedBy(p));
+        }
+        NEW row4 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(created(p));
+            MOVE PROPERTY(namePlanCreatedBy(p));
+            MOVE PROPERTY(nameBasedOn(p));
+        }
+        MOVE PROPERTY(note(p));
+        NEW rowBtns {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(validateRotationPlan(p));
+            MOVE PROPERTY(approveRotationPlan(p));
+            MOVE PROPERTY(copyRotationPlan(p));
+            MOVE PROPERTY(archiveRotationPlan(p));
+            MOVE PROPERTY(nextStepProdPlan(p));
+}
+    }
+}
+
+
+// КФ-С6: дублирующая форма rotationPlanVersions удалена (рабочая — rotationVersions)
+
+// ===================== Excel-выгрузка (матрица севооборота) =====================
+exportRotationPlansXls () + {
+    PRINT rotationPlans XLSX SHEET 'Планы севооборота' TO exportFile;
+    open(exportFile());
+}
+
+exportRotationMatrixXls (RotationPlan pl) + {
+    PRINT rotationPlan OBJECTS p = pl XLSX SHEET 'Матрица севооборота' TO exportFile;
+    open(exportFile());
+}
+
+nextStepProdPlan (RotationPlan p) + {
+    IF planStatus(p) = RotationPlanStatus.approved THEN
+        MESSAGE 'План утверждён.\nСледующий шаг: сформировать годовой производственный план (раздел «Планирование» → «Годовые планы»).';
+    ELSE
+        MESSAGE 'Сначала утвердите план севооборота';
+}
+
+// ===================== Сид (docs/03-logic-KuRotation.md §5) =====================
+wheat () = GROUP MAX Crop c IF code(c) = 'ЗЕР-001';
+barley () = GROUP MAX Crop c IF code(c) = 'ЗЕР-002';
+corn () = GROUP MAX Crop c IF code(c) = 'ЗЕР-003';
+sunflower () = GROUP MAX Crop c IF code(c) = 'ТЕХ-001';
+soy () = GROUP MAX Crop c IF code(c) = 'ЗЕР-004';
+potato () = GROUP MAX Crop c IF code(c) = 'ОВО-001';
+tomato () = GROUP MAX Crop c IF code(c) = 'ОВО-002';
+fallow () = GROUP MAX Crop c IF code(c) = 'ПАР-001';
+
+// последняя цифра кода поля (KH-001 → 1, KH-010 → 0) — распределение полей
+// по 5 шаблонам чередования; раньше возвращало только 0/1 и 4 ветки сида были мертвы
+integerSuffix (Field f) = toInteger(substr(code(f), length(code(f)), 1));
+
+rotationSeed () {
+    // План A (draft): клетки валидны — критические теперь нельзя даже сохранить
+    // (CONSTRAINT), в списке нарушений остаётся warning (пшеница после томата)
+    IF NOT (GROUP MAX RotationPlan p IF note(p) = 'Демо с нарушениями') THEN {
+        LOCAL np = RotationPlan ();
+        NEW p = RotationPlan {
+            number(p) <- 'СС-2027-1';
+            organization(p) <- kuOrgPlan();
+            startYear(p) <- 2027;
+            note(p) <- 'Демо с нарушениями';
+            np() <- p;
+        }
+        FOR Field f IS Field AND code(f) = 'KH-001' DO {
+            NEW i = RotationPlanItem { plan(i) <- np(); field(i) <- f;
+                cropYear(i, 1) <- sunflower(); cropYear(i, 2) <- wheat(); cropYear(i, 3) <- corn(); cropYear(i, 4) <- soy(); cropYear(i, 5) <- fallow(); }
+        }
+        FOR Field f IS Field AND code(f) = 'KH-002' DO {
+            NEW i = RotationPlanItem { plan(i) <- np(); field(i) <- f;
+                cropYear(i, 1) <- tomato(); cropYear(i, 2) <- wheat(); cropYear(i, 3) <- corn(); cropYear(i, 4) <- soy(); cropYear(i, 5) <- fallow(); }
+        }
+        FOR Field f IS Field AND code(f) = 'KH-003' DO {
+            NEW i = RotationPlanItem { plan(i) <- np(); field(i) <- f;
+                cropYear(i, 1) <- wheat(); cropYear(i, 2) <- corn(); cropYear(i, 3) <- soy(); cropYear(i, 4) <- wheat(); cropYear(i, 5) <- fallow(); }
+        }
+        APPLY;
+        FOR RotationPlan p IS RotationPlan AND note(p) = 'Демо с нарушениями' DO
+            validateRotationPlan(p);
+    }
+    // План B «чистый» (approved): севооборот без нарушений по всем 10 полям
+    IF NOT (GROUP MAX RotationPlan p IF note(p) = 'Базовый 2027') THEN {
+        LOCAL npb = RotationPlan ();
+        NEW p = RotationPlan {
+            number(p) <- 'СС-2027-2';
+            organization(p) <- kuOrgPlan();
+            startYear(p) <- 2027;
+            note(p) <- 'Базовый 2027';
+            npb() <- p;
+        }
+        FOR Field f IS Field AND organization(f) = kuOrgPlan() DO {
+            // 5 шаблонов чередования (зерновые ↔ бобовые/пар, возврат 4+ лет)
+            // — разнообразие культур года 1 для темы карты «По культуре»
+            IF integerSuffix(f) = 5 OR integerSuffix(f) = 0 THEN NEW i = RotationPlanItem { plan(i) <- npb(); field(i) <- f;
+                cropYear(i, 1) <- wheat(); cropYear(i, 2) <- soy(); cropYear(i, 3) <- corn(); cropYear(i, 4) <- fallow(); cropYear(i, 5) <- wheat(); }
+            ELSE IF integerSuffix(f) = 1 OR integerSuffix(f) = 6 THEN NEW i = RotationPlanItem { plan(i) <- npb(); field(i) <- f;
+                cropYear(i, 1) <- corn(); cropYear(i, 2) <- fallow(); cropYear(i, 3) <- wheat(); cropYear(i, 4) <- soy(); cropYear(i, 5) <- corn(); }
+            ELSE IF integerSuffix(f) = 2 OR integerSuffix(f) = 7 THEN NEW i = RotationPlanItem { plan(i) <- npb(); field(i) <- f;
+                cropYear(i, 1) <- barley(); cropYear(i, 2) <- soy(); cropYear(i, 3) <- wheat(); cropYear(i, 4) <- fallow(); cropYear(i, 5) <- barley(); }
+            ELSE IF integerSuffix(f) = 3 OR integerSuffix(f) = 8 THEN NEW i = RotationPlanItem { plan(i) <- npb(); field(i) <- f;
+                cropYear(i, 1) <- sunflower(); cropYear(i, 2) <- wheat(); cropYear(i, 3) <- soy(); cropYear(i, 4) <- corn(); cropYear(i, 5) <- fallow(); }
+            ELSE NEW i = RotationPlanItem { plan(i) <- npb(); field(i) <- f;
+                cropYear(i, 1) <- soy(); cropYear(i, 2) <- corn(); cropYear(i, 3) <- wheat(); cropYear(i, 4) <- fallow(); cropYear(i, 5) <- soy(); }
+        }
+        APPLY;
+        FOR RotationPlan p IS RotationPlan AND note(p) = 'Базовый 2027' DO
+            validateRotationPlan(p);
+    }
+    // дозаправка старой БД: клетки плана A приводим к валидным (критические
+    // блокируются CONSTRAINT — менять можно только на допустимое)
+    FOR RotationPlanItem i IS RotationPlanItem
+        AND plan(i) IS RotationPlan AND note(plan(i)) = 'Демо с нарушениями'
+    DO {
+        IF code(field(i)) = 'KH-001' THEN { cropYear(i, 1) <- sunflower(); cropYear(i, 2) <- wheat(); cropYear(i, 3) <- corn(); cropYear(i, 4) <- soy(); cropYear(i, 5) <- fallow(); }
+        IF code(field(i)) = 'KH-002' THEN { cropYear(i, 1) <- tomato(); cropYear(i, 2) <- wheat(); cropYear(i, 3) <- corn(); cropYear(i, 4) <- soy(); cropYear(i, 5) <- fallow(); }
+    }
+    APPLY;
+    FOR RotationPlan p IS RotationPlan AND note(p) = 'Демо с нарушениями' DO validateRotationPlan(p);
+    APPLY;
+
+    // утверждённый статус плана B — дозаправкой (WHEN SET даёт draft)
+    FOR RotationPlan p IS RotationPlan AND note(p) = 'Базовый 2027' AND planStatus(p) != RotationPlanStatus.approved DO {
+        planStatus(p) <- RotationPlanStatus.approved;
+        approvedAt(p) <- currentDateTime();
+        version(p) <- 2;
+    }
+    // побочный эффект утверждения (как в approveRotationPlan): текущая культура полей
+    // (безусловный идемпотентный проход — чтобы работал и когда статус уже выставлен)
+    FOR RotationPlanItem i IS RotationPlanItem
+        AND plan(i) IS RotationPlan AND note(plan(i)) = 'Базовый 2027'
+    DO currentCrop(field(i)) <- cropYear(i, 1);
+    // факт прошлого года для демонстрации предшественника по lastCrop (KH-004: томат был в прошлом году)
+    FOR Field f IS Field AND code(f) = 'KH-004' AND NOT lastCrop(f) DO lastCrop(f) <- tomato();
+    APPLY;
+}

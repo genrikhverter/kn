@@ -1,0 +1,49 @@
+diff --git a/knp_frontend/app/static/js/map.js b/knp_frontend/app/static/js/map.js
+index cb29a1e..0fe91be 100644
+--- a/knp_frontend/app/static/js/map.js
++++ b/knp_frontend/app/static/js/map.js
+@@ -43,15 +43,31 @@ Promise.all([
+         console.warn("Не удалось загрузить реестр полей для карты", err);
+         return { content: [] };
+     }),
+-    fetch(`/static/src/data/fields.geojson`).then(res => res.json()),
++    // Живые контуры полей «Кода Урожая» (LSfusion через api-gateway);
++    // фолбэк — статический демо-макет, если интеграционный контур недоступен.
++    fetch(`${API_BASE}/ku/map/fields`).then(res => {
++        if (!res.ok) throw new Error('ku/map/fields: ' + res.status);
++        return res.json();
++    }).catch(err => {
++        console.warn('Живые поля недоступны, показываем демо-макет:', err);
++        return fetch(`/static/src/data/fields.geojson`).then(res => res.json());
++    }),
+ ])
+     .then(([fieldsPage, geojson]) => {
+         const realFieldNames = new Set((fieldsPage.content || []).map(f => f.name.trim()));
++        // Живой GeoJSON «Кода Урожая»: каждый полигон — реальное поле с карточкой.
++        if (geojson.type === 'FeatureCollection') {
++            (geojson.features || []).forEach(f => {
++                const p = f.properties || {};
++                if (p.name) realFieldNames.add(String(p.name).trim());
++            });
++        }
+ 
+         if (!geojson.error) {
+             let fullExtent = null;
+             const geometries = maptalks.GeoJSON.toGeometry(geojson);
+             geometries.forEach((geo, index) => {
++                if (!geo) return; // фича без/с неразборной геометрией
+                 const props = geo.getProperties() || {};
+                 const name = props.name || ('Объект ' + (index + 1));
+                 const uMapColor = (props._umap_options && props._umap_options.color) ? props._umap_options.color : '#527034';
+@@ -60,7 +76,10 @@ Promise.all([
+                     geo.setSymbol({ 'polygonFill': uMapColor, 'polygonOpacity': 0.3, 'lineColor': uMapColor, 'lineWidth': 2 });
+                 }
+ 
+-                let content = props.description || 'Объект uMap';
++                let content = props.description
++                    || ((props.crop || props.areaHa)
++                        ? `${props.crop || ''}${props.areaHa ? (props.crop ? ', ' : '') + props.areaHa + ' га' : ''}`
++                        : 'Объект uMap');
+                 if (realFieldNames.has(name.trim())) {
+                     const url = `/agronomy/land-bank-gis?field=${encodeURIComponent(name.trim())}`;
+                     content += `<div style="margin-top:8px;"><a href="${url}" style="color:#1e3f20;font-weight:600;">Открыть в земельном банке →</a></div>`;

@@ -1,0 +1,191 @@
+diff --git a/knp_ai-agent/app/config.py b/knp_ai-agent/app/config.py
+index e2ed6ca..52b5aab 100644
+--- a/knp_ai-agent/app/config.py
++++ b/knp_ai-agent/app/config.py
+@@ -35,6 +35,10 @@ class Settings(BaseSettings):
+     neo4j_password: str = "changeme_neo4j"
+ 
+     supply_chain_service_url: str = "http://supply-chain-inventory:8087"
++
++    # Патч интеграции: мост к LSfusion-прототипу «Код Урожая» (economics/
++    # simulation/yield/ku) — закрывает слоты KNP, не реализованные микросервисами.
++    lsfusion_bridge_url: str = "http://knp-bridge:8090"
+     core_mdm_service_url: str = "http://core-mdm:8080"
+ 
+     model_config = SettingsConfigDict(case_sensitive=False)
+diff --git a/knp_ai-agent/app/services/tools.py b/knp_ai-agent/app/services/tools.py
+index 2972b74..ec0350f 100644
+--- a/knp_ai-agent/app/services/tools.py
++++ b/knp_ai-agent/app/services/tools.py
+@@ -28,8 +28,10 @@ from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Any, Awaitable, Callable
+ 
++import httpx
+ import yaml
+ 
++from app.config import settings
+ from app.models.schemas import ChatSource
+ from app.services.og_rag_service import OgRagService, OgRagUnavailableError
+ 
+@@ -244,6 +246,75 @@ class ToolRegistry:
+             handler=self._find_reference_sources,
+         ))
+ 
++
++        # --- Патч интеграции: слоты KNP, закрытые LSfusion-прототипом «Код Урожая» ---
++        # Экономика/агрохимия/справочник полей берутся из моста knp_bridge, за которым
++        # стоит LSfusion (БДР/БДДС/цены/P&L — KuBudget/KuEtl, NPK — KuYield, поля — KuLand).
++        # Принципы те же: заземление определяется фактом успешного вызова, источник —
++        # объект прототипа; модель выбрать инструмент может, подменить результат — нет.
++
++        self._register(Tool(
++            name="get_budget_summary",
++            description=(
++                "Сводка бюджета доходов и расходов (БДР) агрохолдинга за год по сценариям цен: "
++                "доходы, расходы, маржа, статус. Использовать для вопросов вида «какой бюджет "
++                "на 2027», «какая маржа по пессимистичному сценарию», «стресс-тест бюджета»."
++            ),
++            parameters={
++                "type": "object",
++                "properties": {
++                    "year": {
++                        "type": "integer",
++                        "description": "Планируемый год, например 2027",
++                    },
++                },
++                "required": ["year"],
++            },
++            handler=self._get_budget_summary,
++        ))
++
++        self._register(Tool(
++            name="get_crop_pnl",
++            description=(
++                "P&L по культурам за сезон из витрины данных: доход, расход, маржа, "
++                "рентабельность. Использовать для вопросов «какая культура выгоднее», "
++                "или «сколько приносит кукуруза»."
++            ),
++            parameters={"type": "object", "properties": {}, "required": []},
++            handler=self._get_crop_pnl,
++        ))
++
++        self._register(Tool(
++            name="get_npk_balance",
++            description=(
++                "Баланс удобрений N-P-K по конкретному полю: вынос, запас почвы, потребность "
++                "в кг д.в./га, носитель и стоимость. Использовать для вопросов про удобрения, "
++                "азот, фосфор, калий, агрохимию поля."
++            ),
++            parameters={
++                "type": "object",
++                "properties": {
++                    "field_code": {
++                        "type": "string",
++                        "description": "Код поля, например KH-001",
++                    },
++                },
++                "required": ["field_code"],
++            },
++            handler=self._get_npk_balance,
++        ))
++
++        self._register(Tool(
++            name="get_fields",
++            description=(
++                "Справочник полей агрохолдинга: код, название, площадь, текущая культура, "
++                "координаты. Использовать, когда нужен список полей или уточнение кода поля "
++                "перед вызовом других инструментов."
++            ),
++            parameters={"type": "object", "properties": {}, "required": []},
++            handler=self._get_fields,
++        ))
++
+         self._register(Tool(
+             name="ask_clarification",
+             description=(
+@@ -390,3 +461,63 @@ class ToolRegistry:
+     async def _ask_clarification(self, question: str, options: list[str] | None = None) -> ToolResult:
+         # Заземления здесь нет по определению: это вопрос человеку, а не факт из хранилища.
+         return ToolResult(data={"question": question, "options": options or []}, grounded=False)
++
++    # --- Патч интеграции: инструменты LSfusion-прототипа через knp_bridge -------------
++
++    async def _bridge_get(self, path: str, params: dict | None = None, timeout: float = 20.0) -> dict | list | None:
++        """GET к мосту knp_bridge. None — сервис недоступен (не ошибка модели)."""
++        url = settings.lsfusion_bridge_url.rstrip("/") + path
++        try:
++            resp = await httpx.AsyncClient().get(url, params=params, timeout=timeout)
++        except httpx.HTTPError as e:
++            logger.warning("bridge unavailable: %s", e)
++            return None
++        if resp.status_code >= 400:
++            logger.warning("bridge %s -> HTTP %s", path, resp.status_code)
++            return None
++        return resp.json()
++
++    async def _get_budget_summary(self, year: int) -> ToolResult:
++        data = await self._bridge_get("/api/v1/economics/bdr", {"year": year})
++        if data is None:
++            return ToolResult(
++                data={"error": "Бюджетный контур (LSfusion) недоступен."},
++                grounded=False,
++            )
++        sources = [
++            ChatSource(type="budget", id=f"{row.get('plan')}/{row.get('scenario')}", label=f"{row.get('plan')} · {row.get('scenario')}")
++            for row in data
++        ]
++        return ToolResult(data={"year": year, "count": len(data), "budgets": data}, sources=sources)
++
++    async def _get_crop_pnl(self) -> ToolResult:
++        data = await self._bridge_get("/api/v1/economics/crop-pnl")
++        if data is None:
++            return ToolResult(data={"error": "Витрина P&L (LSfusion) недоступна."}, grounded=False)
++        sources = [ChatSource(type="crop", id=row.get("crop", ""), label=row.get("crop", "")) for row in data]
++        return ToolResult(data={"count": len(data), "crops": data}, sources=sources)
++
++    async def _get_npk_balance(self, field_code: str) -> ToolResult:
++        code = field_code.strip().upper()
++        data = await self._bridge_get("/api/v1/yield/npk", {"field": code})
++        if data is None:
++            return ToolResult(data={"error": "Агрохимический контур (LSfusion) недоступен."}, grounded=False)
++        if not data:
++            return ToolResult(data={"found": False, "field_code": code})
++        sources = [ChatSource(type="field", id=code, label=code)]
++        sources += [
++            ChatSource(type="nutrient", id=row.get("element", ""), label=row.get("element", ""))
++            for row in data
++        ]
++        return ToolResult(data={"field_code": code, "elements": data}, sources=sources)
++
++    async def _get_fields(self) -> ToolResult:
++        data = await self._bridge_get("/api/v1/ku/map/fields")
++        if data is None:
++            return ToolResult(data={"error": "Справочник полей (LSfusion) недоступен."}, grounded=False)
++        fields = [
++            dict(f.get("properties") or {}, coordinates=(f.get("geometry") or {}).get("coordinates"))
++            for f in data.get("features", [])
++        ]
++        sources = [ChatSource(type="field", id=f.get("code", ""), label=f.get("name", f.get("code", ""))) for f in fields]
++        return ToolResult(data={"count": len(fields), "fields": fields}, sources=sources)
+diff --git a/knp_api-gateway/app/routes/lsfusion_logistics.py b/knp_api-gateway/app/routes/lsfusion_logistics.py
+new file mode 100644
+index 0000000..b3e452e
+--- /dev/null
++++ b/knp_api-gateway/app/routes/lsfusion_logistics.py
+@@ -0,0 +1,15 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++# Патч интеграции: слот logistics закрывает LSfusion-прототип «Код Урожая»
++# через мост knp_bridge.
++
++from app.routes._proxy_factory import create_proxy_router
++
++router = create_proxy_router(
++    gateway_prefix="/api/v1/logistics",
++    service_name="lsfusion-bridge",
++    service_url_env="LSFUSION_BRIDGE_URL",
++    default_service_url="http://knp-bridge:8090",
++    backend_prefix="/api/v1/logistics",
++    tags=["logistics"],
++)

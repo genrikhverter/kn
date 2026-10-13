@@ -1,0 +1,286 @@
+MODULE KuFleet;
+
+// Код Урожая: «Агродиспетчер 3D» — Three.js-сцена полей с техникой.
+// Этап 1: каркас. Этап 2: датчики/тревоги. Этап 3: задания КУ —
+// операции сезонных ТК, нормы МТР, зоны NPK, раскраска «что вносит/что жнёт».
+REQUIRE Scheme, KuLand, KuCrop, KuYield, KuSimulation;
+
+NAMESPACE Ku;
+
+// ===================== Общий источник (2D + 3D) =====================
+kuFleetData = DATA TEXT ();   // п.22: подпись убрана (сцена занимает экран)
+kuFleetOrg 'Организация-фильтр' = DATA Organization ();
+nameKuFleetOrg () = OVERRIDE name(kuFleetOrg()), 'все';
+kuFleetOrgOk (Field f) = IF NOT kuFleetOrg() THEN TRUE ELSE organization(f) = kuFleetOrg();
+kuFleetTick 'Тик' = DATA INTEGER ();
+
+// ===================== Этап 3: операции и материалы полей =====================
+// последняя операция сезонной ТК поля (по approved комплексному плану)
+fleetOpName 'Операция' (Field f) =
+    GROUP LAST nameSoWorkType(SeasonalOperation o)
+        ORDER soSeq(o), o
+        IF seasonalCard(o) IS SeasonalTechCard
+            AND complexPlan(seasonalCard(o)) IS ComplexPlan
+            AND ypField(complexPlan(seasonalCard(o))) = f
+            AND ypStatus(complexPlan(seasonalCard(o))) = YieldPlanStatus.approvedY;
+// материал операции (последний по порядку — норма внесения)
+fleetMatName 'Материал' (Field f) =
+    GROUP LAST nameSmNom(SeasonalMaterial m)
+        ORDER soSeq(seasonalOperation(m)), seasonalOperation(m)
+        IF seasonalCard(seasonalOperation(m)) IS SeasonalTechCard
+            AND complexPlan(seasonalCard(seasonalOperation(m))) IS ComplexPlan
+            AND ypField(complexPlan(seasonalCard(seasonalOperation(m)))) = f
+            AND ypStatus(complexPlan(seasonalCard(seasonalOperation(m)))) = YieldPlanStatus.approvedY;
+// доза д.в. (кг/га)
+fleetMatDose 'Доза д.в., кг/га' (Field f) =
+    GROUP LAST doseAi(SeasonalMaterial m)
+        ORDER soSeq(seasonalOperation(m)), seasonalOperation(m)
+        IF seasonalCard(seasonalOperation(m)) IS SeasonalTechCard
+            AND complexPlan(seasonalCard(seasonalOperation(m))) IS ComplexPlan
+            AND ypField(complexPlan(seasonalCard(seasonalOperation(m)))) = f
+            AND ypStatus(complexPlan(seasonalCard(seasonalOperation(m)))) = YieldPlanStatus.approvedY;
+// доза N (тема карты)
+fleetDoseN 'Доза N, кг д.в./га' (Field f) = (OVERRIDE fertDoseN(f), 0.0);
+
+// зоны NPK (из PrescriptionFile через хук kuFieldZones)
+fleetZones 'Зоны NPK (JSON)' (Field f) = kuFieldZones(f);
+
+// строка поля (этап 3: + операция, материал, доза; C2: + GeoJSON-контур)
+kuFleetFieldRow (Field f) =
+    '~FLD^' + code(f)
+    + '^' + ('' + (OVERRIDE centerLat(f), 55.0))
+    + '^' + ('' + (OVERRIDE centerLon(f), 73.0))
+    + '^' + ('' + (OVERRIDE areaHa(f), 0))
+    + '^' + (OVERRIDE nameCurrentCrop(f), '-')
+    + '^' + (OVERRIDE fleetOpName(f), '-')
+    + '^' + (OVERRIDE fleetMatName(f), '-')
+    + '^' + ('' + fleetDoseN(f))
+    + '^' + (IF kuFieldStress(f) THEN 'stress' ELSE 'ok')
+    + '^' + (OVERRIDE boundaryGeoJson(f), '');
+
+// ===================== Этап 3: МТР-остатки (СЗР/удобрения) =====================
+// номенклатура-удобрение/СЗР с мин. стоком → строка MTR
+fleetMtrRow (Nomenclature n) =
+    '~MTR^' + (OVERRIDE nomName(n), '-')
+    + '^' + ('' + (OVERRIDE minStock(n), 0))
+    + '^' + ('' + (OVERRIDE basePrice(n), 0))
+    + '^' + (OVERRIDE nameNomUnit(n), '-');
+
+// ===================== Этап 2: типы машин и пороги =====================
+fleetMachineType (Field f) =
+    IF code(f) = 'KH-001' THEN 'combine'
+    ELSE IF code(f) = 'KH-003' THEN 'tractor'
+    ELSE IF code(f) = 'KH-005' THEN 'sprayer'
+    ELSE 'tractor';
+
+// ===================== C2: EquipmentType/Unit (MITE-интеграция) =====================
+// Создаём настоящие EquipmentType/Unit в контуре MITE (scope='field');
+// датчики — sim (этап 1); live — при привязке Device (этап 2)
+fleetEquipSeed 'Инициализировать оборудование агрофлота' () {
+    // типы машин (идемпотентно по имени)
+    IF NOT (GROUP MAX EquipmentType e IF etName(e) = 'Комбайн Torum 585') THEN
+        NEW e = EquipmentType {
+            etName(e) <- 'Комбайн Torum 585'; etShape(e) <- 'machine'; etKind(e) <- 'machine';
+            etCount(e) <- 1; etTempMin(e) <- 40.0; etTempMax(e) <- 105.0;
+            etVibMax(e) <- 12.0; etMtbf(e) <- 1800; etSpare(e) <- 'молотильный барабан'; etSpareQty(e) <- 1;
+        }
+    IF NOT (GROUP MAX EquipmentType e IF etName(e) = 'Трактор МТЗ-1221') THEN
+        NEW e = EquipmentType {
+            etName(e) <- 'Трактор МТЗ-1221'; etShape(e) <- 'machine'; etKind(e) <- 'machine';
+            etCount(e) <- 1; etTempMin(e) <- 40.0; etTempMax(e) <- 95.0;
+            etVibMax(e) <- 8.0; etMtbf(e) <- 2500; etSpare(e) <- 'топливный насос'; etSpareQty(e) <- 1;
+        }
+    IF NOT (GROUP MAX EquipmentType e IF etName(e) = 'Опрыскиватель Amazone UX') THEN
+        NEW e = EquipmentType {
+            etName(e) <- 'Опрыскиватель Amazone UX'; etShape(e) <- 'machine'; etKind(e) <- 'machine';
+            etCount(e) <- 1; etTempMin(e) <- 5.0; etTempMax(e) <- 60.0;
+            etVibMax(e) <- 5.0; etMtbf(e) <- 3000; etSpare(e) <- 'форсунка'; etSpareQty(e) <- 24;
+        }
+    APPLY;
+    // юниты (по одному на демо-поле, идемпотентно по имени)
+    IF NOT (GROUP MAX EquipmentUnit u IF euName(u) = 'Комбайн К-001') THEN
+        NEW u = EquipmentUnit {
+            euName(u) <- 'Комбайн К-001'; euScope(u) <- 'field';
+            euType(u) <- (GROUP MAX EquipmentType e IF etName(e) = 'Комбайн Torum 585');
+            euGroup(u) <- 'KH-001'; euIndex(u) <- 1;
+            euSource(u) <- 'sim';
+        }
+    IF NOT (GROUP MAX EquipmentUnit u IF euName(u) = 'Трактор Т-003') THEN
+        NEW u = EquipmentUnit {
+            euName(u) <- 'Трактор Т-003'; euScope(u) <- 'field';
+            euType(u) <- (GROUP MAX EquipmentType e IF etName(e) = 'Трактор МТЗ-1221');
+            euGroup(u) <- 'KH-003'; euIndex(u) <- 1;
+            euSource(u) <- 'sim';
+        }
+    IF NOT (GROUP MAX EquipmentUnit u IF euName(u) = 'Опрыскиватель О-005') THEN
+        NEW u = EquipmentUnit {
+            euName(u) <- 'Опрыскиватель О-005'; euScope(u) <- 'field';
+            euType(u) <- (GROUP MAX EquipmentType e IF etName(e) = 'Опрыскиватель Amazone UX');
+            euGroup(u) <- 'KH-005'; euIndex(u) <- 1;
+            euSource(u) <- 'sim';
+        }
+    APPLY;
+}
+
+// соответствие поле → EquipmentUnit (для интеграции с FleetData)
+fleetUnitByField (Field f) = GROUP MAX EquipmentUnit u IF euScope(u) = 'field' AND euGroup(u) = code(f);
+nameFleetUnit 'Оборудование' (Field f) = OVERRIDE euName(fleetUnitByField(f)), '';
+nameFleetUnitType 'Тип оборудования' (Field f) =
+    OVERRIDE (GROUP MAX etName(euType(fleetUnitByField(f)))), '';
+
+fleetThrGrainLoss 'Порог потерь зерна, %' = DATA DOUBLE (Field);
+fleetThrFuelRate 'Порог расхода ГСМ, л/га' = DATA DOUBLE (Field);
+fleetThrMoisture 'Порог влажности зерна, %' = DATA DOUBLE (Field);
+fleetThrBattery 'Порог батареи дрона, %' = DATA DOUBLE (Field);
+fleetThrPressure 'Давление опрыскивателя, бар (мин)' = DATA DOUBLE (Field);
+
+fleetGrainLossV (Field f) = OVERRIDE fleetThrGrainLoss(f), 3.0;
+fleetFuelRateV (Field f) = OVERRIDE fleetThrFuelRate(f), 12.0;
+fleetMoistureV (Field f) = OVERRIDE fleetThrMoisture(f), 20.0;
+fleetBatteryV (Field f) = OVERRIDE fleetThrBattery(f), 25.0;
+fleetPressureV (Field f) = OVERRIDE fleetThrPressure(f), 2.0;
+
+// ===================== Этап 2: sim-датчики =====================
+fleetSimSpeed 'Скорость, км/ч (sim)' = DATA DOUBLE (Field);
+fleetSimFuel 'Топливо, % (sim)' = DATA DOUBLE (Field);
+fleetSimTemp 't° двигателя (sim)' = DATA DOUBLE (Field);
+fleetSimGrainLoss 'Потери зерна, % (sim)' = DATA DOUBLE (Field);
+fleetSimMoisture 'Влажность, % (sim)' = DATA DOUBLE (Field);
+fleetSimAlarm (Field f) = fleetSimGrainLoss(f) > fleetGrainLossV(f)
+    OR fleetSimFuel(f) < 15.0
+    OR fleetSimTemp(f) > 105.0;
+
+absFrac (DOUBLE v) = FORMULA DOUBLE 'mod(abs($1), 1.0)';
+
+fleetMachineSpeed (Field f) = (OVERRIDE fleetSimSpeed(f), 0.0);
+fleetMachineFuel (Field f) = (OVERRIDE fleetSimFuel(f), 0.0);
+fleetMachineAlarm (Field f) = fleetSimAlarm(f);
+
+// строка машины
+kuFleetMachineRow (Field f) =
+    '~MCH^' + code(f)
+    + '^' + ('' + (OVERRIDE centerLat(f), 55.0))
+    + '^' + ('' + (OVERRIDE centerLon(f), 73.0))
+    + '^' + ('' + (OVERRIDE areaHa(f), 0))
+    + '^' + (OVERRIDE nameCurrentCrop(f), '-')
+    + '^' + (IF kuFieldStress(f) THEN '1' ELSE '0')
+    + '^' + fleetMachineType(f)
+    + '^' + ('' + fleetMachineSpeed(f))
+    + '^' + ('' + fleetMachineFuel(f))
+    + '^' + (IF fleetMachineAlarm(f) THEN 'alarm' ELSE 'ok');
+
+fleetPreventedLoss 'Предотвращено потерь, ₽' = DATA NUMERIC[16,2] ();
+
+// KPI-строка для сцены
+fleetKpiRow () =
+    '~KPI^' + ('' + (OVERRIDE fleetPreventedLoss(), 0));
+
+// ===================== Сборка (GROUP CONCAT — без FOR-итерации) =====================
+// Паттерн kuMapData: GROUP CONCAT по полям/машинам/МТР (SQL-взрыв предупреждён —
+// строки короткие, без nullable-CASE вложений)
+kuFleetFieldsSec () = GROUP CONCAT kuFleetFieldRow(Field f)
+    IF centerLat(f) AND kuFleetOrgOk(f), '' ORDER code(f);
+kuFleetMachinesSec () = GROUP CONCAT kuFleetMachineRow(Field f)
+    IF (code(f) = 'KH-001' OR code(f) = 'KH-003' OR code(f) = 'KH-005') AND centerLat(f), '' ORDER code(f);
+kuFleetMtrSec () = GROUP CONCAT fleetMtrRow(Nomenclature n)
+    IF minStock(n) AND (nomType(n) = NomType.fertilizer OR nomType(n) = NomType.pesticide), '' ORDER nomCode(n);
+
+refreshKuFleet 'Обновить данные агрофлота' () {
+    kuFleetData() <- (OVERRIDE kuFleetFieldsSec(), '')
+        + (OVERRIDE kuFleetMachinesSec(), '')
+        + (OVERRIDE kuFleetMtrSec(), '')
+        + fleetKpiRow();
+    kuFleetTick() <- (OVERRIDE kuFleetTick(), 0) + 1;
+    APPLY;
+}
+
+// генератор sim-значений (кнопкой; идемпотентен)
+fleetSimTick 'Имитация датчиков агрофлота' () {
+    FOR Field f IS Field AND (code(f) = 'KH-001' OR code(f) = 'KH-003' OR code(f) = 'KH-005') DO {
+        fleetSimSpeed(f) <- 6.0 + 3.0 * absFrac(kuFleetTick() * 0.13 + (OVERRIDE centerLat(f), 55.0));
+        fleetSimFuel(f) <- 85.0 - (OVERRIDE kuFleetTick(), 0) * 0.8;
+        fleetSimTemp(f) <- 82.0 + 15.0 * absFrac(kuFleetTick() * 0.07);
+        fleetSimGrainLoss(f) <- 1.5 + 2.5 * absFrac(kuFleetTick() * 0.11 + 0.3);
+        fleetSimMoisture(f) <- 14.0 + 5.0 * absFrac(kuFleetTick() * 0.05);
+    }
+    refreshKuFleet();
+}
+
+// виртуальный склад материалов (этап 1 — без реального складского учёта)
+fleetStock 'Остаток на складе' = DATA NUMERIC[14,2] (Nomenclature);
+fleetStockV (Nomenclature n) = OVERRIDE fleetStock(n), (OVERRIDE minStock(n), 0) * 3.0; // дефолт = 3×мин-сток
+
+// KPI: предотвращённые потери ₽ (накопительный счётчик сцены)
+
+// инцидент → задание → списание → МТР → шина (сквозной клик из сцены)
+handleFleetIncident (Field f) {
+    IF NOT f THEN RETURN;
+    // 1) предотвращённые потери: потери% × площадь × факт-урожайность × цена продукции (упрощённо)
+    LOCAL lossPct = DOUBLE ();
+    lossPct() <- OVERRIDE fleetSimGrainLoss(f), 0.0;
+    LOCAL areaHaV = DOUBLE ();
+    areaHaV() <- OVERRIDE areaHa(f), 0.0;
+    LOCAL prevented = NUMERIC[16,2] ();
+    // цена продукции культуры поля (product Nomenclature с ценой)
+    prevented() <- round2(lossPct() / 100.0 * areaHaV() * 10.0 * (OVERRIDE factYield(f), 50.0) * 15.0);
+    fleetPreventedLoss() <- (OVERRIDE fleetPreventedLoss(), 0) + prevented();
+
+    // 2) списание материала (карбамид для N-дефицита / фунгицид для прочего)
+    LOCAL mat = Nomenclature ();
+    mat() <- GROUP MAX Nomenclature n IF nomCode(n) = 'N-00003'; // карбамид
+    IF mat() THEN
+        fleetStock(mat()) <- (OVERRIDE fleetStock(mat()), fleetStockV(mat())) - 100.0; // списание 100 кг
+
+    // 3) при остатке ниже мин-стока — заявка МТР (класс из KuYield, НЕ новый)
+    IF mat() AND fleetStock(mat()) < (OVERRIDE minStock(mat()), 0) THEN
+        NEW mr = MtrRequest {
+            mrField(mr) <- f;
+            requiredBy(mr) <- currentDateTime() + 172800; // +48 ч
+        }
+
+    // 4) событие шины
+    kuPublish(KuEventKind.jobDone, 'Агродиспетчер 3D', code(f),
+        'Инцидент принят: ' + (OVERRIDE nameCurrentCrop(f), '—') + '; предотвращено ~'
+        + (OVERRIDE ('' + prevented()), '0') + ' ₽');
+    APPLY;
+}
+
+round2 (NUMERIC[18,6] v) = FORMULA NUMERIC[16,2] 'round($1, 2)';
+
+
+
+// событие от клиента (этап 4: select/incident)
+kuFleet3dEvent () {
+    INPUT j = JSON DO
+        IMPORT JSON FROM j FIELDS() STRING action, STRING objCode DO {
+            IF action = 'select' AND objCode THEN
+                kuPublish(KuEventKind.jobDone, 'Агродиспетчер 3D', objCode, 'Выбор объекта');
+            ELSE IF action = 'incident' AND objCode THEN
+                handleFleetIncident(fieldByCode(objCode));
+        }
+}
+
+// ===================== Этап 4: бизнес-замыкание =====================
+// Инцидент (тревога датчика) → корректирующее задание → списание материала
+// со склада → при остатке < мин-стока — заявка МТР → событие шины
+// KPI: «предотвращено потерь ₽» (складной паттерн valueAtRisk)
+
+// ===================== Форма =====================
+FORM kuFleet3d 'Агродиспетчер 3D'
+    PROPERTIES () kuFleetData CUSTOM 'fleet3d' ON CHANGE kuFleet3dEvent()
+    PROPERTIES () refreshKuFleet, fleetSimTick, fleetEquipSeed
+    PROPERTIES () READONLY fleetPreventedLoss
+;
+DESIGN kuFleet3d {
+    // п.22: сцена — вся рабочая область (растяжка в fleet3d.js), панель
+    // управления — лентой внизу; заголовок-подпись данных убран
+    PROPERTY(kuFleetData()) { caption = ''; }
+    NEW controls {
+        caption = 'Управление';
+        horizontal = TRUE;
+        MOVE PROPERTY(refreshKuFleet());
+        MOVE PROPERTY(fleetSimTick());
+        MOVE PROPERTY(fleetEquipSeed());
+        MOVE PROPERTY(fleetPreventedLoss());
+    }
+}

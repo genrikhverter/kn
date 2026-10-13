@@ -1,0 +1,1371 @@
+MODULE KuYield;
+
+// Код Урожая: программирование урожая (ФТ4.1–4.4).
+// Спецификация: docs/02-data-model.md §8; docs/03-logic-KuYield.md.
+// ⚠ Все формулы — допущения прототипа (уточнить агрономом).
+REQUIRE KuCrop, KuLand, KuBudget, Authentication, StoreTaskLib;
+
+NAMESPACE Ku;
+
+// ===================== Перечисления =====================
+CLASS YieldPlanStatus 'Статус' {
+    draft 'Черновик', approvedY 'Утвержден', archived 'Архив'
+}
+CLASS NutrientEl 'Элемент' {
+    n 'Азот (N)', p 'Фосфор (P)', k 'Калий (K)'
+}
+CLASS SeasonalCardStatus 'Статус' {
+    formed 'Сформирована', agreed 'Согласована', inWork 'В работе'
+}
+CLASS GenTaskKind 'Тип задачи' {
+    genTechcard 'Генерация ТЗ', genShapefile 'Shapefile', genIsoxml 'ISO-XML'
+}
+// КФ-К7: этап 1 — генерация синхронная (done сразу после действия);
+// queued/running — этап 2 (фоновая генерация, LRO)
+CLASS GenTaskStatus 'Статус' {
+    queued 'В очереди', running 'Выполняется', done 'Завершено', error 'Ошибка'
+}
+// КФ-Р8: errorR — этап 2 (сбой расчёта); executedR употребляется КФ-Р1
+CLASS RecommendationStatus 'Статус' {
+    newR 'Новая', approvedR 'Утверждена', rejectedR 'Отклонена', errorR 'Ошибка',
+    executedR 'Исполнена'
+}
+// КФ-КБ2: этап 1 — {initiated, awaiting, completed}; полный набор статусов
+// (Агрегация данных/Ожидание LLM/Ошибка) и llm_model_id/prompt_version —
+// этап 2 (спека; LLM-вариант KNP — ollama+tool-calling через мост)
+CLASS CalibrationStatus 'Статус сессии' {
+    initiated 'Инициирована', awaiting 'Ожидание решения', completed 'Завершена'
+}
+CLASS ProposalDecision 'Решение' {
+    approvedP 'Утверждено', rejectedP 'Отклонено', correctedP 'Скорректировано'
+}
+CLASS OptSessionStatus 'Статус' {
+    queuedO 'В очереди', runningO 'Выполняется', doneO 'Завершено', errorO 'Ошибка'
+}
+// sentM/doneM/rejectedM — этап 2 (статусы внешней отправки в закупки, ФТ6.1)
+CLASS MtrRequestStatus 'Статус заявки' {
+    formedM 'Сформирована', sentM 'Отправлена в ERP', doneM 'Исполнена', rejectedM 'Отклонена'
+}
+CLASS RoutingTaskStatus 'Статус задания' {
+    plannedT 'Запланировано', awaitingT 'Ожидает синхронизации', cancelledT 'Отменено'
+}
+CLASS CollisionKind 'Тип коллизии' {
+    weatherC 'Погода', mtrDeficit 'Дефицит МТР', overloadC 'Перегрузка элеватора', noDriver 'Нет водителя'
+}
+CLASS CollisionSeverity 'Серьёзность' {
+    criticalC 'Критично', warningC 'Предупреждение'
+}
+
+// ===================== Хелперы =====================
+max0 (NUMERIC[14,2] x) = IF x > 0 THEN x ELSE 0.0;
+// доля д.в. носителя: NULL/<=0 → NULL (защита деления, сработает OVERRIDE по месту)
+aiPct (Nomenclature n) = IF activeIngredient(n) > 0.0 THEN activeIngredient(n);
+templateCardFor (Crop c) = GROUP MAX TechCard tc IF tcCrop(tc) = c AND cardStatus(tc) = TechCardStatus.approved;
+nomElement (Nomenclature n) =
+    IF nomCode(n) = 'N-00003' OR nomCode(n) = 'N-00004' THEN NutrientEl.n
+    ELSE IF nomCode(n) = 'N-00006' THEN NutrientEl.p
+    ELSE IF nomCode(n) = 'N-00007' THEN NutrientEl.k;
+
+// ===================== Комплексный план (ФТ4.1) =====================
+CLASS ComplexPlan 'Комплексный план';
+TABLE complexPlan (ComplexPlan);
+ypField 'Поле' = DATA Field (ComplexPlan) NONULL;
+nameYpField 'Поле' (ComplexPlan c) = OVERRIDE name(ypField(c)), '';
+ypCrop 'Культура' = DATA Crop (ComplexPlan) NONULL;
+nameYpCrop 'Культура' (ComplexPlan c) = OVERRIDE nameCrop(ypCrop(c)), '';
+// КФ-9: сорт — ССЫЛКА (была строка: переименование сорта рвало связь);
+// NONULL снят на время миграции типа на живой БД (потом можно вернуть)
+ypVariety 'Сорт/гибрид' = DATA Variety (ComplexPlan);
+nameYpVariety 'Сорт/гибрид' (ComplexPlan c) = OVERRIDE varName(ypVariety(c)), '';
+setYpVarietyAct 'Выбрать сорт' (ComplexPlan c) {
+    DIALOG pickVariety OBJECTS pv = ypVariety(c) INPUT pv NULL FILTERS varCrop(pv) = ypCrop(c) DO ypVariety(c) <- pv;
+}
+ypScenario 'Сценарий цен' = DATA PriceScenario (ComplexPlan) NONULL;
+nameYpScenario 'Сценарий цен' (ComplexPlan c) = OVERRIDE psName(ypScenario(c)), '';
+targetYieldPlan 'Целевая урожайность, ц/га' = DATA NUMERIC[10,2] (ComplexPlan) NONULL;
+ypStatus 'Статус' = DATA YieldPlanStatus (ComplexPlan) NONULL;
+nameYpStatus 'Статус' (ComplexPlan c) = staticCaption(ypStatus(c));
+ypSoilAnalysis 'Агрохиманализ' = DATA SoilAnalysis (ComplexPlan) NONULL;
+nameYpSoil 'Агрохиманализ (N/P/K/pH)' (ComplexPlan c) =
+    OVERRIDE 'N ' + n(ypSoilAnalysis(c)) + ' / P ' + p(ypSoilAnalysis(c)) + ' / K ' + k(ypSoilAnalysis(c)) + ' / pH ' + ph(ypSoilAnalysis(c)), '';
+// Волна 3 (NPK + MITE): живые показания датчиков почвы поля (контур MITE);
+// при пересчёте баланса датчик приоритетнее лабораторного агрохиманализа
+ypSensorN 'Датчик N, мг/кг' (ComplexPlan c) = kuSensorN(ypField(c));
+ypSensorP 'Датчик P, мг/кг' (ComplexPlan c) = kuSensorP(ypField(c));
+ypSensorK 'Датчик K, мг/кг' (ComplexPlan c) = kuSensorK(ypField(c));
+ypSensorMoist 'Датчик: влажность почвы, %' (ComplexPlan c) = kuSensorMoist(ypField(c));
+ypSensorTemp 'Датчик: t° почвы, °C' (ComplexPlan c) = kuSensorTemp(ypField(c));
+ypVersion 'Версия' = DATA INTEGER (ComplexPlan) NONULL;
+// КФ-К2: предшественник версии (копия «на основании»)
+ypBasedOn 'На основании' = DATA ComplexPlan (ComplexPlan);
+// КФ-К3: экспертная оценка (агрохимия неполная/старше 4 лет)
+expertMode 'Экспертная оценка' = DATA BOOLEAN (ComplexPlan);
+ypNote 'Комментарий (обоснование)' = DATA TEXT (ComplexPlan);
+// КФ-К6: трассировка на годовой план (шаг 4 → шаг 6 сквозного процесса)
+ypProdPlan 'Годовой план' = DATA ProdPlan (ComplexPlan);
+nameYpProdPlan 'Годовой план' (ComplexPlan c) = OVERRIDE ppNumber(ypProdPlan(c)), '';
+ypWarnings 'Предупреждения (JSON)' = DATA TEXT (ComplexPlan);
+ypCreated 'Создано' = DATA DATETIME (ComplexPlan);
+ypApprovedAt 'Утверждён' = DATA DATETIME (ComplexPlan);
+// КФ-9: сорт/генетика последнего утверждённого комплексного плана поля —
+// реализация ABSTRACT-хуков из KuLand (культурные коэффициенты как OVERRIDE
+// второго уровня дают genGdd/genBiomassMax культуры)
+lastYpApproved (Field f) = GROUP LAST ComplexPlan cp
+    ORDER ypApprovedAt(cp), cp IF ypField(cp) = f AND ypStatus(cp) = YieldPlanStatus.approvedY;
+kuFieldVariety (Field f) += ypVariety(lastYpApproved(f));
+cropOfPlan (Field f) = OVERRIDE ypCrop(lastYpApproved(f)), currentCrop(f);
+kuFieldGdd (Field f) += (OVERRIDE varGdd(ypVariety(lastYpApproved(f))), genGdd(cropOfPlan(f)));
+kuFieldBiomassMax (Field f) += (OVERRIDE varBiomassMax(ypVariety(lastYpApproved(f))), genBiomassMax(cropOfPlan(f)));
+
+WHEN SET(ComplexPlan c IS ComplexPlan) DO {
+    ypStatus(c) <- YieldPlanStatus.draft;
+    ypCreated(c) <- currentDateTime();
+}
+// КФ-К2: версия не растёт — NEW-блок newComplexPlanVersion задаёт её сам
+// (WHEN SET выполняется на APPLY позже NEW и затирал бы присвоение)
+WHEN SET(ComplexPlan c IS ComplexPlan) AND NOT CHANGED(ypVersion(c)) DO ypVersion(c) <- 1;
+// КФ-К2: иммутабельность утверждённого — изменение полей блокируется,
+// правка через новую версию (newComplexPlanVersion)
+CONSTRAINT ComplexPlan c IS ComplexPlan AND ypStatus(c) = YieldPlanStatus.approvedY
+    AND (CHANGED(ypField(c)) OR CHANGED(ypCrop(c)) OR CHANGED(ypVariety(c)) OR CHANGED(ypScenario(c))
+        OR CHANGED(targetYieldPlan(c)) OR CHANGED(ypSoilAnalysis(c)))
+    CHECKED BY ypField, ypCrop, ypVariety, ypScenario, targetYieldPlan, ypSoilAnalysis
+    MESSAGE 'Утверждённый план не редактируется — создайте новую версию';
+
+// ===================== Баланс NPK =====================
+CLASS NutrientBalance 'Баланс питательных веществ';
+TABLE nutrientBalance (NutrientBalance);
+nbPlan 'Комплексный план' = DATA ComplexPlan (NutrientBalance) AUTOSET;
+nbElement 'Элемент' = DATA NutrientEl (NutrientBalance) NONULL;
+nameNbElement 'Элемент' (NutrientBalance b) = staticCaption(nbElement(b));
+removalPerTon 'Вынос, кг/т' = DATA NUMERIC[8,3] (NutrientBalance) NONULL;
+soilReserve 'Запас почвы, кг/га' = DATA NUMERIC[10,2] (NutrientBalance) NONULL;
+soilAssimilation 'Усвоение из почвы, %' = DATA NUMERIC[5,2] (NutrientBalance) NONULL;
+fertAssimilation 'Усвоение из удобрений, %' = DATA NUMERIC[5,2] (NutrientBalance) NONULL;
+// ⚠ допущение: доза д.в. = вынос с планом − усвоенный запас почвы
+requiredDoseAi 'Потребность, кг д.в./га' (NutrientBalance b) =
+    max0(removalPerTon(b) * targetYieldPlan(nbPlan(b)) / 10.0 - soilReserve(b) * soilAssimilation(b) / 100.0);
+doseForBalance (ComplexPlan c, NutrientEl e) = GROUP MAX requiredDoseAi(NutrientBalance b) IF nbPlan(b) = c AND nbElement(b) = e;
+
+// доза N плана питания — на поле (тема карты «Внесение удобрений», КП09)
+WHEN CHANGED (requiredDoseAi(NutrientBalance b)) AND b IS NutrientBalance DO {
+    IF nbElement(b) = NutrientEl.n AND ypField(nbPlan(b)) IS Field THEN
+        fertDoseN(ypField(nbPlan(b))) <- requiredDoseAi(b);
+}
+balanceByPlanEl = GROUP AGGR NutrientBalance b BY nbPlan(b), nbElement(b);
+
+// экономика (⚠ допущения: носитель — карбамид для N, суперфосфат для P,
+// сульфат калия для K; доход = целевая × цена продукции)
+nbCarrier (NutrientBalance b) =
+    IF nbElement(b) = NutrientEl.n THEN (GROUP MAX Nomenclature n IF nomCode(n) = 'N-00003')
+    ELSE IF nbElement(b) = NutrientEl.p THEN (GROUP MAX Nomenclature n IF nomCode(n) = 'N-00006')
+    ELSE (GROUP MAX Nomenclature n IF nomCode(n) = 'N-00007');
+fertCost 'Стоимость удобрений, руб/га' (NutrientBalance b) =
+    requiredDoseAi(b) / (OVERRIDE aiPct(nbCarrier(b)), 46.0) * 100.0
+    * (OVERRIDE priceOf(ypScenario(nbPlan(b)), nbCarrier(b)), 0.0);
+ypProduct (ComplexPlan c) = GROUP MAX Nomenclature n IF nomType(n) = NomType.product AND prodCrop(n) = ypCrop(c);   // КФ-8
+incomePlan 'Доход, руб/га' (ComplexPlan c) =
+    targetYieldPlan(c) / 10.0 * (OVERRIDE priceOf(ypScenario(c), ypProduct(c)), 0.0);
+fertCostTotal 'Удобрения, руб/га' (ComplexPlan c) = GROUP SUM fertCost(NutrientBalance b) IF nbPlan(b) = c;
+
+// ===================== Сезонная техкарта (ФТ4.1.3) =====================
+CLASS SeasonalTechCard 'Сезонная техкарта';
+TABLE seasonalTechCard (SeasonalTechCard);
+complexPlan 'Комплексный план' = DATA ComplexPlan (SeasonalTechCard) NONULL;
+templateTechCard 'Шаблон' = DATA TechCard (SeasonalTechCard) NONULL;
+nameTemplate 'Шаблон' (SeasonalTechCard s) = OVERRIDE tcName(templateTechCard(s)), '';
+stcField (SeasonalTechCard s) = ypField(complexPlan(s));
+stcStatus 'Статус' = DATA SeasonalCardStatus (SeasonalTechCard) NONULL;
+nameStcStatus 'Статус' (SeasonalTechCard s) = staticCaption(stcStatus(s));
+WHEN SET(SeasonalTechCard s IS SeasonalTechCard) DO stcStatus(s) <- SeasonalCardStatus.formed;
+
+CLASS SeasonalOperation 'Операция сезонной карты';
+TABLE seasonalOperation (SeasonalOperation);
+seasonalCard 'Сезонная карта' = DATA SeasonalTechCard (SeasonalOperation) AUTOSET;
+soWorkType 'Вид работы' = DATA WorkType (SeasonalOperation) NONULL;
+nameSoWorkType 'Вид работы' (SeasonalOperation o) = OVERRIDE wtName(soWorkType(o)), '';
+soPhase 'Фаза' = DATA Phase (SeasonalOperation);
+soPlannedDate 'План. дата' = DATA DATE (SeasonalOperation);
+soSeq '№' = DATA INTEGER (SeasonalOperation) NONULL;
+// КФ-Р1: примечание операции (ссылка на стресс-событие коррекции)
+soNote 'Примечание' = DATA ISTRING[200] (SeasonalOperation);
+
+CLASS SeasonalMaterial 'Материал сезонной операции';
+TABLE seasonalMaterial (SeasonalMaterial);
+seasonalOperation 'Операция' = DATA SeasonalOperation (SeasonalMaterial) AUTOSET;
+smNomenclature 'Номенклатура' = DATA Nomenclature (SeasonalMaterial) NONULL;
+nameSmNom 'Номенклатура' (SeasonalMaterial m) = OVERRIDE nomName(smNomenclature(m)), '';
+smMethod 'Метод внесения' = DATA ApplicationMethod (SeasonalMaterial);
+doseAi 'Доза д.в., кг/га' = DATA NUMERIC[10,2] (SeasonalMaterial);
+dosePhysical 'Физическая доза' (SeasonalMaterial m) =
+    doseAi(m) / (OVERRIDE aiPct(smNomenclature(m)), 100.0) * 100.0;
+smUnit (SeasonalMaterial m) = unit(smNomenclature(m));
+
+// КФ-М2: у поля есть плановые даты операций сезонной ТК (предупреждение
+// агрегации входа в симуляции; хук объявлен в KuLand — сиблинг KuSimulation)
+kuFieldHasOpDates (Field f) += GROUP MAX 1 IF SeasonalOperation o IS SeasonalOperation
+    AND soPlannedDate(o) AND complexPlan(seasonalCard(o)) = lastYpApproved(f);
+
+// КФ-К1: доли внесения по операциям — устранить дозадвоение (этап 1 —
+// равномерно между операциями сезонной карты с материалом элемента:
+// 2 азотные операции → по 50%; инвариант: GROUP SUM доз элемента = доза
+// баланса; ручная корректировка — sharePercent, сумма ≠100% — предупреждение)
+sharePercent 'Доля внесения, %' = DATA NUMERIC[5,2] (SeasonalMaterial);
+CONSTRAINT SeasonalMaterial m IS SeasonalMaterial AND (sharePercent(m) < 0 OR sharePercent(m) > 100)
+    CHECKED BY sharePercent MESSAGE 'Доля внесения — от 0 до 100%';
+smHasEl (SeasonalOperation o, NutrientEl e) =
+    GROUP MAX 1 IF seasonalOperation(SeasonalMaterial m) = o AND nomElement(smNomenclature(m)) = e;
+opCntEl (SeasonalTechCard s, NutrientEl e) =
+    GROUP SUM 1 IF seasonalCard(SeasonalOperation o) = s AND smHasEl(o, e);
+shareSumEl (ComplexPlan c, NutrientEl e) =
+    GROUP SUM sharePercent(SeasonalMaterial m)
+    IF complexPlan(seasonalCard(seasonalOperation(m))) = c AND nomElement(smNomenclature(m)) = e;
+shareBroken (ComplexPlan c) =
+    GROUP MAX 1 IF complexPlan(seasonalCard(seasonalOperation(SeasonalMaterial m))) = c
+        AND sharePercent(m) AND shareSumEl(c, nomElement(smNomenclature(m))) != 100;
+
+// КФ-К4 (BR-04, этап 1): стоимость операций внесения — ГСМ + труд по
+// нормативам шаблона для операций сезонной карты с материалами-удобрениями
+// (ставка — OVERRIDE baseRate(profession), 500 — синхронно с КФ-П1)
+seasonalFertOp (SeasonalOperation o) =
+    GROUP MAX 1 IF seasonalOperation(SeasonalMaterial m) = o AND nomElement(smNomenclature(m));
+tplOf (SeasonalOperation o) =
+    GROUP MAX TechOperation t IF card(t) = templateTechCard(seasonalCard(o)) AND seqNo(t) = soSeq(o);
+soFuelCost (SeasonalOperation o) =
+    GROUP SUM fuelRate(OperationFuel ff) * (OVERRIDE priceOf(ypScenario(complexPlan(seasonalCard(o))), fuelNomenclature(ff)), 0.0)
+    IF operation(ff) = tplOf(o);
+soLaborCost (SeasonalOperation o) =
+    GROUP SUM timeRate(OperationLabor ll) * (OVERRIDE baseRate(profession(ll)), 500.0)
+    IF operation(ll) = tplOf(o);
+applicationCost 'Внесение, руб/га' (ComplexPlan c) =
+    (OVERRIDE (GROUP SUM (soFuelCost(SeasonalOperation o) + soLaborCost(o))
+        IF complexPlan(seasonalCard(o)) = c AND seasonalFertOp(o)), 0.0);
+marginPercent 'Маржинальность, %' (ComplexPlan c) =
+    IF incomePlan(c) THEN (incomePlan(c) - fertCostTotal(c) - applicationCost(c)) / incomePlan(c) * 100.0;
+
+// ===================== Задачи генерации (ФТ4.1.4) =====================
+CLASS GenerationTask 'Задача генерации';
+TABLE generationTask (GenerationTask);
+taskKind 'Тип задачи' = DATA GenTaskKind (GenerationTask) NONULL;
+genComplexPlan 'Комплексный план' = DATA ComplexPlan (GenerationTask);
+genSeasonalCard 'Сезонная карта' = DATA SeasonalTechCard (GenerationTask);
+genStatus 'Статус' = DATA GenTaskStatus (GenerationTask) NONULL;
+nameGenStatus 'Статус' (GenerationTask t) = staticCaption(genStatus(t));
+genError 'Ошибка' = DATA TEXT (GenerationTask);
+genCreated 'Создана' = DATA DATETIME (GenerationTask);
+// статус/дата создания по умолчанию; NOT CHANGED — не затирать значения,
+// заданные в NEW-блоке (урок: WHEN SET выполняется на APPLY позже NEW)
+WHEN SET(GenerationTask t IS GenerationTask) DO genCreated(t) <- currentDateTime();
+WHEN SET(GenerationTask t IS GenerationTask) AND NOT CHANGED(genStatus(t)) DO genStatus(t) <- GenTaskStatus.queued;
+CONSTRAINT GenerationTask t IS GenerationTask AND NOT genComplexPlan(t) AND NOT genSeasonalCard(t)
+    CHECKED BY taskKind MESSAGE 'Укажите комплексный план или сезонную карту';
+
+// ===================== Корректирующие мероприятия (ФТ4.2) =====================
+CLASS KbRule 'Правило базы знаний';
+TABLE kbRule (KbRule);
+// КФ-А4: тип стресса — ССЫЛКА на справочник (была строка-имя); NONULL снят
+// на время миграции типа на живой БД
+kbStressRef = DATA StressType (KbRule);
+nameKbStressRef 'Тип стресса' (KbRule kr) = OVERRIDE stName(kbStressRef(kr)), '';
+setKbStressAct 'Выбрать тип стресса' (KbRule kr) {
+    DIALOG pickStressType OBJECTS st = kbStressRef(kr) INPUT st NULL DO kbStressRef(kr) <- st;
+}
+// КФ-А5: серьёзность стресса в рекомендации
+crSeverity 'Серьёзность' = DATA ISTRING[20] (CorrectionRecommendation);
+kbCrop 'Культура' = DATA Crop (KbRule);
+kbMinBbch 'BBCH мин' = DATA ISTRING[8] (KbRule);
+kbMaxBbch 'BBCH макс' = DATA ISTRING[8] (KbRule);
+kbNomenclature 'Препарат' = DATA Nomenclature (KbRule) NONULL;
+nameKbNom 'Препарат' (KbRule r) = OVERRIDE nomName(kbNomenclature(r)), '';
+kbWorkType 'Вид работы' = DATA WorkType (KbRule) NONULL;
+kbMethod 'Метод внесения' = DATA ApplicationMethod (KbRule) NONULL;
+kbPriority 'Приоритет' = DATA INTEGER (KbRule) NONULL;
+kbAssimilation 'Коэф. усвоения' = DATA NUMERIC[5,2] (KbRule) NONULL;
+needsWeatherWindow 'Нужно сухое окно' = DATA BOOLEAN (KbRule);
+
+CLASS CorrectionRecommendation 'Комплексная рекомендация';
+TABLE correctionRecommendation (CorrectionRecommendation);
+stressEventId 'ID события-триггера' = DATA ISTRING[36] (CorrectionRecommendation);
+crField 'Поле' = DATA Field (CorrectionRecommendation) NONULL;
+nameCrField 'Поле' (CorrectionRecommendation r) = OVERRIDE name(crField(r)), '';
+crCrop 'Культура' = DATA Crop (CorrectionRecommendation) NONULL;
+nameCrCrop 'Культура' (CorrectionRecommendation r) = OVERRIDE nameCrop(crCrop(r)), '';
+crPhase 'Фаза' = DATA Phase (CorrectionRecommendation);
+crScenario 'Сценарий цен' = DATA PriceScenario (CorrectionRecommendation) NONULL;
+crStatus 'Статус' = DATA RecommendationStatus (CorrectionRecommendation) NONULL;
+nameCrStatus 'Статус' (CorrectionRecommendation r) = staticCaption(crStatus(r));
+analysisText 'Обоснование' = DATA TEXT (CorrectionRecommendation);
+expectedBenefit 'Выгода, руб/га' = DATA NUMERIC[14,2] (CorrectionRecommendation);
+// ⚠ допущение: выгода = 30% дохода поля; затраты считаются по спецификации
+crDecidedBy 'Решение принял' = DATA CustomUser (CorrectionRecommendation);
+decisionComment 'Комментарий' = DATA TEXT (CorrectionRecommendation);
+crCreated 'Создана' = DATA DATETIME (CorrectionRecommendation);
+WHEN SET(CorrectionRecommendation r IS CorrectionRecommendation) DO {
+    crStatus(r) <- RecommendationStatus.newR;
+    crCreated(r) <- currentDateTime();
+}
+
+CLASS CorrectionItem 'Спецификация мероприятия';
+TABLE correctionItem (CorrectionItem);
+recommendation 'Рекомендация' = DATA CorrectionRecommendation (CorrectionItem) AUTOSET;
+ciNomenclature 'Номенклатура' = DATA Nomenclature (CorrectionItem) NONULL;
+nameCiNom 'Препарат' (CorrectionItem i) = OVERRIDE nomName(ciNomenclature(i)), '';
+ciWorkType 'Вид работы' = DATA WorkType (CorrectionItem) NONULL;
+ciMethod 'Метод внесения' = DATA ApplicationMethod (CorrectionItem) NONULL;
+// КФ-Р5: правило-источник мероприятия (для коэффициента усвоения)
+ciRule 'Правило БЗ' = DATA KbRule (CorrectionItem);
+nameCiRule 'Правило БЗ' (CorrectionItem i) = OVERRIDE (IF ciRule(i) THEN 'приоритет ' + ('' + kbPriority(ciRule(i))) ELSE ''), '';
+requiredAiDose 'Доза д.в., кг/га' = DATA NUMERIC[10,2] (CorrectionItem) NONULL;
+// КФ-Р5 (спека ФТ4.2.2): Доза_физ = Требуемое / (К_усвоения × ДВ%)
+physicalDose 'Физ. доза' (CorrectionItem i) =
+    requiredAiDose(i) / ((OVERRIDE aiPct(ciNomenclature(i)), 100.0) / 100.0
+        * (OVERRIDE (kbAssimilation(ciRule(i)) / 100.0), 1.0));
+ciUnit (CorrectionItem i) = unit(ciNomenclature(i));
+// КФ-Р3/Р4: согласование единиц — физдоза кг/га, цены сценариев ₽/т (карбамид
+// 24 500 и т.п. — тонны очевидны): /1000, иначе стоимость ×1000 и BR-02
+// отвергает все рекомендации (наследованный рассинхрон, старый netEffect
+// был отрицательным всегда)
+aiDoseCost 'Стоимость, руб/га' (CorrectionItem i) =
+    physicalDose(i) * priceOf(crScenario(recommendation(i)), ciNomenclature(i)) / 1000.0;
+// КФ-Р3: стоимость операции коррекции — настройка (допущение этапа 1)
+kuOperationCost 'Стоимость операции коррекции, руб/га' = DATA NUMERIC[10,2] ();
+totalCost 'Затраты, руб/га' (CorrectionRecommendation r) =
+    (OVERRIDE (GROUP SUM aiDoseCost(CorrectionItem i) IF recommendation(i) = r), 0.0)
+    + (OVERRIDE kuOperationCost(), 300.0);
+netEffect 'Чистый эффект, руб/га' (CorrectionRecommendation r) =
+    (OVERRIDE expectedBenefit(r), 0.0) - totalCost(r);
+
+
+
+// ===================== Файл-предписание (ФТ4.1.4, КП10) =====================
+// ⚪ прототип: зоны дифференцирования — по обеспеченности N (агрохиманализ
+// поля): низкая < 20 / средняя 20-35 / высокая > 35 мг/кг; дозы — из баланса
+// N с корректировкой 1.2/1.0/0.8; формат — JSON (SHP/ISO-XML — 05-deferred)
+CLASS PrescriptionFile 'Файл-предписание';
+TABLE prescriptionFile (PrescriptionFile);
+prescCard = DATA SeasonalTechCard (PrescriptionFile) AUTOSET;
+namePrescCard 'Сезонная карта' (PrescriptionFile pf) = OVERRIDE nameTemplate(prescCard(pf)), '';
+zoningSrc 'Источник зонирования' = DATA ISTRING[60] (PrescriptionFile);
+zonesJson 'Зоны и дозы (JSON)' = DATA TEXT (PrescriptionFile);
+zonesSummary 'Зоны и дозы' = DATA ISTRING[500] (PrescriptionFile);
+zonesMethod 'Метод зонирования' = DATA ISTRING[20] (PrescriptionFile);
+prescFormat 'Формат' = DATA ISTRING[10] (PrescriptionFile);
+prescNBase 'База N, мг/кг' = DATA DOUBLE (PrescriptionFile);
+prescIsoxml 'Файл ISOXML (ZIP)' = DATA RAWFILE (PrescriptionFile);
+// КФ-К5: предписание привязано к операции внесения сезонной карты
+prescOperation 'Операция внесения' = DATA SeasonalOperation (PrescriptionFile);
+namePrescOperation 'Операция внесения' (PrescriptionFile pf) = OVERRIDE nameSoWorkType(prescOperation(pf)), '';
+WHEN SET(PrescriptionFile pf IS PrescriptionFile) DO {
+    prescFormat(pf) <- 'JSON';
+    zonesMethod(pf) <- 'k-means';
+}
+
+// реализация хука карты (KuLand.kuFieldZones): последний JSON зон k-means
+// по полю (сезонная карта предписания ← комплексный план поля) — слой «Зоны NPK»
+kuFieldZones (Field f) += GROUP MAX zonesJson(PrescriptionFile pf)
+    IF ypField(complexPlan(prescCard(pf))) = f;
+
+prescDoseN 'Доза N, кг д.в./га' (ComplexPlan cp) =
+    OVERRIDE doseForBalance(cp, NutrientEl.n), 30.0;
+
+runKMeans (PrescriptionFile pf, DOUBLE nBase, DOUBLE dose, DOUBLE lon, DOUBLE lat, ISTRING[100] fieldName, INTEGER k)
+    INTERNAL 'mite.KMeansZoneAction' (PrescriptionFile, DOUBLE, DOUBLE, DOUBLE, DOUBLE, ISTRING[100], INTEGER);
+runIsoxml (PrescriptionFile pf) INTERNAL 'mite.IsoxmlExportAction' (PrescriptionFile);
+
+// КФ-К5: ядро генерации предписания (без диалогов — вызывается из диалога
+// и доступно для /exec-проверок): uniform=TRUE — равномерное внесение
+// (одна зона, коэффициент 1.0) при отсутствии данных агрохимии
+createPrescriptionFile (SeasonalTechCard sc, SeasonalOperation op, BOOLEAN uniform, BOOLEAN mkIsoxml) {
+    IF NOT (GROUP MAX PrescriptionFile pf IF prescCard(pf) = sc) THEN
+        NEW pf = PrescriptionFile { prescCard(pf) <- sc; }
+    APPLY;
+    FOR PrescriptionFile pf IS PrescriptionFile AND prescCard(pf) = sc DO {
+        prescOperation(pf) <- op;
+        prescNBase(pf) <- IF uniform THEN 0.0 ELSE (OVERRIDE n(ypSoilAnalysis(complexPlan(sc))), 25.0);
+        zoningSrc(pf) <- IF uniform THEN 'равномерное внесение (нет данных агрохимии)' ELSE 'агрохимия N (сетка-симуляция вариабельности)';
+    }
+    APPLY;
+    FOR PrescriptionFile pf IS PrescriptionFile AND prescCard(pf) = sc DO
+        runKMeans(pf, prescNBase(pf), prescDoseN(complexPlan(sc)),
+            (OVERRIDE centerLon(ypField(complexPlan(sc))), 38.976),
+            (OVERRIDE centerLat(ypField(complexPlan(sc))), 45.040),
+            (OVERRIDE name(ypField(complexPlan(sc))), ''),
+            IF uniform THEN 1 ELSE 3);
+    // КФ-К7: genIsoxml употреблён (формат ISOXML из диалога); JSON-предписание
+    // логируется genShapefile (наследованное имя значения этапа 1)
+    IF mkIsoxml THEN
+        FOR PrescriptionFile pf IS PrescriptionFile AND prescCard(pf) = sc DO {
+            runIsoxml(pf);
+            NEW t = GenerationTask { taskKind(t) <- GenTaskKind.genIsoxml; genSeasonalCard(t) <- sc; genStatus(t) <- GenTaskStatus.done; }
+        }
+    ELSE
+        NEW t = GenerationTask { taskKind(t) <- GenTaskKind.genShapefile; genSeasonalCard(t) <- sc; genStatus(t) <- GenTaskStatus.done; }
+    APPLY;
+}
+
+// шаг 2 диалога: формат ISOXML + подтверждение равномерного внесения
+prescriptionStep2 (SeasonalTechCard sc, SeasonalOperation op) {
+    IF NOT n(ypSoilAnalysis(complexPlan(sc))) THEN
+        ASK 'Нет данных агрохимии по N. Сформировать равномерное внесение на всю площадь (одна зона, коэффициент 1.0)?' DO {
+            ASK 'Сформировать также ISOXML (ISO 11783-10, ZIP)?' mkI = YESNO DO
+                createPrescriptionFile(sc, op, TRUE, mkI);
+        }
+    ELSE
+        ASK 'Сформировать также ISOXML (ISO 11783-10, ZIP)?' mkI = YESNO DO
+            createPrescriptionFile(sc, op, NULL, mkI);   // NULL = не равномерное (платформа: FALSE-литерал в аргументах запрещён)
+}
+
+// ТЗ 4.2.5.1.6 + матобеспечение (k-means): зоны кластеризацией k-means,
+// дозы из баланса N с коэффициентом «беднее зона — выше доза».
+// КФ-К5: диалог — операция внесения (фильтр: материалы-удобрения),
+// формат (JSON/ISOXML; SHP — этап 2), источник зонирования этапа 1 — агрохимия N
+smNomOfOp 'Удобрения' (SeasonalOperation o) =
+    GROUP CONCAT nameSmNom(SeasonalMaterial m) IF seasonalOperation(m) = o, ', ' ORDER seasonalOperation(m), m;
+FORM pickSeasonalFertOperation 'Операция внесения'
+    OBJECTS po = SeasonalOperation
+    PROPERTIES (po) READONLY soSeq, nameSoWorkType, smNomOfOp
+    ORDERS soSeq(po)
+;
+generatePrescription 'Сформировать предписание…' (SeasonalTechCard sc) {
+    DIALOG pickSeasonalFertOperation OBJECTS po INPUT po NULL
+        FILTERS seasonalCard(po) = sc AND seasonalFertOp(po)
+    DO prescriptionStep2(sc, po);
+}
+
+// ТЗ 4.2.5.1.6: экспорт файла-предписания в ISOXML (ISO 11783-10, ZIP)
+exportIsoxml 'Скачать ISOXML' (PrescriptionFile pf) {
+    runIsoxml(pf);
+    APPLY;   // фиксируем файл до open(): open падает в REST-контексте, файл должен остаться
+    IF prescIsoxml(pf) THEN
+        open(prescIsoxml(pf));
+    ELSE
+        MESSAGE 'Файл ISOXML не сформирован (нет зон или ошибка генерации).';
+}
+
+// ===================== Калибровка (ФТ4.3, каркас) =====================
+CLASS CalibrationSession 'Сессия калибровки';
+TABLE calibrationSession (CalibrationSession);
+seasonYear 'Сезон' = DATA INTEGER (CalibrationSession) NONULL;
+csCrop 'Культура' = DATA Crop (CalibrationSession) NONULL;
+expert 'Эксперт' = DATA CustomUser (CalibrationSession);
+csStatus 'Статус' = DATA CalibrationStatus (CalibrationSession) NONULL;
+nameCsStatus 'Статус' (CalibrationSession s) = staticCaption(csStatus(s));
+csCreated 'Создана' = DATA DATETIME (CalibrationSession);
+WHEN SET(CalibrationSession s IS CalibrationSession) DO csCreated(s) <- currentDateTime();
+WHEN SET(CalibrationSession s IS CalibrationSession) AND NOT CHANGED(csStatus(s)) DO csStatus(s) <- CalibrationStatus.initiated;
+CLASS CalibrationProposal 'Предложение калибровки';
+TABLE calibrationProposal (CalibrationProposal);
+session 'Сессия' = DATA CalibrationSession (CalibrationProposal) AUTOSET;
+coeffCode 'Код коэффициента' = DATA ISTRING[40] (CalibrationProposal) NONULL;
+coeffDescription 'Описание' = DATA TEXT (CalibrationProposal);
+currentValue 'Текущее' = DATA DOUBLE (CalibrationProposal) NONULL;
+proposedValue 'Предложено' = DATA DOUBLE (CalibrationProposal) NONULL;
+justification 'Обоснование' = DATA TEXT (CalibrationProposal);
+decision 'Решение' = DATA ProposalDecision (CalibrationProposal);
+finalValue 'Утверждено' = DATA DOUBLE (CalibrationProposal);
+expertComment 'Комментарий' = DATA TEXT (CalibrationProposal);
+
+// ===================== Калибровка: аналитический генератор (КФ-КБ1) =====================
+// план-факт по культуре сезона (История поля): поля с план-культурой сезона;
+// план — план-урожайность сезона (строка ГП), факт — факт-урожайность актов.
+// Этап 1 вместо LLM: |Δ|>5% на >30% полей культуры → предложение
+// finalValue = текущий коэффициент × (1 + Δ/100) (логика демо-сида 28,5=30×0,95)
+pctAbs (DOUBLE v) = IF v < 0 THEN -v ELSE v;
+calPlanSum (Crop c, INTEGER yr) = GROUP SUM fsPlanYieldC(FieldSeason x) IF fsPlanCrop(x) = c AND fsYear(x) = yr AND fsPlanYieldC(x);
+calPlanCnt (Crop c, INTEGER yr) = GROUP SUM 1 IF FieldSeason x IS FieldSeason AND fsPlanCrop(x) = c AND fsYear(x) = yr AND fsPlanYieldC(x);
+calFactSum (Crop c, INTEGER yr) = GROUP SUM fsFactYieldC(FieldSeason x) IF fsPlanCrop(x) = c AND fsYear(x) = yr AND fsFactYieldC(x);
+calFactCnt (Crop c, INTEGER yr) = GROUP SUM 1 IF FieldSeason x IS FieldSeason AND fsPlanCrop(x) = c AND fsYear(x) = yr AND fsFactYieldC(x);
+calPlanAvg (Crop c, INTEGER yr) = IF (OVERRIDE calPlanCnt(c, yr), 0) > 0 THEN calPlanSum(c, yr) / calPlanCnt(c, yr);
+calFactAvg (Crop c, INTEGER yr) = IF (OVERRIDE calFactCnt(c, yr), 0) > 0 THEN calFactSum(c, yr) / calFactCnt(c, yr);
+calDeltaPct 'План-факт, %' (Crop c, INTEGER yr) =
+    IF (OVERRIDE calPlanAvg(c, yr), 0.0) > 0 THEN (calFactAvg(c, yr) - calPlanAvg(c, yr)) * 100.0 / calPlanAvg(c, yr);
+calDevCnt (Crop c, INTEGER yr) = GROUP SUM 1 IF FieldSeason x IS FieldSeason
+    AND fsPlanCrop(x) = c AND fsYear(x) = yr AND fsPlanYieldC(x) AND fsFactYieldC(x)
+    AND pctAbs((fsFactYieldC(x) - fsPlanYieldC(x)) * 100.0 / fsPlanYieldC(x)) > 5.0;
+calDeviatedShare 'Доля полей с отклонением >5%, %' (Crop c, INTEGER yr) =
+    IF (OVERRIDE calPlanCnt(c, yr), 0) > 0 THEN 100.0 * (OVERRIDE calDevCnt(c, yr), 0) / calPlanCnt(c, yr);
+calRound2 (DOUBLE v) = FORMULA NUMERIC[10,2] 'round($1, 2)';
+
+// ===================== C2: LLM-калибровка (мост KNP / ai/chat) =====================
+kuAiGatewayUrl () = 'http://192.168.189.129:8088/api/v1/ai/chat';
+llmCalibrationAdvice 'AI-обоснование' = DATA TEXT (CalibrationSession);
+llmCalibrationStatus 'AI-статус' = DATA ISTRING[20] (CalibrationSession);
+// chr-хелперы для JSON-скобок (фигурные скобки в строках — локализация!)
+chOpen () = [FORMULA STRING[1] 'chr(123)']();   // {
+chClose () = [FORMULA STRING[1] 'chr(125)']();  // }
+
+requestLlmCalibration 'Запросить AI-обоснование' (CalibrationSession s) {
+    llmCalibrationStatus(s) <- 'запрос...';
+    APPLY;
+    LOCAL headers = STRING(STRING);
+    headers('Content-Type') <- 'application/json';
+    // JSON-тело: {"message":"..."} — скобки через chr-хелперы.
+    // Промпт — «методологическая задача» (тест C 11.10): шлюзовый системный
+    // промпт гоняет вопросы о «конкретных объектах хозяйства» в инструменты
+    // OG-RAG (модель блуждала по полям/сортам хранилища, напр. «OM-39»);
+    // рамка «отвечай из общих знаний» даёт чистую экспертизу (grounded=false)
+    LOCAL body = TEXT ();
+    body() <- chOpen() + '"message":"'
+        + 'Теоретический вопрос по агрономии и моделированию (отвечай только из общих знаний, '
+        + 'к данным хозяйства не обращайся, инструменты не нужны). '
+        + 'При калибровке модели программирования урожая по итогам сезона выявлено: культура — '
+        + (OVERRIDE nameCrop(csCrop(s)), 'пшеница')
+        + ' (сезон ' + ('' + seasonYear(s)) + '); '
+        + 'плановая урожайность ' + (OVERRIDE ('' + calRound2(calPlanAvg(csCrop(s), seasonYear(s)))), '0') + ' ц/га, '
+        + 'фактическая ' + (OVERRIDE ('' + calRound2(calFactAvg(csCrop(s), seasonYear(s)))), '0') + ' ц/га '
+        + '(отклонение ' + (OVERRIDE ('' + calRound2(calDeltaPct(csCrop(s), seasonYear(s)))), '0') + '%); '
+        + 'норматив выноса азота в модели — '
+        + (OVERRIDE ('' + calRound2(removalN(csCrop(s)))), '30') + ' кг/т; '
+        + 'модель предлагает скорректировать норматив до '
+        + (OVERRIDE ('' + calRound2((OVERRIDE removalN(csCrop(s)), 30.0) * (1.0 + (OVERRIDE calDeltaPct(csCrop(s), seasonYear(s)), 0.0) / 100.0))), '0')
+        + ' кг/т пропорционально факту. '
+        + 'Агрономически ли оправдана такая корректировка? Какие причины отклонения '
+        + '(погода, агротехника, измерения) стоит исключить, прежде чем её принимать? '
+        + 'Ответ — 2-3 предложения.'
+        + '"' + chClose();
+    TRY {
+        EXTERNAL HTTP POST kuAiGatewayUrl() HEADERS headers PARAMS JSONFILE(body()) TO exportFile;
+        // ответ: {"answer":"...", "grounded":...} — IMPORT JSON (паттерн apiKnpRecycling)
+        LOCAL answer = TEXT ();
+        IMPORT JSON FROM exportFile() TO () answer;
+        llmCalibrationAdvice(s) <- (OVERRIDE answer(), '(пустой ответ)');
+        llmCalibrationStatus(s) <- 'готово';
+    } CATCH {
+        llmCalibrationStatus(s) <- 'ошибка: ' + (OVERRIDE messageCaughtException(), 'нет связи');
+    }
+    APPLY;
+}
+
+generateCalibrationProposals 'Сформировать предложения (авто)' (CalibrationSession s) {
+    FOR Crop c IS Crop AND c = csCrop(s) AND calPlanAvg(c, seasonYear(s)) AND calFactAvg(c, seasonYear(s)) DO
+        IF pctAbs((OVERRIDE calDeltaPct(c, seasonYear(s)), 0.0)) > 5.0
+            AND (OVERRIDE calDeviatedShare(c, seasonYear(s)), 0.0) > 30.0
+        THEN
+            NEW p = CalibrationProposal {
+                session(p) <- s;
+                coeffCode(p) <- 'removalN_' + code(c);
+                coeffDescription(p) <- 'Вынос N, кг/т — авто-предложение (план-факт сезона)';
+                currentValue(p) <- (OVERRIDE removalN(c), 30.0);
+                proposedValue(p) <- calRound2((OVERRIDE removalN(c), 30.0) * (1.0 + (OVERRIDE calDeltaPct(c, seasonYear(s)), 0.0) / 100.0));
+                justification(p) <- 'план-факт: ' + (OVERRIDE ('' + calRound2(calDeltaPct(c, seasonYear(s)))), '—')
+                    + '% по ' + (OVERRIDE ('' + calDevCnt(c, seasonYear(s))), '0') + ' полям из '
+                    + (OVERRIDE ('' + calPlanCnt(c, seasonYear(s))), '0') + ' (доля '
+                    + (OVERRIDE ('' + calRound2(calDeviatedShare(c, seasonYear(s)))), '0') + '%)';
+            }
+    APPLY;
+}
+
+// КФ-КБ3/КБ4: утверждение — гвард 30% (предупреждение + обязательное
+// обоснование эксперта) и применение через аудит с контекстом калибровки
+approveCalibrationProposal 'Утвердить коэффициент' (CalibrationProposal p) {
+    IF (OVERRIDE currentValue(p), 0.0) > 0
+        AND pctAbs(((OVERRIDE proposedValue(p), 0.0) / currentValue(p) - 1.0) * 100.0) > 30.0
+        AND NOT expertComment(p) THEN
+        MESSAGE 'Отклонение от текущего >30% — заполните обоснование (комментарий эксперта)';
+    ELSE {
+        finalValue(p) <- (OVERRIDE finalValue(p), proposedValue(p));
+        decision(p) <- ProposalDecision.approvedP;
+        FOR CalibrationSession s IS CalibrationSession AND s = session(p) DO
+            FOR Crop c IS Crop AND c = csCrop(s) DO {
+                removalN(c) <- (OVERRIDE finalValue(p), proposedValue(p));
+                kuAuditChange('Калибровка', 'сессия ' + ('' + seasonYear(s)) + ', предложение ' + ('' + p),
+                    'removalN ' + code(c), (OVERRIDE ('' + currentValue(p)), ''), (OVERRIDE ('' + (OVERRIDE finalValue(p), proposedValue(p))), ''));
+            }
+        APPLY;
+    }
+}
+
+// ===================== Оптимизация графика (ФТ4.4, каркас) =====================
+CLASS OptimizationSession 'Сессия оптимизации';
+TABLE optimizationSession (OptimizationSession);
+triggerEvent 'Триггер' = DATA ISTRING[60] (OptimizationSession);
+horizonHours 'Горизонт, ч' = DATA INTEGER (OptimizationSession) NONULL;
+objective 'Веса целевой (JSON)' = DATA TEXT (OptimizationSession);
+snapshotAt 'Срез данных' = DATA DATETIME (OptimizationSession);
+optStatus 'Статус' = DATA OptSessionStatus (OptimizationSession) NONULL;
+nameOptStatus 'Статус' (OptimizationSession s) = staticCaption(optStatus(s));
+optProdPlan 'Годовой план' = DATA ProdPlan (OptimizationSession) NONULL;
+optError 'Ошибка' = DATA TEXT (OptimizationSession);
+WHEN SET(OptimizationSession s IS OptimizationSession) DO {
+    snapshotAt(s) <- currentDateTime();
+    horizonHours(s) <- 48;
+}
+WHEN SET(OptimizationSession s IS OptimizationSession) AND NOT CHANGED(optStatus(s)) DO optStatus(s) <- OptSessionStatus.queuedO;
+
+CLASS MtrRequest 'Заявка на МТР';
+TABLE mtrRequest (MtrRequest);
+optSession 'Сессия' = DATA OptimizationSession (MtrRequest) AUTOSET;
+mrStatus 'Статус' = DATA MtrRequestStatus (MtrRequest) NONULL;
+nameMrStatus 'Статус' (MtrRequest r) = staticCaption(mrStatus(r));
+mrField 'Поле' = DATA Field (MtrRequest) NONULL;
+nameMrField 'Поле' (MtrRequest r) = OVERRIDE name(mrField(r)), '';
+requiredBy 'Доставить к' = DATA DATETIME (MtrRequest) NONULL;
+WHEN SET(MtrRequest r IS MtrRequest) DO mrStatus(r) <- MtrRequestStatus.formedM;
+CLASS MtrRequestItem 'Строка заявки';
+TABLE mtrRequestItem (MtrRequestItem);
+request 'Заявка' = DATA MtrRequest (MtrRequestItem) AUTOSET;
+mriNomenclature 'Номенклатура' = DATA Nomenclature (MtrRequestItem) NONULL;
+nameMriNom (MtrRequestItem i) = OVERRIDE nomName(mriNomenclature(i)), '';
+mriQty 'Кол-во' = DATA NUMERIC[14,3] (MtrRequestItem) NONULL;
+mriWorkType 'Вид работ' = DATA WorkType (MtrRequestItem);
+
+CLASS RoutingTask 'Маршрутное задание';
+TABLE routingTask (RoutingTask);
+rtSession 'Сессия' = DATA OptimizationSession (RoutingTask) AUTOSET;
+// КФ-О5: этап 1 — техника не персонифицирована (спека, правка 10.10);
+// справочник МТП и свойство rtMachine — этап 2
+equipmentId 'Техника (ID)' = DATA ISTRING[40] (RoutingTask) NONULL;
+equipmentKind 'Тип техники' = DATA ISTRING[30] (RoutingTask) NONULL;
+rtStatus 'Статус' = DATA RoutingTaskStatus (RoutingTask) NONULL;
+nameRtStatus 'Статус' (RoutingTask t) = staticCaption(rtStatus(t));
+WHEN SET(RoutingTask t IS RoutingTask) DO rtStatus(t) <- RoutingTaskStatus.plannedT;
+// Волна 6 (MITE-первичность задач): каждому маршрутному заданию — задача
+// контура StoreTask (исполнители/сроки/чек-листы/мобильный API MITE);
+// ПЗ-347 «утверждённые операции → электронные карты-задания», ОАФ А.3.1.1
+rtTask 'Задача (StoreTask)' = DATA StoreTask.Task (RoutingTask);
+nameRtTask 'Задача MITE' (RoutingTask t) = StoreTask.name(rtTask(t));
+nameRtTaskStatus 'Статус задачи' (RoutingTask t) = StoreTask.nameStatus(rtTask(t));
+rtTaskDeadline 'Срок задачи' (RoutingTask t) = StoreTask.deadline(rtTask(t));
+// КФ-О4: этап 2 (составные задачи с шагами, синхронизацией и объёмами)
+CLASS RoutingStep 'Шаг маршрута';
+TABLE routingStep (RoutingStep);
+routingTask 'Задание' = DATA RoutingTask (RoutingStep) AUTOSET;
+rsField 'Точка' = DATA Field (RoutingStep) NONULL;
+nameRsField 'Точка' (RoutingStep s) = OVERRIDE name(rsField(s)), '';
+rsWorkType 'Вид работ' = DATA WorkType (RoutingStep) NONULL;
+startTime 'Начало' = DATA DATETIME (RoutingStep) NONULL;
+endTime 'Окончание' = DATA DATETIME (RoutingStep) NONULL;
+expectedVolume 'Объём' = DATA NUMERIC[12,2] (RoutingStep);
+syncWith 'Синхронизация с' = DATA RoutingStep (RoutingStep);
+
+CLASS CollisionLog 'Коллизия';
+TABLE collisionLog (CollisionLog);
+colSession 'Сессия оптимизации' = DATA OptimizationSession (CollisionLog) AUTOSET;
+collisionKind 'Тип коллизии' = DATA CollisionKind (CollisionLog) NONULL;
+nameCollisionKind 'Тип' (CollisionLog l) = staticCaption(collisionKind(l));
+colSeverity 'Серьёзность' = DATA CollisionSeverity (CollisionLog) NONULL;
+nameColSeverity 'Серьёзность' (CollisionLog l) = staticCaption(colSeverity(l));
+colField 'Поле' = DATA Field (CollisionLog);
+colNomenclature 'Номенклатура' = DATA Nomenclature (CollisionLog);
+colDescription 'Описание' = DATA TEXT (CollisionLog) NONULL;
+suggestedAction 'Рекомендация' = DATA TEXT (CollisionLog);
+
+// ===================== Действия =====================
+// КФ-А6(а): пересчёт мг/кг → кг/га через плотность почвы поля и глубину
+// слоя (НСИ: атрибут SoilType, дефолт 25 см; плотность NULL → 1.2 допущение)
+soilLayerDepth 'Глубина слоя, см' = DATA NUMERIC[5,1] (SoilType);
+nkToKgHa (Field f, DOUBLE mg1, DOUBLE mg2, DOUBLE dflt) =
+    (OVERRIDE mg1, OVERRIDE mg2, dflt) * (OVERRIDE densitySoil(soilType(f)), 1.2) * (OVERRIDE soilLayerDepth(soilType(f)), 25.0) / 10.0;
+
+// КФ-К3: возраст агрохимии плана (дни; >1461 ≈ 4 года — экспертная оценка)
+soilAgeDays (ComplexPlan c) = currentDate() - analysisDate(ypSoilAnalysis(c));
+
+// пересчёт баланса NPK по последнему агрохиманализу поля
+recalcNutrients 'Рассчитать NPK' (ComplexPlan c) {
+    // КФ-К2: утверждённый план не пересчитывается — новая версия
+    IF ypStatus(c) != YieldPlanStatus.draft THEN
+        MESSAGE 'План утверждён — создайте новую версию (кнопка «Новая версия»)';
+    ELSE {
+        FOR NutrientBalance b IS NutrientBalance AND nbPlan(b) = c DO DELETE b;
+        APPLY;
+        NEW bn = NutrientBalance {
+            nbPlan(bn) <- c; nbElement(bn) <- NutrientEl.n;
+            removalPerTon(bn) <- OVERRIDE removalN(ypCrop(c)), 30.0;
+            // КФ-А6(а): запас кг/га = мг/кг × плотность (г/см³) × слой (см) / 10;
+            // дефолт-аргумент (20/30/200) — признак экспертного режима (нет данных)
+            soilReserve(bn) <- nkToKgHa(ypField(c), (OVERRIDE kuSensorN(ypField(c)), NULL), (OVERRIDE n(ypSoilAnalysis(c)), NULL), 20.0);
+            soilAssimilation(bn) <- 30.0; fertAssimilation(bn) <- 70.0;
+        }
+        NEW bp2 = NutrientBalance {
+            nbPlan(bp2) <- c; nbElement(bp2) <- NutrientEl.p;
+            removalPerTon(bp2) <- OVERRIDE removalP(ypCrop(c)), 12.0;
+            soilReserve(bp2) <- nkToKgHa(ypField(c), (OVERRIDE kuSensorP(ypField(c)), NULL), (OVERRIDE p(ypSoilAnalysis(c)), NULL), 30.0);
+            soilAssimilation(bp2) <- 25.0; fertAssimilation(bp2) <- 60.0;
+        }
+        NEW bk = NutrientBalance {
+            nbPlan(bk) <- c; nbElement(bk) <- NutrientEl.k;
+            removalPerTon(bk) <- OVERRIDE removalK(ypCrop(c)), 25.0;
+            soilReserve(bk) <- nkToKgHa(ypField(c), (OVERRIDE kuSensorK(ypField(c)), NULL), (OVERRIDE k(ypSoilAnalysis(c)), NULL), 200.0);
+            soilAssimilation(bk) <- 40.0; fertAssimilation(bk) <- 65.0;
+        }
+        // предупреждения (⚠ эвристики прототипа)
+        ypWarnings(c) <- '';
+        IF ph(ypSoilAnalysis(c)) < phMin(ypCrop(c)) OR ph(ypSoilAnalysis(c)) > phMax(ypCrop(c)) THEN
+            ypWarnings(c) <- 'pH вне диапазона культуры; ';
+        IF targetYieldPlan(c) > targetYield(ypCrop(c)) * 1.3 THEN
+            ypWarnings(c) <- ypWarnings(c) + 'Целевая урожайность выше 130% целевой культуры';
+        // живые датчики почвы (Волна 3): эвристики здоровья почвы
+        IF kuSensorMoist(ypField(c)) AND kuSensorMoist(ypField(c)) < 30.0 THEN
+            ypWarnings(c) <- ypWarnings(c) + '; почва сухая (<30% по датчику) — усвоение снижено';
+        IF kuSensorTemp(ypField(c)) AND kuSensorTemp(ypField(c)) < 5.0 THEN
+            ypWarnings(c) <- ypWarnings(c) + '; почва холодная (<5°C по датчику) — подкормку отложить';
+        // КФ-К3: экспертная оценка — агрохимия старше 4 лет или без N/P/K
+        // (дефолты 20/30/200 подставляются только в этом режиме)
+        expertMode(c) <- soilAgeDays(c) > 1461
+            OR NOT n(ypSoilAnalysis(c)) OR NOT p(ypSoilAnalysis(c)) OR NOT k(ypSoilAnalysis(c));
+        IF expertMode(c) THEN
+            ypWarnings(c) <- (OVERRIDE ypWarnings(c), '')
+                + (IF ypWarnings(c) THEN '; ' ELSE '')
+                + 'ЭКСПЕРТНАЯ ОЦЕНКА: агрохимия неполная или старше 4 лет — утверждение только с обоснованием (комментарий плана)';
+        // КФ-А6: запас почвы покрывает вынос K — внесение калия не требуется
+        IF (GROUP MAX requiredDoseAi(NutrientBalance b) IF nbPlan(b) = c AND nbElement(b) = NutrientEl.k) = 0 THEN
+            ypWarnings(c) <- (IF (OVERRIDE ypWarnings(c), '') = '' THEN '' ELSE (OVERRIDE ypWarnings(c), '') + '; ')
+                + 'запас почвы покрывает вынос K — внесение калия не требуется';
+        APPLY;
+    }
+}
+
+// КФ-К1: доза материала = доза баланса элемента × доля операции
+// (ручная sharePercent, иначе равномерно 1/число операций с материалом
+// элемента); инвариант: GROUP SUM доз материалов элемента = дозе баланса
+assignSeasonalDoses 'Пересчитать доли доз' (SeasonalTechCard s) {
+    FOR SeasonalMaterial sm IS SeasonalMaterial
+        AND seasonalCard(seasonalOperation(sm)) = s
+        AND nomElement(smNomenclature(sm))
+    DO doseAi(sm) <- doseForBalance(complexPlan(s), nomElement(smNomenclature(sm)))
+        * (OVERRIDE sharePercent(sm), 100.0 / (OVERRIDE opCntEl(s, nomElement(smNomenclature(sm))), 1)) / 100.0;
+    APPLY;
+}
+// живой пересчёт при ручном изменении доли
+WHEN CHANGED (sharePercent(SeasonalMaterial m)) AND m IS SeasonalMaterial DO
+    assignSeasonalDoses(seasonalCard(seasonalOperation(m)));
+
+// КФ-К2: копия «на основании» — версия+1, черновик; дозы и сезонная ТК
+// пересоздаются расчётом (recalcNutrients → утверждение)
+newComplexPlanVersion 'Новая версия' (ComplexPlan src) {
+    NEW c = ComplexPlan {
+        ypField(c) <- ypField(src);
+        ypCrop(c) <- ypCrop(src);
+        ypVariety(c) <- ypVariety(src);
+        ypScenario(c) <- ypScenario(src);
+        targetYieldPlan(c) <- targetYieldPlan(src);
+        ypSoilAnalysis(c) <- ypSoilAnalysis(src);
+        ypProdPlan(c) <- ypProdPlan(src);
+        ypVersion(c) <- ypVersion(src) + 1;
+        ypBasedOn(c) <- src;
+    }
+    APPLY;
+}
+
+// КФ-Р1: создание сезонной ТК по шаблону (вызывается утверждением
+// комплексного плана и инъекцией коррекции при утверждённом плане)
+generateSeasonalCard 'Сформировать сезонную ТК' (ComplexPlan c) {
+    IF NOT (GROUP MAX SeasonalTechCard s IF complexPlan(s) = c) AND templateCardFor(ypCrop(c)) THEN {
+        LOCAL sc = SeasonalTechCard ();
+        NEW s = SeasonalTechCard {
+            complexPlan(s) <- c;
+            templateTechCard(s) <- templateCardFor(ypCrop(c));
+            sc() <- s;
+        }
+        FOR TechOperation o IS TechOperation AND card(o) = templateCardFor(ypCrop(c)) DO {
+            LOCAL nso = SeasonalOperation ();
+            NEW so = SeasonalOperation {
+                seasonalCard(so) <- sc();
+                soSeq(so) <- seqNo(o);
+                soWorkType(so) <- workType(o);
+                soPhase(so) <- phaseTrigger(o);
+                nso() <- so;
+            }
+            FOR OperationMaterial m IS OperationMaterial AND operation(m) = o DO
+                NEW sm = SeasonalMaterial {
+                    seasonalOperation(sm) <- nso();
+                    smNomenclature(sm) <- nomenclature(m);
+                    smMethod(sm) <- method(m);
+                    doseAi(sm) <- matRate(m) * 10.0;
+                }
+        }
+        // КФ-К1: дозы удобрений — из баланса NPK по долям операций
+        assignSeasonalDoses(sc());
+        NEW t = GenerationTask { taskKind(t) <- GenTaskKind.genTechcard; genComplexPlan(t) <- c; genStatus(t) <- GenTaskStatus.done; }
+        APPLY;
+    }
+}
+
+approveComplexPlan 'Утвердить план' (ComplexPlan c) {
+    // КФ-К2: повторное утверждение/правки утверждённого — через новую версию
+    IF ypStatus(c) != YieldPlanStatus.draft THEN
+        MESSAGE 'План уже утверждён — создайте новую версию';
+    // КФ-К3: экспертный режим требует обоснования (комментарий плана)
+    ELSE IF expertMode(c) AND NOT ypNote(c) THEN
+        MESSAGE 'Экспертная оценка: заполните обоснование в поле «Комментарий» перед утверждением';
+    ELSE {
+        ypStatus(c) <- YieldPlanStatus.approvedY;
+        ypApprovedAt(c) <- currentDateTime();
+        // КФ-К1: предупреждение о долях, заданных вручную и не суммирующихся в 100%
+        IF shareBroken(c) THEN
+            ypWarnings(c) <- (OVERRIDE ypWarnings(c), '') + '; доли внесения (sharePercent) в сумме ≠ 100% — проверьте сезонную ТК';
+        APPLY;
+        generateSeasonalCard(c);
+    }
+}
+
+// ФТ4.2: рекомендация по правилу базы знаний
+// stName — классифицированный тип стресса (ТЗ 4.2.2.2); '' → подбор по приоритету
+// КФ-Р3: настройки экономики коррекций (допущения этапа 1, spec-work 10.10:
+// цена продукции — из утверждённого сценария с fallback 14 500)
+kuSaveFactor 'Доля спасаемого урожая, %' = DATA NUMERIC[5,2] ();
+kuCorrectDoseAi 'Требуемое д.в. коррекции, кг/га' = DATA NUMERIC[10,2] ();
+prodOfCrop (Crop cp) = GROUP MAX Nomenclature n IF nomType(n) = NomType.product AND prodCrop(n) = cp;
+// КФ-Р6: окно BBCH правила против текущей фазы поля — ОДНОЗНАЧНЫЙ boolean
+// (IF-цепочка даёт TRUE/FALSE, не NULL; OR-цепочка сравнений травится 3VL:
+// NULL-окно/фаза/нечисловой код → правило допускается)
+bbchWindowOk (KbRule kr, Field f) =
+    IF NOT kbMaxBbch(kr) THEN TRUE
+    ELSE IF NOT kuFieldPhase(f) OR kuFieldPhase(f) = '' THEN TRUE
+    ELSE IF toInteger(kbMaxBbch(kr)) THEN toInteger(kuFieldPhase(f)) <= toInteger(kbMaxBbch(kr))
+    ELSE TRUE;
+createCorrection 'Создать рекомендацию' (Field f, Crop cp, StressType st, ISTRING[20] sev) {
+    NEW nr = CorrectionRecommendation {
+        stressEventId(nr) <- (IF st IS StressType THEN 'auto-' + stCode(st) + '-' ELSE 'manual-')
+            + (OVERRIDE ('' + (GROUP SUM 1 IF CorrectionRecommendation x)), '0');
+        crField(nr) <- f;
+        crCrop(nr) <- cp;
+        crScenario(nr) <- (GROUP MAX PriceScenario s IF psStatus(s) = PriceScenarioStatus.approved);
+        // КФ-Р3: выгода = целевая/10 × цена продукции из сценария × доля спасения
+        expectedBenefit(nr) <- targetYield(cp) / 10.0
+            * (OVERRIDE priceOf(crScenario(nr), prodOfCrop(cp)), 14500.0)
+            * (OVERRIDE kuSaveFactor(), 30.0) / 100.0;
+        crSeverity(nr) <- IF sev AND sev != '' THEN sev;
+    }
+    APPLY;
+    // ⚠ LOCAL после APPLY мёртв (урок: recommendation писал NULL — сироты
+    // 33358/86117 в живой БД); перевыборка по «последней для поля+культуры»
+    LOCAL r2 = CorrectionRecommendation ();
+    r2() <- GROUP LAST CorrectionRecommendation x ORDER crCreated(x), x
+        IF crField(x) = f AND crCrop(x) = cp;
+    // лучшее правило: тип стресса (если задан), приоритет, культура совпадает или универсальна
+    // (NOT stName — защита от NULL-типа: NOT NULL = TRUE, трактуем как «тип не задан»);
+    // КФ-Р6: правило с верхним окном BBCH ниже текущей фазы поля — отбраковка
+    // (окно не задано / фаза неизвестна / код нечисловой — правило допускается)
+    FOR KbRule kr IS KbRule AND (NOT kbCrop(kr) OR kbCrop(kr) = cp)
+        AND (NOT (st IS StressType) OR kbStressRef(kr) = st)
+        AND NOT (GROUP MAX KbRule k2 IF (NOT kbCrop(k2) OR kbCrop(k2) = cp) AND (NOT (st IS StressType) OR kbStressRef(k2) = st)
+            AND kbPriority(k2) < kbPriority(kr))
+        AND bbchWindowOk(kr, f)
+    DO {
+        NEW i = CorrectionItem {
+            recommendation(i) <- r2();
+            ciRule(i) <- kr;
+            ciNomenclature(i) <- kbNomenclature(kr);
+            ciWorkType(i) <- kbWorkType(kr);
+            ciMethod(i) <- kbMethod(kr);
+            requiredAiDose(i) <- (OVERRIDE kuCorrectDoseAi(), 30.0);
+        }
+        FOR CorrectionRecommendation rr IS CorrectionRecommendation AND rr = r2() DO {
+            analysisText(rr) <- 'Стресс на поле (' + (OVERRIDE stName(st), 'тип не задан')
+                + '); препарат: ' + (OVERRIDE nomName(kbNomenclature(kr)), '') + '; правило приоритета ' + ('' + kbPriority(kr));
+            // КФ-Р6: фаза ниже нижней границы окна — допускается с предупреждением
+            IF kbMinBbch(kr) AND (OVERRIDE kuFieldPhase(f), '') != ''
+                AND toInteger(kuFieldPhase(f)) < toInteger(kbMinBbch(kr)) THEN
+                analysisText(rr) <- (OVERRIDE analysisText(rr), '') + '; фаза BBCH поля ниже окна правила (' + (OVERRIDE kbMinBbch(kr), '') + ')';
+            // ОАФ Б.1.2.1.2: для правил с требованием сухого окна — статус
+            // окна по живому прогнозу (слой KuLand)
+            IF needsWeatherWindow(kr) AND kuWfHas(kuSeasonLoc(), currentDate()) THEN
+                analysisText(rr) <- (OVERRIDE analysisText(rr), '') + '; погодное окно: '
+                    + (IF kuWindowRainy() != '' THEN 'осадки ' + kuWindowRainy() + '— ждать сухого окна (> 24 ч)' ELSE 'сухое окно подтверждено (7 дней)');
+        }
+    }
+    APPLY;
+    // КФ-Р7 (BR-04): подходящего правила нет — экспертная оценка агронома
+    r2() <- GROUP LAST CorrectionRecommendation x ORDER crCreated(x), x
+        IF crField(x) = f AND crCrop(x) = cp;
+    IF NOT (GROUP SUM 1 IF recommendation(CorrectionItem i) = r2()) THEN {
+        kuNotify('Агроном', 'Требуется экспертная оценка: нет правила БЗ для стресса '
+            + (OVERRIDE stName(st), 'тип не задан') + ' на поле ' + (OVERRIDE name(f), ''));
+        NEW l = ServiceLog { operKind(l) <- 'Коррекция: нет правила БЗ (экспертная оценка)';
+            logObjectKind(l) <- 'Field'; logObjectId(l) <- (OVERRIDE name(f), ''); }
+        APPLY;
+    }
+    // КФ-Р4 (BR-02): экономически нецелесообразно — рекомендация не создаётся
+    ELSE {
+        r2() <- GROUP LAST CorrectionRecommendation x ORDER crCreated(x), x
+            IF crField(x) = f AND crCrop(x) = cp;
+        FOR CorrectionRecommendation rr IS CorrectionRecommendation AND rr = r2() DO
+            IF netEffect(rr) < 0 THEN {
+                // мероприятия удаляются вместе с рекомендацией (иначе сироты)
+                FOR CorrectionItem ci IS CorrectionItem AND recommendation(ci) = rr DO DELETE ci;
+                FOR CorrectionRecommendation rr2 IS CorrectionRecommendation AND rr2 = rr DO DELETE rr2;
+                NEW l = ServiceLog { operKind(l) <- 'Коррекция: отказ (затраты больше выгоды)';
+                    logObjectKind(l) <- 'Field'; logObjectId(l) <- (OVERRIDE name(f), ''); }
+            }
+        APPLY;
+    }
+}
+
+// КФ-С6 (11.10): коррекция из детекции реестра — гипотеза детекции как
+// дефолт типа (эксперт переопределит в UI); культура обязательна
+createCorrectionFromDetection 'Коррекция по детекции' (StressDetection d) {
+    IF currentCrop(sdField(d)) THEN
+        createCorrection(sdField(d), currentCrop(sdField(d)),
+            (OVERRIDE sdHypothesis(d), stUnmodeled()), 'Средняя');
+    ELSE
+        MESSAGE 'На поле нет текущей культуры — коррекция недоступна.';
+}
+FORM stressMonitor 'Стресс-монитор'
+    OBJECTS d = StressDetection
+    PROPERTIES (d) READONLY nameSdField, nameSdIndicator, sdMeasured, sdThreshold, nameSdHypothesis, sdAgeDays, nameSdStatus
+    PROPERTIES (d) createCorrectionFromDetection SHOWIF sdStatus(d) = StressDetectionStatus.active
+    PROPERTIES (d) NEWSESSION EDIT, DELETE
+    FILTERS sdStatus(d) = StressDetectionStatus.active OR sdStatus(d) = StressDetectionStatus.confirmed
+    ORDERS sdDetectedAt(d) DESC
+;
+
+// КФ-Р1 (BR-03, спека ФТ4.2.2): при утверждении — инъекция операции внесения
+// в сезонную ТК поля (по последнему утверждённому комплексному плану; карты
+// нет — создаётся по шаблону); статус → «Исполнена».
+// ⚠ Согласование с КФ-К1: инъецированная доза = требуемому д.в. коррекции
+// (дополнительная подкормка сверх плана; перераспределения долей не делаем).
+// Параметр r выживает APPLY (эталон copyPriceScenario); LOCAL — нет.
+approveCorrection 'Утвердить' (CorrectionRecommendation r) {
+    crStatus(r) <- RecommendationStatus.approvedR;
+    IF currentUser() THEN crDecidedBy(r) <- currentUser();
+    LOCAL ap = ComplexPlan ();
+    ap() <- lastYpApproved(crField(r));
+    IF ap() AND NOT (GROUP MAX SeasonalTechCard s IF complexPlan(s) = ap()) THEN
+        generateSeasonalCard(ap());   // APPLY внутри
+    FOR CorrectionItem i IS CorrectionItem AND recommendation(i) = r DO {
+        LOCAL sc = SeasonalTechCard ();
+        sc() <- GROUP MAX SeasonalTechCard s IF complexPlan(s) = lastYpApproved(crField(r));
+        IF sc() THEN {
+            LOCAL nso = SeasonalOperation ();
+            NEW so = SeasonalOperation {
+                seasonalCard(so) <- sc();
+                soWorkType(so) <- ciWorkType(i);
+                soSeq(so) <- (OVERRIDE (GROUP MAX soSeq(SeasonalOperation o) IF seasonalCard(o) = sc()), 0) + 1;
+                soPlannedDate(so) <- currentDate();
+                soNote(so) <- 'Коррекция ' + (OVERRIDE stressEventId(r), '') + ': '
+                    + (OVERRIDE stName(kbStressRef(ciRule(i))), 'стресс');
+                nso() <- so;
+            }
+            NEW sm = SeasonalMaterial {
+                seasonalOperation(sm) <- nso();
+                smNomenclature(sm) <- ciNomenclature(i);
+                smMethod(sm) <- ciMethod(i);
+                doseAi(sm) <- requiredAiDose(i);
+            }
+        }
+    }
+    // «Исполнена» — только если инъекция состоялась (есть мероприятия и карта)
+    IF (GROUP SUM 1 IF recommendation(CorrectionItem i) = r)
+        AND (GROUP MAX SeasonalTechCard s IF complexPlan(s) = lastYpApproved(crField(r))) THEN
+        crStatus(r) <- RecommendationStatus.executedR;
+    // КФ-Р2: событие «Корректирующее мероприятие утверждено» (13-й тип шины)
+    kuPublish(KuEventKind.correctionApproved, 'CorrectionRecommendation', (OVERRIDE stressEventId(r), ''),
+        'Поле: ' + (OVERRIDE name(crField(r)), '')
+        + '; препараты: ' + (OVERRIDE (GROUP CONCAT nomName(ciNomenclature(CorrectionItem i)) IF recommendation(i) = r, ', ' ORDER i), '')
+        + '; доза д.в.: ' + (OVERRIDE ('' + (GROUP SUM requiredAiDose(CorrectionItem i) IF recommendation(i) = r)), '')
+        + '; выгода, руб/га: ' + (OVERRIDE ('' + expectedBenefit(r)), ''));
+    APPLY;
+}
+// КФ-Р2: отклонение — с обязательной причиной (спека)
+rejectCorrection 'Отклонить' (CorrectionRecommendation r) {
+    IF NOT decisionComment(r) THEN
+        MESSAGE 'Укажите причину отклонения в поле «Комментарий»';
+    ELSE {
+        crStatus(r) <- RecommendationStatus.rejectedR;
+        IF currentUser() THEN crDecidedBy(r) <- currentUser();
+        APPLY;
+    }
+}
+
+// ФТ4.4: эвристика графика (⚠ без VRP)
+// КФ-О1: фиксация фактической конфигурации сессии; фигурные скобки JSON —
+// через chr (литеральные {} в строках — локализация)
+obrace () = [FORMULA STRING[1] 'chr(123)']();
+cbrace () = [FORMULA STRING[1] 'chr(125)']();
+// КФ-О3: серьёзность погодной коллизии — критично, если в 7-дневном окне
+// есть задания с дедлайном (иначе предупреждение); типы «Дефицит МТР»/
+// «Перегрузка элеватора»/«Нет водителя» — этап 2 (спека)
+hasDeadlineInWindow () = GROUP MAX 1 IF RoutingTask t IS RoutingTask
+    AND rtTaskDeadline(t) AND rtTaskDeadline(t) <= currentDate() + 7;
+runOptimization 'Оптимизировать график' (ProdPlan p) {
+    LOCAL ob = TEXT ();
+    ob() <- obrace() + '"mode":"heuristic","weather":"'
+        + (IF kuWfHas(kuSeasonLoc(), currentDate()) THEN 'live' ELSE 'fallback')
+        + '","vrpBridge":false' + cbrace();   // VRP/веса W1-W3 — этап 2
+    NEW s = OptimizationSession {
+        triggerEvent(s) <- 'manual';
+        objective(s) <- ob();
+        optProdPlan(s) <- p;
+        optStatus(s) <- OptSessionStatus.runningO;
+    }
+    APPLY;
+    // эвристика (⚠ вместо VRP): заявки на материалы сезонных карт + маршруты
+    // по технике-константе + коллизия при пересечении времени на технике
+    FOR OptimizationSession s IS OptimizationSession AND optProdPlan(s) = p AND optStatus(s) = OptSessionStatus.runningO DO {
+        // КФ-О2: срок заявок — от горизонта сессии (спека: 48 ч)
+        LOCAL horizon = INTEGER ();
+        horizon() <- OVERRIDE horizonHours(s), 48;
+        // 1) заявки МТР по материалам сезонных операций плана
+        FOR SeasonalMaterial sm IS SeasonalMaterial
+            AND seasonalCard(seasonalOperation(sm)) IS SeasonalTechCard
+            AND complexPlan(seasonalCard(seasonalOperation(sm))) IS ComplexPlan
+            AND ypField(complexPlan(seasonalCard(seasonalOperation(sm)))) IS Field
+        DO NEW r = MtrRequest {
+            optSession(r) <- s;
+            mrField(r) <- ypField(complexPlan(seasonalCard(seasonalOperation(sm))));
+            requiredBy(r) <- currentDateTime() + horizon() * 3600;
+        }
+        // 2) маршрутные задания: по одному на сезонную операцию (⚠ этап 1 —
+        // техника не персонифицирована: справочник МТП — этап 2, спека) + задача
+        // контура StoreTask (Волна 6; срок — тем же горизонтом сессии, КФ-О2)
+        LOCAL rts = RoutingTask ();
+        LOCAL tsk = StoreTask.Task ();
+        FOR SeasonalOperation so IS SeasonalOperation
+            AND seasonalCard(so) IS SeasonalTechCard
+            AND complexPlan(seasonalCard(so)) IS ComplexPlan
+        DO {
+            NEW rt = RoutingTask {
+                rtSession(rt) <- s;
+                equipmentId(rt) <- 'UNIT-01';
+                equipmentKind(rt) <- 'Универсальный';
+                rts() <- rt;
+            }
+            NEW t = StoreTask.Task {
+                StoreTask.name(t) <- 'КУ: Маршрут ' + (OVERRIDE nameSoWorkType(so), 'операция');
+                StoreTask.type(t) <- StoreTask.formTaskType();
+                StoreTask.priority(t) <- StoreTask.taskPriority('normal');
+                StoreTask.status(t) <- StoreTask.taskStatus('new');
+                StoreTask.deadline(t) <- currentDate() + (horizon() + 23) / 24;   // вверх, INTEGER-деление
+                StoreTask.description(t) <- 'Техника UNIT-01 ('
+                    + (OVERRIDE nameSoWorkType(so), 'операция') + '); электронная карта-задание (ПЗ, ОАФ А.3.1.1)';
+                tsk() <- t;
+            }
+            rtTask(rts()) <- tsk();
+        }
+        // 3) коллизия погоды: по живому прогнозу на 7 дней (ОАФ А.3.1.2 —
+        // задания, критичные к осадкам, приостанавливаются до сухого окна
+        // > 24 ч). Нет живых данных (закрытый стенд без сети) — прежняя
+        // демо-запись, чтобы коллизия на показе присутствовала всегда
+        IF kuWfHas(kuSeasonLoc(), currentDate()) THEN {
+            IF kuWindowRainy() != '' THEN
+                NEW l = CollisionLog {
+                    colSession(l) <- s;
+                    collisionKind(l) <- CollisionKind.weatherC;
+                    // КФ-О3: дедлайны в окне осадков — критично
+                    colSeverity(l) <- IF hasDeadlineInWindow() THEN CollisionSeverity.criticalC ELSE CollisionSeverity.warningC;
+                    colDescription(l) <- 'Живой прогноз: осадки ожидаются ' + kuWindowRainy() + '— операции, критичные к осадкам, приостановлены'
+                        + (IF hasDeadlineInWindow() THEN '; в окне есть задания с дедлайном — КРИТИЧНО' ELSE '');
+                    suggestedAction(l) <- 'Перенести операции на дату после осадков (сухое окно более 24 ч)';
+                }
+            ELSE
+                NEW l = CollisionLog {
+                    colSession(l) <- s;
+                    collisionKind(l) <- CollisionKind.weatherC;
+                    colSeverity(l) <- CollisionSeverity.warningC;
+                    colDescription(l) <- 'Живой прогноз: осадки в 7-дневном окне не ожидаются — погодных ограничений нет';
+                    suggestedAction(l) <- 'Работы выполнять по графику';
+                }
+        } ELSE
+            NEW l = CollisionLog {
+                colSession(l) <- s;
+                collisionKind(l) <- CollisionKind.weatherC;
+                colSeverity(l) <- CollisionSeverity.warningC;
+                colDescription(l) <- 'Прогноз дождя в период работ — проверить окна';
+                suggestedAction(l) <- 'Перенести операции на +1 день при подтверждении';
+            }
+        optStatus(s) <- OptSessionStatus.doneO;
+    }
+    APPLY;
+}
+
+
+// ОАФ А.3.1.2 (хвост сценария, волна 6): при неблагоприятном прогнозе
+// задания, критичные к осадкам, приостанавливаются (awaitingT), при сухом
+// окне возвращаются в работу; диспетчер получает уведомление (волна 4).
+// КФ-О6: приостановка/возврат пишутся в журнал коллизий (последняя сессия
+// оптимизации; серьёзность по КФ-О3)
+kuWeatherHoldTasks 'Погода: приостановить/вернуть задания' () {
+    kuJobStart('Погодная приостановка заданий');
+    IF kuWfHas(kuSeasonLoc(), currentDate()) AND kuWindowRainy() != '' THEN {
+        FOR RoutingTask t IS RoutingTask AND rtStatus(t) = RoutingTaskStatus.plannedT DO
+            rtStatus(t) <- RoutingTaskStatus.awaitingT;
+        FOR OptimizationSession s IS OptimizationSession
+            AND s = (GROUP LAST OptimizationSession x ORDER snapshotAt(x), x)
+        DO NEW l = CollisionLog {
+            colSession(l) <- s;
+            collisionKind(l) <- CollisionKind.weatherC;
+            colSeverity(l) <- IF hasDeadlineInWindow() THEN CollisionSeverity.criticalC ELSE CollisionSeverity.warningC;
+            colDescription(l) <- 'Приостановка заданий: по живому прогнозу осадки ' + kuWindowRainy() + '(сухое окно > 24 ч — возврат)';
+            suggestedAction(l) <- 'Вернуть задания кнопкой при сухом окне';
+        }
+        APPLY;
+        kuNotify('Диспетчер', 'Задания приостановлены: по живому прогнозу осадки ' + kuWindowRainy() + '(сухое окно > 24 ч — возврат)');
+    } ELSE {
+        IF kuWfHas(kuSeasonLoc(), currentDate()) THEN {
+            FOR RoutingTask t IS RoutingTask AND rtStatus(t) = RoutingTaskStatus.awaitingT DO
+                rtStatus(t) <- RoutingTaskStatus.plannedT;
+            FOR OptimizationSession s IS OptimizationSession
+                AND s = (GROUP LAST OptimizationSession x ORDER snapshotAt(x), x)
+                AND (GROUP MAX 1 IF RoutingTask t IS RoutingTask AND rtSession(t) = s
+                        AND rtStatus(t) = RoutingTaskStatus.awaitingT)
+            DO NEW l = CollisionLog {
+                colSession(l) <- s;
+                collisionKind(l) <- CollisionKind.weatherC;
+                colSeverity(l) <- CollisionSeverity.warningC;
+                colDescription(l) <- 'Сухое окно подтверждено — задания возвращены в работу';
+                suggestedAction(l) <- 'Выполнять по графику';
+            }
+            APPLY;
+            kuNotify('Диспетчер', 'Сухое окно подтверждено — задания возвращены в работу');
+        }
+    }
+    kuJobFinish('Погодная приостановка заданий', 'Выполнено',
+        'Открытых заданий: ' + (OVERRIDE ('' + (GROUP SUM 1 IF RoutingTask t IS RoutingTask AND rtStatus(t) != RoutingTaskStatus.cancelledT)), '0'));
+}
+
+// ===================== Регистрация стресса → рекомендация (ФТ4.2.1) =====================
+registerStress 'Зарегистрировать стресс' (Field f) {
+    IF currentCrop(f) THEN {
+        createCorrection(f, currentCrop(f), NULL, '');
+    } ELSE {
+        MESSAGE 'На поле не задана текущая культура';
+    }
+}
+
+// ФТ2.6 → ФТ4.2: замыкание авто-выявленного стресса (KuSimulation) на сервис
+// корректирующих мероприятий — рекомендация по правилу базы знаний
+onKuStress (Field f, StressType st, ISTRING[20] sev) + {
+    IF currentCrop(f) THEN createCorrection(f, currentCrop(f), st, sev);
+}
+
+nextStepForecast '→ Запустить прогноз' (ComplexPlan c) ABSTRACT;
+nextStepForecast (ComplexPlan c) + {
+    IF ypStatus(c) = YieldPlanStatus.approvedY THEN
+        MESSAGE 'Комплексный план утверждён.\nСледующий шаг: запустить прогноз (раздел «Симуляция» → «Задачи моделирования»).';
+    ELSE
+        MESSAGE 'Сначала утвердите комплексный план';
+}
+
+// ФТ4.2.1: регистрация стресса на поле → автоматическая рекомендация
+FORM stressRegistration 'Регистрация стресса'
+    OBJECTS f = Field
+    PROPERTIES (f) READONLY name, nameCurrentCrop
+    PROPERTIES (f) registerStress
+    FILTERS currentCrop(f)
+;
+
+runOptimizationForSession 'Оптимизировать (по плану сессии)' (OptimizationSession s) {
+    runOptimization(optProdPlan(s));
+}
+
+// ===================== Выбор объектов: пикеры =====================
+// Сырые объектные свойства платформа показывает числовым id — на форме
+// вычисляемые имена, изменение ссылок — кнопками выбора из списка.
+setYpFieldAct 'Выбрать поле' (ComplexPlan c) {
+    DIALOG pickField OBJECTS f = ypField(c) INPUT f NULL DO {
+        ypField(c) <- f;
+        // КФ-К6: автоподстановка единственного утверждённого ГП организации
+        // поля (несколько утверждённых — остаётся ручной пикер)
+        IF NOT ypProdPlan(c) THEN
+            ypProdPlan(c) <- GROUP MAX ProdPlan p
+                IF ppStatus(p) = ProdPlanStatus.approvedG AND ppOrganization(p) = organization(f);
+    }
+}
+setYpCropAct 'Выбрать культуру' (ComplexPlan c) {
+    DIALOG pickCrop OBJECTS pc = ypCrop(c) INPUT pc NULL DO ypCrop(c) <- pc;
+}
+setYpScenarioAct 'Выбрать сценарий цен' (ComplexPlan c) {
+    DIALOG pickPriceScenario OBJECTS sc = ypScenario(c) INPUT sc NULL DO ypScenario(c) <- sc;
+}
+setYpSoilAct 'Выбрать агрохиманализ' (ComplexPlan c) {
+    DIALOG pickSoilAnalysis OBJECTS a = ypSoilAnalysis(c) INPUT a NULL FILTERS field(a) = ypField(c) DO ypSoilAnalysis(c) <- a;
+}
+setYpProdPlanAct 'Выбрать годовой план' (ComplexPlan c) {
+    DIALOG pickProdPlan OBJECTS pp = ypProdPlan(c) INPUT pp NULL FILTERS ppStatus(pp) = ProdPlanStatus.approvedG DO ypProdPlan(c) <- pp;
+}
+
+// ===================== Формы =====================
+
+// «Показать на карте» для комплексного плана: поле плана — с зонами NPK
+showComplexPlanOnMap 'Показать на карте' (ComplexPlan cp) {
+    showFieldOnMap(ypField(cp));
+}
+
+FORM complexPlans 'Комплексные планы'
+    OBJECTS c = ComplexPlan
+    PROPERTIES (c) READONLY nameYpField, nameYpCrop, targetYieldPlan, nameYpStatus, ypVersion, nameYpProdPlan, marginPercent
+    PROPERTIES (c) NEWSESSION NEW, EDIT, DELETE, recalcNutrients, approveComplexPlan, newComplexPlanVersion
+    PROPERTIES (c) showComplexPlanOnMap
+;
+
+FORM complexPlan 'Комплексный план'
+    OBJECTS c = ComplexPlan PANEL
+    PROPERTIES (c) READONLY nameYpField, nameYpCrop, nameYpScenario, nameYpSoil, nameYpProdPlan
+    PROPERTIES (c) READONLY ypSensorN, ypSensorP, ypSensorK, ypSensorMoist, ypSensorTemp
+    PROPERTIES (c) setYpFieldAct, setYpCropAct, setYpScenarioAct, setYpSoilAct SHOWIF ypStatus(c) = YieldPlanStatus.draft
+    PROPERTIES (c) setYpProdPlanAct SHOWIF NOT ypProdPlan(c)
+    PROPERTIES (c) READONLY nameYpVariety
+    PROPERTIES (c) setYpVarietyAct SHOWIF NOT ypVariety(c)
+    PROPERTIES (c) targetYieldPlan READONLYIF ypStatus(c) != YieldPlanStatus.draft
+    PROPERTIES (c) ypNote
+    PROPERTIES (c) READONLY nameYpStatus, ypVersion, expertMode, ypWarnings, incomePlan, fertCostTotal, applicationCost, marginPercent
+    PROPERTIES (c) recalcNutrients, approveComplexPlan SHOWIF ypStatus(c) = YieldPlanStatus.draft
+    PROPERTIES (c) newComplexPlanVersion SHOWIF ypStatus(c) = YieldPlanStatus.approvedY
+    PROPERTIES (c) nextStepForecast
+
+    OBJECTS b = NutrientBalance
+    PROPERTIES (b) READONLY nameNbElement, removalPerTon, soilReserve, soilAssimilation, fertAssimilation, requiredDoseAi
+    FILTERS nbPlan(b) = c
+
+    OBJECTS s = SeasonalTechCard
+    PROPERTIES (s) READONLY nameTemplate, nameStcStatus
+    PROPERTIES (s) generatePrescription
+    FILTERS complexPlan(s) = c
+
+    OBJECTS pf = PrescriptionFile
+    PROPERTIES (pf) READONLY namePrescOperation, zoningSrc, prescNBase, zonesMethod, prescFormat, zonesSummary, zonesJson
+    PROPERTIES (pf) exportIsoxml
+    FILTERS prescCard(pf) = s
+
+    OBJECTS so = SeasonalOperation
+    PROPERTIES (so) READONLY soSeq, nameSoWorkType, soPlannedDate, soNote
+    FILTERS seasonalCard(so) = s
+
+    OBJECTS sm = SeasonalMaterial
+    PROPERTIES (sm) READONLY nameSmNom, doseAi, dosePhysical
+    FILTERS seasonalOperation(sm) = so
+
+    EDIT ComplexPlan OBJECT c
+;
+
+FORM correctionRecommendations 'Корректирующие мероприятия'
+    OBJECTS r = CorrectionRecommendation
+    PROPERTIES (r) READONLY nameCrField, nameCrCrop, nameCrStatus, crSeverity, totalCost, expectedBenefit, netEffect
+    PROPERTIES (r) NEWSESSION EDIT, DELETE, approveCorrection, rejectCorrection
+;
+
+FORM correctionRecommendation 'Рекомендация'
+    OBJECTS r = CorrectionRecommendation PANEL
+    PROPERTIES (r) READONLY stressEventId, crField, crCrop, crPhase, crScenario, nameCrStatus, crSeverity, analysisText, totalCost, expectedBenefit, netEffect, crDecidedBy
+    PROPERTIES (r) decisionComment, approveCorrection, rejectCorrection
+
+    OBJECTS i = CorrectionItem
+    PROPERTIES (i) READONLY nameCiNom, nameCiRule, requiredAiDose, physicalDose, aiDoseCost
+    FILTERS recommendation(i) = r
+
+    EDIT CorrectionRecommendation OBJECT r
+;
+
+// имена для реестра базы знаний (форма была без колонок — выглядела пустой)
+nameKbCrop 'Культура' (KbRule kr) = OVERRIDE nameCrop(kbCrop(kr)), '(любая)';
+nameKbWork 'Вид работы' (KbRule kr) = OVERRIDE wtName(kbWorkType(kr)), '';
+FORM kbRules 'База знаний (правила)'
+    OBJECTS kr = KbRule
+    PROPERTIES (kr) READONLY kbPriority, nameKbCrop, nameKbStressRef, nameKbNom, nameKbWork, kbAssimilation, needsWeatherWindow
+    PROPERTIES (kr) setKbStressAct
+    PROPERTIES (kr) NEWSESSION NEW, EDIT, DELETE
+    ORDERS kbPriority(kr)
+;
+
+// КФ-КБ5: «Проверить на истории» (ретроспективный прогон BR-05) — этап 2:
+// прогон симуляции прошлого сезона с предложенными коэффициентами
+FORM calibrationSessions 'Калибровка моделей'
+    OBJECTS s = CalibrationSession
+    PROPERTIES (s) READONLY seasonYear, csCrop, nameCsStatus, csCreated
+    PROPERTIES (s) NEWSESSION NEW, EDIT, DELETE, generateCalibrationProposals
+    PROPERTIES (s) requestLlmCalibration
+    PROPERTIES (s) READONLY llmCalibrationStatus, llmCalibrationAdvice
+
+    OBJECTS p = CalibrationProposal
+    PROPERTIES (p) READONLY coeffCode, currentValue, proposedValue, justification, decision, finalValue
+    PROPERTIES (p) expertComment, approveCalibrationProposal
+    FILTERS session(p) = s
+;
+
+FORM optimizationSessions 'График обеспечения'
+    OBJECTS s = OptimizationSession
+    PROPERTIES (s) READONLY triggerEvent, optProdPlan, nameOptStatus, snapshotAt
+    PROPERTIES (s) NEWSESSION NEW, EDIT, DELETE, runOptimizationForSession
+
+    OBJECTS l = CollisionLog
+    PROPERTIES (l) READONLY nameCollisionKind, nameColSeverity, colDescription, suggestedAction
+    FILTERS colSession(l) = s
+;
+
+// ===================== Сид =====================
+northField () = GROUP MAX Field f IF code(f) = 'KH-001';
+wheatYield () = GROUP MAX Crop c IF code(c) = 'ЗЕР-001';
+fertN () = GROUP MAX Nomenclature n IF nomCode(n) = 'N-00003';
+fungicideNom () = GROUP MAX Nomenclature n IF nomCode(n) = 'N-00009';
+sprayWork () = GROUP MAX WorkType w IF wtCode(w) = 'АГРО-008';
+sprayMethod () = GROUP MAX ApplicationMethod am IF amCode(am) = 'MV-004';
+
+yieldSeed () {
+    // комплексный план по KH-001 (пшеница), сценарий «Базовый 2027»
+    IF NOT (GROUP MAX ComplexPlan c) AND northField() AND wheatYield() AND (GROUP MAX PriceScenario s IF psName(s) = 'Базовый 2027') THEN {
+        NEW c = ComplexPlan {
+            ypField(c) <- northField();
+            ypCrop(c) <- wheatYield();
+            ypVariety(c) <- GROUP MAX Variety v IF varName(v) = 'Московская 39';   // КФ-9: ссылка
+            ypScenario(c) <- GROUP MAX PriceScenario s IF psName(s) = 'Базовый 2027';
+            targetYieldPlan(c) <- 65.0;
+            ypSoilAnalysis(c) <- GROUP MAX SoilAnalysis a IF field(a) = northField();
+        }
+        APPLY;
+        FOR ComplexPlan c IS ComplexPlan AND ypField(c) = northField() DO recalcNutrients(c);
+        APPLY;
+    }
+    // КФ-К6: трассировка сид-плана KH-001 → ГП-2027-1 (идемпотентно)
+    FOR ComplexPlan c IS ComplexPlan AND ypField(c) = northField() AND NOT ypProdPlan(c) DO
+        ypProdPlan(c) <- GROUP MAX ProdPlan p IF ppNumber(p) = 'ГП-2027-1' AND ppStatus(p) = ProdPlanStatus.approvedG;
+    APPLY;
+    // сезонная карта + утверждение — дозаправкой
+    IF (GROUP MAX ComplexPlan c IF ypField(c) = northField()) AND ypStatus(GROUP MAX ComplexPlan c IF ypField(c) = northField()) = YieldPlanStatus.draft THEN
+        FOR ComplexPlan c IS ComplexPlan AND ypField(c) = northField() DO approveComplexPlan(c);
+    // база знаний: дефицит азота → карбамид
+    IF NOT (GROUP MAX KbRule kr) AND fertN() AND sprayWork() AND sprayMethod() THEN {
+        NEW kr = KbRule {
+            kbStressRef(kr) <- GROUP MAX StressType st IF stName(st) = 'Дефицит азота';
+            // окно до конца вегетации: фаза поля сида = 99 (последняя точка
+            // ряда) — с окном 60 правило отбраковывалось бы КФ-Р6 всегда
+            // (фитоцитоз-отбраковка проверена юнит-тестом 10.10)
+            kbMinBbch(kr) <- '20'; kbMaxBbch(kr) <- '99';
+            kbNomenclature(kr) <- fertN();
+            kbWorkType(kr) <- sprayWork();
+            kbMethod(kr) <- sprayMethod();
+            kbPriority(kr) <- 1; kbAssimilation(kr) <- 70.0; needsWeatherWindow(kr) <- TRUE;
+        }
+        APPLY;
+    }
+    // рекомендация по правилу (утверждённая)
+    IF NOT (GROUP MAX CorrectionRecommendation r) AND northField() AND wheatYield() THEN {
+        FOR Field f IS Field AND code(f) = 'KH-001' DO createCorrection(f, wheatYield(), stressByName('Дефицит азота'), 'Средняя');
+        APPLY;
+        FOR CorrectionRecommendation r IS CorrectionRecommendation AND crStatus(r) = RecommendationStatus.newR DO
+            crStatus(r) <- RecommendationStatus.approvedR;
+        APPLY;
+    }
+    // калибровка — каркас
+    IF NOT (GROUP MAX CalibrationSession s) AND wheatYield() THEN {
+        NEW s = CalibrationSession { seasonYear(s) <- 2026; csCrop(s) <- wheatYield(); csStatus(s) <- CalibrationStatus.completed; }
+        APPLY;
+        FOR CalibrationSession s IS CalibrationSession AND seasonYear(s) = 2026 DO
+            NEW pr = CalibrationProposal {
+                session(pr) <- s;
+                coeffCode(pr) <- 'removalN_wheat';
+                coeffDescription(pr) <- 'Вынос N пшеницей, кг/т';
+                currentValue(pr) <- 30.0; proposedValue(pr) <- 28.5;
+                justification(pr) <- 'Факт 2026 ниже нормы на 5%';
+                decision(pr) <- ProposalDecision.approvedP; finalValue(pr) <- 28.5;
+            }
+        APPLY;
+    }
+    // сессия оптимизации с демо-коллизией
+    IF NOT (GROUP MAX OptimizationSession s) AND (GROUP MAX ProdPlan p IF ppNumber(p) = 'ГП-2027-1') THEN {
+        NEW s = OptimizationSession { triggerEvent(s) <- 'сид'; optProdPlan(s) <- GROUP MAX ProdPlan p IF ppNumber(p) = 'ГП-2027-1'; optStatus(s) <- OptSessionStatus.doneO; }
+        APPLY;
+        FOR OptimizationSession s IS OptimizationSession AND triggerEvent(s) = 'сид' DO {
+            FOR Field f IS Field AND code(f) = 'KH-001' DO
+                NEW r = MtrRequest { optSession(r) <- s; mrField(r) <- f; requiredBy(r) <- currentDateTime() + 43200; }
+            NEW t = RoutingTask { rtSession(t) <- s; equipmentId(t) <- 'COMBINE-01'; equipmentKind(t) <- 'Комбайн'; }
+            NEW l = CollisionLog { colSession(l) <- s; collisionKind(l) <- CollisionKind.weatherC; colSeverity(l) <- CollisionSeverity.warningC; colDescription(l) <- 'Прогноз дождя в период уборки'; suggestedAction(l) <- 'Перенести на +1 день'; }
+        }
+        APPLY;
+    }
+    // КП09: дозаполнение дозы N по существующим балансам (WHEN CHANGED
+    // срабатывает только на новые расчёты, а сид создаёт баланс напрямую)
+    FOR NutrientBalance b IS NutrientBalance AND nbElement(b) = NutrientEl.n AND ypField(nbPlan(b)) IS Field DO
+        fertDoseN(ypField(nbPlan(b))) <- requiredDoseAi(b);
+    APPLY;
+}

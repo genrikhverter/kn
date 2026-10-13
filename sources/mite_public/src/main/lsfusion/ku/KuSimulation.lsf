@@ -1,0 +1,1274 @@
+MODULE KuSimulation;
+
+// Код Урожая: симуляция — жизненный цикл задач, модель KuGDD-1.0,
+// сценарный анализ, справочник типов стресса.
+// Спецификация: docs/02-data-model.md §9; docs/03-logic-KuSimulation.md.
+// ⚠ Модель и температуры — допущения прототипа.
+REQUIRE KuRotation, KuLand, KuCrop, Authentication, Weather;
+
+NAMESPACE Ku;
+
+CLASS SimTaskStatus 'Статус задачи' {
+    queued 'В очереди', processing 'В обработке', done 'Успешно завершена',
+    error 'Ошибка выполнения', cancelled 'Отменена'
+}
+CLASS SimTaskKind 'Тип задачи' {
+    planned 'Плановая', manual 'Ручная'
+}
+CLASS SimResultStatus 'Статус результата' {
+    active 'Активный', archived 'Архивный', onApproval 'На утверждении'
+}
+CLASS ForecastKind 'Тип прогноза' {
+    // corrective — этап 2 (корректирующий прогноз после мероприятий)
+    basic 'Базовый', scenario 'Сценарный', corrective 'Корректирующий'
+}
+CLASS ScenarioKind 'Тип сценария' {
+    fertilizing 'Внесение удобрений', drought 'Засуха', irrigation 'Орошение',
+    pest 'Поражение вредителями/болезнями', sowDate 'Изменение даты сева'
+}
+CLASS ScenarioElement 'Элемент питания' { sn 'Азот', sp 'Фосфор', sk 'Калий' }
+
+// ===================== Константы модели (калибруемые) =====================
+CLASS ModelCoeff 'Коэффициент модели';
+TABLE modelCoeff (ModelCoeff);
+coeffCode 'Код' = DATA ISTRING[40] (ModelCoeff) NONULL IN id;
+coeffValue 'Значение' = DATA DOUBLE (ModelCoeff) NONULL;
+coeffDescription 'Описание' = DATA TEXT (ModelCoeff);
+coeffByCode = GROUP AGGR ModelCoeff m BY coeffCode(m);
+// версионирование коэффициентов модели (W1.6, ТЗ 4.2.5.2.2)
+WHEN CHANGED (coeffValue(ModelCoeff m)) DO
+    kuAuditChange('Коэффициент модели', coeffCode(m), 'Значение', (OVERRIDE ('' + PREV(coeffValue(m))), '—'), '' + coeffValue(m));
+baseTempN () = OVERRIDE coeffValue(coeffByCode('baseTempN')), 8.0;
+// 1150 (решение владельца 10.10): календарь Омска набирает максимум 1208,8
+// GDD за сезон — при 1500 дата созревания недостижима; 1150 даёт ~07.09
+gddToHarvest () = OVERRIDE coeffValue(coeffByCode('gddToHarvest')), 1150.0;
+biomassMaxT () = OVERRIDE coeffValue(coeffByCode('biomassMaxT')), 12.0;
+// КФ-9: сортовая генетика — САТ/биомасса последнего утверждённого плана поля
+// (kuFieldGdd сам даёт сорт→культура; здесь добавлен глобальный дефолт)
+gddToHarvestFor (Field f) = OVERRIDE kuFieldGdd(f), gddToHarvest();
+biomassMaxTFor (Field f) = OVERRIDE kuFieldBiomassMax(f), biomassMaxT();
+// КФ-М4: сценарные коэффициенты — калибруемые константы (допущения этапа 1,
+// см. spec-work 10.10 «Симуляция»; функции отклика от дозы/мм/даты сева — этап 2)
+scnFertEffect () = OVERRIDE coeffValue(coeffByCode('scnFertEffect')), 1.05;
+scnDroughtPerDayPct () = OVERRIDE coeffValue(coeffByCode('scnDroughtPerDayPct')), 1.2;
+
+// ===================== Ядра моделей (этап 2: DSSAT-класс) =====================
+// Реестр вычислительных ядер: задача выбирает ядро, результат фиксирует
+// использованное (унифицированный контракт точек ряда: биомасса/NDVI/фаза/
+// вода/NPK/прогноз — одинаков для всех ядер). Внешние коннекторы DSSAT/APSIM
+// (этап 3) подключаются тем же контрактом через apiSimRunBase.
+CLASS SimEngine 'Ядро модели';
+TABLE simEngine (SimEngine);
+seCode 'Код' = DATA ISTRING[20] (SimEngine) NONULL IN id;
+seName 'Название' = DATA ISTRING[60] (SimEngine) NONULL;
+seDescription 'Описание' = DATA TEXT (SimEngine);
+engineByCode = GROUP AGGR SimEngine e BY seCode(e);
+engineGdd () = GROUP MAX SimEngine e IF seCode(e) = 'ENG-GDD';
+engineGdw () = GROUP MAX SimEngine e IF seCode(e) = 'ENG-GDW';
+// базовая температура развития культуры (фенология ядра GDW; отдельная от
+// глобальной baseTempN — та привязана к эталонному календарю GDD-ядра)
+cropTBase 'Tbase развития, °C' (Crop c) = DATA NUMERIC[4,1] (Crop);
+// калибруемые коэффициенты ядра GDW (реестр ModelCoeff, дозаправка сидом)
+wueKgHaMm () = OVERRIDE coeffValue(coeffByCode('wueKgHaMm')), 25.0;      // WUE: кг/га биомассы на мм ETa
+awcMm () = OVERRIDE coeffValue(coeffByCode('awcMm')), 170.0;             // доступная влага корнеобитаемого слоя, мм
+swStartFrac () = OVERRIDE coeffValue(coeffByCode('swStartFrac')), 0.65;  // стартовый запас влаги, доля AWC
+diurnalRangeN () = OVERRIDE coeffValue(coeffByCode('diurnalRangeN')), 9.0; // типичная амплитуда Tmax−Tmin, °C
+kcMid () = OVERRIDE coeffValue(coeffByCode('kcMid')), 1.10;              // пиковый культурный коэффициент
+
+
+// ===================== Тип стресса =====================
+// StressType перенесён в KuCrop (КФ-А4: ссылка из базы знаний KuYield)
+
+// ===================== Задача моделирования =====================
+CLASS SimTask 'Задача моделирования';
+TABLE simTask (SimTask);
+simField 'Поле' = DATA Field (SimTask) NONULL;
+nameSimField 'Поле' (SimTask t) = OVERRIDE name(simField(t)), '';
+simCreatedAt 'Создана' = DATA DATETIME (SimTask);
+simTaskKind 'Тип' = DATA SimTaskKind (SimTask) NONULL;
+nameSimTaskKind 'Тип' (SimTask t) = staticCaption(simTaskKind(t));
+horizonDays 'Горизонт, дн' = DATA INTEGER (SimTask) NONULL;
+simStatus 'Статус' = DATA SimTaskStatus (SimTask) NONULL;
+nameSimStatus 'Статус' (SimTask t) = staticCaption(simStatus(t));
+simFinishedAt 'Завершена' = DATA DATETIME (SimTask);
+simError 'Причина ошибки' = DATA TEXT (SimTask);
+// умолчания при создании; NOT CHANGED — не затирать значения из NEW-блока
+// (WHEN SET выполняется на APPLY позже NEW: ручные done/planned терялись)
+WHEN SET(SimTask t IS SimTask) DO simCreatedAt(t) <- currentDateTime();
+WHEN SET(SimTask t IS SimTask) AND NOT CHANGED(simStatus(t)) DO simStatus(t) <- SimTaskStatus.queued;
+WHEN SET(SimTask t IS SimTask) AND NOT CHANGED(simTaskKind(t)) DO simTaskKind(t) <- SimTaskKind.manual;
+WHEN SET(SimTask t IS SimTask) AND NOT CHANGED(horizonDays(t)) DO horizonDays(t) <- 90;
+CONSTRAINT SimTask t IS SimTask AND (horizonDays(t) < 1 OR horizonDays(t) > 365) CHECKED BY horizonDays MESSAGE 'Горизонт — 1..365 дней';
+// ядро расчёта (этап 2): умолчание — эталонный GDD; GDW — кнопкой/API
+simEngine 'Ядро' = DATA SimEngine (SimTask);
+nameSimEngine 'Ядро' (SimTask t) = OVERRIDE seName(simEngine(t)), '';
+WHEN SET(SimTask t IS SimTask) AND NOT CHANGED(simEngine(t)) DO simEngine(t) <- engineGdd();
+
+// ===================== Результат =====================
+// Справочник метеонорм (ФТ6.5 в объёме стенда): среднемесячная температура
+// и осадки; в промышленном контуре — загрузка по API поставщика/импорт
+CLASS KuWeatherNorm 'Метеонорма месяца';
+TABLE kuWeatherNorm (KuWeatherNorm);
+wnMonth 'Месяц' = DATA INTEGER (KuWeatherNorm) NONULL IN id;
+tempAvg 'Ср. температура, °C' = DATA NUMERIC[5,1] (KuWeatherNorm);
+precipMm 'Осадки, мм' = DATA NUMERIC[8,1] (KuWeatherNorm);
+weatherByMonth = GROUP AGGR KuWeatherNorm w BY wnMonth(w);
+
+// ===================== Календарь сезона (W1.4, ТЗ 4.2.2.1) =====================
+// Суточный шаг модели: 156 дней вегетации (15.04–17.09) + 14 дней горизонта
+// прогноза (ТЗ: ряд на горизонте до 14 дней). Суточная температура — из
+// метеонорм месяца с детерминированной внутримесячной вариацией;
+// в промышленном контуре заменяется фактическими/прогнозными метеоданными.
+CLASS SeasonDay 'День сезона';
+TABLE seasonDay (SeasonDay);
+sdDay '№ дня' = DATA INTEGER (SeasonDay) NONULL IN id;
+sdDate 'Дата' = DATA DATE (SeasonDay) NONULL;
+sdTemp 'Температура, °C' = DATA NUMERIC[5,1] (SeasonDay);
+sdInHorizon 'Горизонт прогноза' = DATA BOOLEAN (SeasonDay);
+sdLive 'Живые данные' = DATA BOOLEAN (SeasonDay);
+sdGdd 'GDD за день, °C·дн' (SeasonDay d) =
+    IF (OVERRIDE sdTemp(d), 0.0) > baseTempN() THEN (OVERRIDE sdTemp(d), 0.0) - baseTempN() ELSE 0.0;
+sdCumGdd 'Накоплено GDD, °C·дн' (SeasonDay d) =
+    GROUP SUM sdGdd(SeasonDay x) IF sdDay(x) <= sdDay(d);
+sdProgress 'Прогресс вегетации' (SeasonDay d) =
+    IF gddToHarvest() > 0.0 THEN
+        (IF sdCumGdd(d) > gddToHarvest() THEN 1.0 ELSE sdCumGdd(d) / gddToHarvest())
+    ELSE 0.0;   // защита от нулевого калибруемого коэффициента
+seasonDayByDay = GROUP AGGR SeasonDay d BY sdDay(d);
+
+// прогресс вегетации для конкретного поля (календарь SeasonDay общий,
+// но порог созревания у каждого поля свой — сорт)
+sdProgressFor (SeasonDay d, Field f) =
+    IF gddToHarvestFor(f) > 0.0 THEN
+        (IF sdCumGdd(d) > gddToHarvestFor(f) THEN 1.0 ELSE sdCumGdd(d) / gddToHarvestFor(f))
+    ELSE 0.0;
+
+// ===================== Радиация и эвапотранспирация (ядро GDW) =====================
+// Тригонометрия — только через FORMULA (SQL-функции postgres), по одному
+// параметру на свойство (многопараметрических FORMULA в проекте нет)
+sinD (DOUBLE v) = FORMULA DOUBLE 'sin($1)';
+cosD (DOUBLE v) = FORMULA DOUBLE 'cos($1)';
+tanD (DOUBLE v) = FORMULA DOUBLE 'tan($1)';
+acosD (DOUBLE v) = FORMULA DOUBLE 'acos($1)';
+sqrtD (DOUBLE v) = FORMULA DOUBLE 'sqrt($1)';
+radOfD (DOUBLE v) = FORMULA DOUBLE 'radians($1)';
+doyOf (DATE dt) = FORMULA INTEGER 'extract(doy from $1)::int';
+// солнечное склонение/расстояние (ФАО-56, уравнение 21-23)
+solDecl (INTEGER j) = 0.409 * sinD(6.283185307179586 * j / 365.0 - 1.39);
+invDist (INTEGER j) = 1.0 + 0.033 * cosD(6.283185307179586 * j / 365.0);
+sunsetAngRad (INTEGER j, DOUBLE latRad) = acosD(0.0 - tanD(latRad) * tanD(solDecl(j)));
+// внеземная радиация Ra в мм эквивалента испарения/день (ФАО-56, ур. 21)
+raMmDay 'Ra, мм/дн' (INTEGER j, DOUBLE latRad) =
+    0.408 * (24.0 * 60.0 / 3.141592653589793) * 0.0820 * invDist(j)
+    * (sunsetAngRad(j, latRad) * sinD(latRad) * solDecl(j)
+        + cosD(latRad) * cosD(solDecl(j)) * sinD(sunsetAngRad(j, latRad)));
+// ET0 по Хargreves (ФАО-56, ур. 52): Ra × (T+17.8) × sqrt(Tmax−Tmin)
+et0OfDay 'ET0, мм/дн' (SeasonDay d, Field f) =
+    0.0023 * (OVERRIDE raMmDay(doyOf(sdDate(d)), radOfD((OVERRIDE centerLat(f), 55.0))), 0.0)
+        * ((OVERRIDE sdTemp(d), 0.0) + 17.8) * sqrtD(diurnalRangeN());
+// культурный коэффициент: трапеция по прогресу вегетации (пик kcMid)
+kcOfProg (DOUBLE prog) =
+    IF prog < 0.15 THEN 0.35
+    ELSE IF prog < 0.50 THEN 0.35 + (kcMid() - 0.35) * (prog - 0.15) / 0.35
+    ELSE IF prog < 0.85 THEN kcMid() - (kcMid() - 0.55) * (prog - 0.50) / 0.35
+    ELSE 0.55;
+// осадки дня: месячная норма, разложенная по дням (календарь на нормах)
+rainOfDayMm (SeasonDay d) =
+    (OVERRIDE precipMm(weatherByMonth(extractMonthNumber(sdDate(d)))), 0.0) / 30.0;
+
+CLASS SimResult 'Результат моделирования';
+TABLE simResult (SimResult);
+simTask 'Задача' = DATA SimTask (SimResult) NONULL;
+resultField (SimResult r) = simField(simTask(r));
+resultCrop 'Культура' = DATA Crop (SimResult) NONULL;
+nameResultCrop 'Культура' (SimResult r) = OVERRIDE nameCrop(resultCrop(r)), '';
+resultVariety 'Сорт' = DATA Variety (SimResult);   // КФ-9: ссылка
+nameResultVariety 'Сорт' (SimResult r) = OVERRIDE varName(resultVariety(r)), '';
+calcAt 'Рассчитано' = DATA DATETIME (SimResult) NONULL;
+forecastKind 'Тип прогноза' = DATA ForecastKind (SimResult) NONULL;
+nameForecastKind 'Прогноз' (SimResult r) = staticCaption(forecastKind(r));
+resultModelName 'Модель' = DATA ISTRING[40] (SimResult) NONULL;
+// ядро расчёта (этап 2): копия из задачи на момент прогона
+resultEngine 'Ядро' = DATA SimEngine (SimResult);
+nameResultEngine 'Ядро' (SimResult r) = OVERRIDE seName(resultEngine(r)), '';
+resultHorizon 'Горизонт, дн' = DATA INTEGER (SimResult) NONULL;
+resultStatus 'Статус' = DATA SimResultStatus (SimResult) NONULL;
+nameResultStatus 'Статус' (SimResult r) = staticCaption(resultStatus(r));
+simResultField 'Поле' (SimResult r) = name(simField(simTask(r)));
+// погодный контекст расчёта (КП05): из справочника метеонорм
+weatherTemp 'Ср. t сезона, °C' = DATA NUMERIC[5,1] (SimResult);
+weatherPrecip 'Осадки за сезон, мм' = DATA NUMERIC[8,1] (SimResult);
+WHEN SET(SimResult r IS SimResult) DO {
+    calcAt(r) <- currentDateTime();
+    resultEngine(r) <- simEngine(simTask(r));
+    resultModelName(r) <- OVERRIDE seName(simEngine(simTask(r))), 'KuGDD-1.0';
+    resultStatus(r) <- SimResultStatus.active;
+    weatherTemp(r) <- (GROUP SUM tempAvg(KuWeatherNorm w) IF wnMonth(w) >= 4 AND wnMonth(w) <= 9)
+        / (GROUP SUM 1 IF KuWeatherNorm w IS KuWeatherNorm AND wnMonth(w) >= 4 AND wnMonth(w) <= 9 AND tempAvg(w));
+    weatherPrecip(r) <- GROUP SUM precipMm(KuWeatherNorm w) IF wnMonth(w) >= 4 AND wnMonth(w) <= 9;
+}
+
+CLASS SimResultPoint 'Точка ряда';
+TABLE simResultPoint (SimResultPoint);
+result 'Результат' = DATA SimResult (SimResultPoint) AUTOSET;
+pointDate 'Дата' = DATA DATE (SimResultPoint) NONULL;
+biomass 'Биомасса, т/га' = DATA NUMERIC[10,3] (SimResultPoint);
+ndvi 'NDVI (индекс вегетации)' = DATA NUMERIC[6,3] (SimResultPoint);
+phaseCode 'Фаза (BBCH)' = DATA ISTRING[8] (SimResultPoint);
+waterUse 'Вода, мм/день' = DATA NUMERIC[8,2] (SimResultPoint);
+nUse 'N, кг/га/день' = DATA NUMERIC[8,2] (SimResultPoint);
+pUse 'P, кг/га/день' = DATA NUMERIC[8,2] (SimResultPoint);
+kUse 'K, кг/га/день' = DATA NUMERIC[8,2] (SimResultPoint);
+yieldForecast 'Прогноз, ц/га' = DATA NUMERIC[10,2] (SimResultPoint);
+// ФТ2.6: фактический NDVI (спутник/полевые наблюдения) — ввод вручную/импортом
+factNdvi 'NDVI факт' = DATA NUMERIC[6,3] (SimResultPoint);
+ndviDeviation 'Отклонение NDVI, %' (SimResultPoint p) =
+    IF factNdvi(p) AND ndvi(p) THEN (factNdvi(p) - ndvi(p)) * 100.0 / ndvi(p);
+//GROUP AGGR (result, pointDate) убран: свойство нигде не использовалось, а
+//навязанная уникальность даты внутри результата ломала импорт точек
+//(месячная точка + суточный хвост на одну дату);
+// КФ-М2: предупреждения агрегации входа (ФТ2.2 этап 1) — нет агрохимии,
+// возраст анализа > года, нет дат сезонной ТК, пробелы живой погоды
+resultWarnings 'Предупреждения' = DATA TEXT (SimResult);
+// КФ-М3 (ФТ2.3): дата созревания — первая точка ряда, где накопленные
+// градусо-дни календаря ≥ gddToHarvest поля (сорт/культура)
+cumGddOfDate (DATE dt) = GROUP MAX sdCumGdd(SeasonDay d) IF sdDate(d) = dt;
+resultMaturityDate 'Дата созревания' (SimResult r) =
+    GROUP MIN pointDate(SimResultPoint p) IF result(p) = r
+        AND (OVERRIDE cumGddOfDate(pointDate(p)), 0.0) >= gddToHarvestFor(simField(simTask(r)));
+lastYieldForecast 'Прогноз урожайности, ц/га' (SimResult r) =
+    GROUP LAST yieldForecast(SimResultPoint p) IF result(p) = r ORDER pointDate(p), p;
+lastPointDate 'Дата последней точки' (SimResult r) =
+    GROUP MAX pointDate(SimResultPoint p) IF result(p) = r;
+// настраиваемый порог выявления стресса (спецификация v2.0: по умолчанию 15%)
+kuStressThreshold 'Порог отклонения NDVI, %' = DATA NUMERIC[6,2] ();
+stressThreshold () = OVERRIDE kuStressThreshold(), 15.0;
+
+// реализация хука карты (KuLand.kuFieldStress), КФ-С1 (11.10): поле в
+// стрессе = есть АКТИВНАЯ детекция любого показателя в реестре; NDVI-детектор
+// (refreshNdviDetections) поддерживает записи при прогонах/детекции,
+// датчики/осадки/скаутинг пишут свои детекторы в KuLand.
+// Стары вычисляемый вариант (недобор NDVI точки активного результата)
+// заменён материализованным реестром — эталон KH-001 −28% переносится бэкфиллом
+kuFieldStress (Field f) += activeDetectionOfField(f);
+
+
+// КФ-10: феностадия поля — phaseCode последней по дате точки активного
+// базового результата (решение пользователя: без фильтра pointDate<=сейчас)
+activeBasicResult (Field f) = GROUP LAST SimResult r
+    ORDER calcAt(r), r IF resultStatus(r) = SimResultStatus.active AND forecastKind(r) = ForecastKind.basic
+        AND simField(simTask(r)) = f;
+// худшее (самое отрицательное) отклонение NDVI активного базового результата
+worstNdviDevOf (Field f) =
+    GROUP MIN ndviDeviation(SimResultPoint p) IF result(p) = activeBasicResult(f) AND factNdvi(p);
+// NDVI-детектор → реестр: DEV/CRIT по порогам культуры; без отклонения — гасим
+refreshNdviDetections (Field f) {
+    IF activeBasicResult(f) AND worstNdviDevOf(f) < 0.0 - cropDevThreshold(resultCrop(activeBasicResult(f))) THEN {
+        IF worstNdviDevOf(f) < 0.0 - cropCritThreshold(resultCrop(activeBasicResult(f))) THEN {
+            upsertDetection(f, siByCode('NDVI_CRIT'), worstNdviDevOf(f),
+                0.0 - cropDevThreshold(resultCrop(activeBasicResult(f))), NULL);
+            resolveDetection(f, siByCode('NDVI_DEV'));
+        } ELSE {
+            upsertDetection(f, siByCode('NDVI_DEV'), worstNdviDevOf(f),
+                0.0 - cropDevThreshold(resultCrop(activeBasicResult(f))), NULL);
+            resolveDetection(f, siByCode('NDVI_CRIT'));
+        }
+    } ELSE {
+        resolveDetection(f, siByCode('NDVI_DEV'));
+        resolveDetection(f, siByCode('NDVI_CRIT'));
+    }
+}
+kuFieldPhase (Field f) +=
+    OVERRIDE (GROUP LAST phaseCode(SimResultPoint p)
+        ORDER pointDate(p), p
+        IF result(p) = activeBasicResult(f) AND pointDate(p) = lastPointDate(activeBasicResult(f))), '';
+
+
+// ===================== Сценарный анализ =====================
+CLASS ScenarioRun 'Задача сценарного анализа';
+TABLE scenarioRun (ScenarioRun);
+srField 'Поле' = DATA Field (ScenarioRun) NONULL;
+nameSrField 'Поле' (ScenarioRun r) = OVERRIDE name(srField(r)), '';
+// этап 1: базовый результат фиксируется справочно, на расчёт не влияет
+srBaseResult 'Базовый результат' = DATA SimResult (ScenarioRun);
+nameSrBaseResult 'Базовый результат' (ScenarioRun r) =
+    OVERRIDE simResultField(srBaseResult(r)) + ' · ' + nameResultCrop(srBaseResult(r)) + ' · ' + resultModelName(srBaseResult(r)), '';
+scenarioKind 'Тип сценария' = DATA ScenarioKind (ScenarioRun) NONULL;
+nameScenarioKind 'Сценарий' (ScenarioRun r) = staticCaption(scenarioKind(r));
+srElement 'Элемент' = DATA ScenarioElement (ScenarioRun);
+nameSrElement 'Элемент' (ScenarioRun r) = staticCaption(srElement(r));
+srDose 'Доза, кг д.в./га' = DATA NUMERIC[10,2] (ScenarioRun);
+srAppDate 'Дата внесения' = DATA DATE (ScenarioRun);
+srStartDate 'Начало (засуха/вредители)' = DATA DATE (ScenarioRun);
+srDays 'Длительность, дн' = DATA INTEGER (ScenarioRun);
+srIrrDate 'Дата полива' = DATA DATE (ScenarioRun);
+srIrrMm 'Норма полива, мм' = DATA NUMERIC[8,2] (ScenarioRun);
+srPestPercent 'Поражение, %' = DATA NUMERIC[5,2] (ScenarioRun);
+srNewSowDate 'Новая дата сева' = DATA DATE (ScenarioRun);
+srCreatedAt 'Создана' = DATA DATETIME (ScenarioRun);
+srCode 'Код' = DATA ISTRING[20] (ScenarioRun);
+srSeq 'Счётчик сценариев (служебное)' = DATA INTEGER ();
+srStatus 'Статус' = DATA SimTaskStatus (ScenarioRun) NONULL;
+nameSrStatus 'Статус' (ScenarioRun r) = staticCaption(srStatus(r));
+srResult 'Результат' = DATA SimResult (ScenarioRun);
+WHEN SET(ScenarioRun r IS ScenarioRun) DO {
+    srStatus(r) <- SimTaskStatus.queued;
+    srCreatedAt(r) <- currentDateTime();
+}
+
+// ===================== Действия =====================
+// W1.4 (ТЗ 4.2.2.1): суточный шаг модели KuGDD — ряд строится по календарю
+// SeasonDay, показатели каждого дня из накопленных градусодней; горизонт
+// 14 дней — дозревание с деградацией NDVI (после достижения прогресса 1.0)
+ndviOfDay (DOUBLE prog, INTEGER dayNo) =
+    IF sdInHorizon(seasonDayByDay(dayNo)) THEN
+        IF 0.45 * (1.0 - (dayNo - 156) / 20.0) < 0.2 THEN 0.2 ELSE 0.45 * (1.0 - (dayNo - 156) / 20.0)
+    ELSE IF prog <= 0.75 THEN 0.25 + prog * 0.7333
+    ELSE 0.80 - (prog - 0.75) * 1.4;
+phaseOfDay (DOUBLE prog, INTEGER dayNo) =
+    IF sdInHorizon(seasonDayByDay(dayNo)) THEN '99'
+    ELSE IF prog < 0.10 THEN '10' ELSE IF prog < 0.30 THEN '30' ELSE IF prog < 0.50 THEN '39'
+    ELSE IF prog < 0.75 THEN '59' ELSE IF prog < 0.90 THEN '73' ELSE '89';
+
+makeDailySeason (SimResult r, DOUBLE stressFactor, DOUBLE pestPct) {
+    LOCAL fld = Field ();
+    LOCAL prog = NUMERIC[6,4] ();
+    fld() <- simField(simTask(r));
+    FOR SeasonDay d IS SeasonDay ORDER sdDay(d) DO {
+        prog() <- sdProgressFor(d, fld());
+        NEW p = SimResultPoint {
+            result(p) <- r;
+            pointDate(p) <- sdDate(d);
+            biomass(p) <- biomassMaxTFor(fld()) * stressFactor * (1.0 - pestPct / 100.0) * prog();
+            ndvi(p) <- ndviOfDay(prog(), sdDay(d));
+            phaseCode(p) <- phaseOfDay(prog(), sdDay(d));
+            waterUse(p) <- IF prog() >= 1.0 THEN 1.5
+                ELSE IF prog() < 0.1 THEN 2.0 ELSE 4.0;
+            nUse(p) <- removalN(resultCrop(r)) / 2000.0;
+            pUse(p) <- removalP(resultCrop(r)) / 2000.0;
+            kUse(p) <- removalK(resultCrop(r)) / 2000.0;
+            yieldForecast(p) <- targetYield(resultCrop(r)) * prog() * stressFactor * (1.0 - pestPct / 100.0);
+        }
+    }
+}
+
+// Ядро KuGDW-2.0 (DSSAT-класс, этап 2): суточный водно-тепловой баланс.
+// Фенология — градусо-дни с Tbase КУЛЬТУРЫ (не глобальной baseTempN);
+// ET0 — Хargreves от Ra (широта поля × день года); ETa = Kc×ET0×Ks, где
+// Ks — водный стресс по запасу влаги (триггер 55% AWC); биомасса —
+// WUE × ΣETa; урожайность — цель × прогресс × интегральный индекс
+// водной обеспеченности ΣETa/ΣETc (Стейпл—Лемерт); осадки — месячные
+// нормы по дням; вынос NPK распределяется по долям ETa.
+makeDailySeasonGdw (SimResult r, DOUBLE fertFactor, DOUBLE pestPct) {
+    LOCAL fld = Field ();
+    LOCAL tbase = NUMERIC[4,1] ();
+    LOCAL prog = NUMERIC[6,4] ();
+    LOCAL cum = NUMERIC[10,2] ();
+    LOCAL sw = NUMERIC[10,2] ();
+    LOCAL eta = NUMERIC[8,2] ();
+    LOCAL etc = NUMERIC[8,2] ();
+    LOCAL etaCum = NUMERIC[10,2] ();
+    LOCAL etcCum = NUMERIC[10,2] ();
+    LOCAL wsf = NUMERIC[6,4] ();
+    fld() <- simField(simTask(r));
+    tbase() <- OVERRIDE cropTBase(resultCrop(r)), 4.0;
+    sw() <- awcMm() * swStartFrac();
+    FOR SeasonDay d IS SeasonDay ORDER sdDay(d) DO {
+        cum() <- (OVERRIDE cum(), 0.0) + (IF (OVERRIDE sdTemp(d), 0.0) > tbase() THEN (OVERRIDE sdTemp(d), 0.0) - tbase() ELSE 0.0);
+        prog() <- IF gddToHarvestFor(fld()) > 0.0 THEN (IF cum() >= gddToHarvestFor(fld()) THEN 1.0 ELSE cum() / gddToHarvestFor(fld())) ELSE 0.0;
+        etc() <- kcOfProg(prog()) * et0OfDay(d, fld());
+        eta() <- etc() * (IF sw() < 0.55 * awcMm() THEN sw() / (0.55 * awcMm()) ELSE 1.0);
+        // баланс влаги: осадки − ETa, с ограничением [0; AWC] (избыток — дренаж)
+        sw() <- (OVERRIDE sw(), 0.0) + rainOfDayMm(d) - (OVERRIDE eta(), 0.0);
+        IF sw() < 0.0 THEN sw() <- 0.0;
+        IF sw() > awcMm() THEN sw() <- awcMm();
+        etaCum() <- (OVERRIDE etaCum(), 0.0) + (OVERRIDE eta(), 0.0);
+        etcCum() <- (OVERRIDE etcCum(), 0.0) + (OVERRIDE etc(), 0.0);
+        wsf() <- IF etcCum() > 0.0 THEN etaCum() / etcCum() ELSE 1.0;
+        NEW p = SimResultPoint {
+            result(p) <- r;
+            pointDate(p) <- sdDate(d);
+            biomass(p) <- etaCum() * wueKgHaMm() / 1000.0 * (1.0 - pestPct / 100.0);
+            ndvi(p) <- ndviOfDay(prog(), sdDay(d));
+            phaseCode(p) <- phaseOfDay(prog(), sdDay(d));
+            waterUse(p) <- eta();
+            nUse(p) <- (OVERRIDE removalN(resultCrop(r)), 0.0) * eta() / (OVERRIDE etaCum(), 1.0);
+            pUse(p) <- (OVERRIDE removalP(resultCrop(r)), 0.0) * eta() / (OVERRIDE etaCum(), 1.0);
+            kUse(p) <- (OVERRIDE removalK(resultCrop(r)), 0.0) * eta() / (OVERRIDE etaCum(), 1.0);
+            yieldForecast(p) <- (OVERRIDE targetYield(resultCrop(r)), 0.0) * prog() * (OVERRIDE wsf(), 1.0) * fertFactor * (1.0 - pestPct / 100.0);
+        }
+    }
+}
+
+// КФ-М1 (ФТ2.4): прежние active basic-результаты поля → archived; их
+// факт-NDVI переносится в новый ряд по датам (демо-стресс −28% KH-001
+// переживает суточный прогон; сценарные результаты не трогаем)
+archivePrevBasicResults (Field f, SimResult newR) {
+    FOR SimResult old IS SimResult AND resultStatus(old) = SimResultStatus.active
+        AND forecastKind(old) = ForecastKind.basic AND simField(simTask(old)) = f
+        AND old != newR
+    DO {
+        FOR SimResultPoint op IS SimResultPoint AND result(op) = old AND factNdvi(op) DO
+            FOR SimResultPoint np IS SimResultPoint AND result(np) = newR AND pointDate(np) = pointDate(op) DO
+                factNdvi(np) <- factNdvi(op);
+        resultStatus(old) <- SimResultStatus.archived;
+    }
+}
+
+runSimTask 'Выполнить' (SimTask t) {
+    IF NOT currentCrop(simField(t)) THEN {
+        simStatus(t) <- SimTaskStatus.error;
+        simError(t) <- 'На поле не задана текущая культура';
+        APPLY;
+    } ELSE {
+        simStatus(t) <- SimTaskStatus.processing;
+        // КФ-М2: предупреждения агрегации входа (критично только отсутствие
+        // культуры — см. выше); календарь на нормах — честное указание
+        LOCAL warn = TEXT ();
+        warn() <- '';
+        IF NOT lastAnalysisDate(simField(t)) THEN warn() <- 'нет агрохиманализа по полю; ';
+        IF (OVERRIDE analysisAgeDays(simField(t)), 0) > 365 THEN
+            warn() <- (OVERRIDE warn(), '') + 'агрохимия старше года; ';
+        IF NOT kuFieldHasOpDates(simField(t)) THEN
+            warn() <- (OVERRIDE warn(), '') + 'нет плановых дат операций сезонной ТК; ';
+        IF (GROUP SUM 1 IF SeasonDay d IS SeasonDay AND NOT sdInHorizon(d) AND NOT sdLive(d)) > 0 THEN
+            warn() <- (OVERRIDE warn(), '') + 'календарь частично на климатических нормах (живая погода неполна); ';
+        LOCAL r = SimResult ();
+        NEW nr = SimResult {
+            simTask(nr) <- t;
+            resultCrop(nr) <- currentCrop(simField(t));
+            resultVariety(nr) <- kuFieldVariety(simField(t));   // КФ-9: фиксируем сорт плана
+            resultHorizon(nr) <- horizonDays(t);
+            forecastKind(nr) <- ForecastKind.basic;
+            resultWarnings(nr) <- warn();
+            r() <- nr;
+        }
+        // результат и точки — одним батчем (LOCAL живёт до APPLY);
+        // ядро — по задаче (этап 2: GDW — суточный водно-тепловой баланс)
+        IF simEngine(t) = engineGdw() THEN
+            makeDailySeasonGdw(r(), 1.0, 0.0);
+        ELSE
+            makeDailySeason(r(), 1.0, 0.0);
+        // КФ-М1: архивация прежних active + перенос факт-NDVI по датам
+        archivePrevBasicResults(simField(t), r());
+        // КФ-С1: NDVI-детекции — в реестр (перенесённые факты уже на месте)
+        refreshNdviDetections(simField(t));
+        simStatus(t) <- SimTaskStatus.done;
+        simFinishedAt(t) <- currentDateTime();
+        kuPublish(KuEventKind.forecastDone, 'SimResult', name(simField(t)),
+            'Модель ' + (OVERRIDE seName(simEngine(t)), 'KuGDD-1.0') + ', прогноз ' + (OVERRIDE ('' + lastYieldForecast(r())), '—') + ' ц/га');
+        APPLY;
+    }
+}
+
+cancelSimTask 'Отменить' (SimTask t) {
+    simStatus(t) <- SimTaskStatus.cancelled;
+    APPLY;
+}
+
+// прогон ядром KuGDW-2.0 в один клик (этап 2): переключает задачу и выполняет
+runSimTaskGdw 'Выполнить (KuGDW-2.0)' (SimTask t) {
+    simEngine(t) <- engineGdw();
+    runSimTask(t);
+}
+
+// сценарный прогон (⚠ эффекты-допущения: удобрение/полив +5%, засуха/вредители −%)
+runScenario 'Выполнить сценарий' (ScenarioRun sr) {
+    IF NOT currentCrop(srField(sr)) THEN {
+        srStatus(sr) <- SimTaskStatus.error;
+        APPLY;
+    } ELSE {
+        srStatus(sr) <- SimTaskStatus.processing;
+        LOCAL t = SimTask ();
+        LOCAL r = SimResult ();
+        NEW nt = SimTask {
+            simField(nt) <- srField(sr);
+            horizonDays(nt) <- 90;
+            simStatus(nt) <- SimTaskStatus.processing;
+            t() <- nt;
+        }
+        NEW nr = SimResult {
+            simTask(nr) <- t();
+            resultCrop(nr) <- currentCrop(srField(sr));
+            resultHorizon(nr) <- 90;
+            forecastKind(nr) <- ForecastKind.scenario;
+            r() <- nr;
+        }
+        // одним батчем — LOCAL живёт до APPLY; КФ-М4: множитель эффекта
+        // удобрения/полива — калибруемая константа scnFertEffect
+        makeDailySeason(r(), scnFertEffect(), 0.0);
+        // эффект сценария применяется к точкам (⚠ грубо: снижение прогноза);
+        // КФ-М4: % потерь за день засухи — scnDroughtPerDayPct
+        IF scenarioKind(sr) = ScenarioKind.pest OR scenarioKind(sr) = ScenarioKind.drought THEN
+            FOR SimResultPoint p IS SimResultPoint AND result(p) = r() DO
+                yieldForecast(p) <- yieldForecast(p)
+                    * (1.0 - (IF scenarioKind(sr) = ScenarioKind.pest THEN (OVERRIDE srPestPercent(sr), 30.0)
+                        ELSE (OVERRIDE srDays(sr), 14) * scnDroughtPerDayPct()) / 100.0);
+        srResult(sr) <- r();
+        srStatus(sr) <- SimTaskStatus.done;
+        simStatus(t()) <- SimTaskStatus.done;
+        simFinishedAt(t()) <- currentDateTime();
+        kuPublish(KuEventKind.scenarioDone, 'ScenarioRun', (OVERRIDE srCode(sr), ''),
+            nameSrField(sr) + ': ' + nameScenarioKind(sr));
+        APPLY;
+    }
+}
+
+// ТЗ 4.2.2.2: автоклассификация лимитирующего фактора по доступным данным
+// (агрохимия N vs минимум культуры; дефицит осадков по метеонормам; иначе —
+// немоделируемый фактор на ручной анализ). ⚠ прототип: без ML-классификатора
+stressDrought () = GROUP MAX StressType st IF stName(st) = 'Засуха';
+stressNitrogen () = GROUP MAX StressType st IF stName(st) = 'Дефицит азота';
+stressUnmodeled () = GROUP MAX StressType st IF stName(st) = 'Немоделируемый фактор';
+seasonPrecip () = GROUP SUM precipMm(KuWeatherNorm w) IF wnMonth(w) >= 4 AND wnMonth(w) <= 9;
+// КФ-А2: режим оценки осадков: 'season' — средняя декадная сумма сезона
+// (демо, детерминировано по нормам), 'forecast' — живой прогноз, приведённый
+// к декаде (прод). Выбор — свойством kuPrecipMode (форма «Типы стресса»).
+kuPrecipMode 'Режим осадков (season/forecast)' = DATA ISTRING[10] ();
+precip7Forecast () =
+    (OVERRIDE kuWfPrecipDay(kuSeasonLoc(), currentDate()), 0.0)
+    + (OVERRIDE kuWfPrecipDay(kuSeasonLoc(), currentDate() + 1), 0.0)
+    + (OVERRIDE kuWfPrecipDay(kuSeasonLoc(), currentDate() + 2), 0.0)
+    + (OVERRIDE kuWfPrecipDay(kuSeasonLoc(), currentDate() + 3), 0.0)
+    + (OVERRIDE kuWfPrecipDay(kuSeasonLoc(), currentDate() + 4), 0.0)
+    + (OVERRIDE kuWfPrecipDay(kuSeasonLoc(), currentDate() + 5), 0.0)
+    + (OVERRIDE kuWfPrecipDay(kuSeasonLoc(), currentDate() + 6), 0.0);
+precip10Of (Crop c) =
+    IF (OVERRIDE kuPrecipMode(), 'season') = 'forecast' THEN precip7Forecast() * 10.0 / 7.0
+    ELSE seasonPrecip() / 18.0;
+// КФ-А2: классификация по порогу культуры (PRECIP10), фолбэк — правило N-окна
+// культуры; сезон < 330 мм оставлен комментарием-допущением в доке
+detectStressType (SimResult r) =
+    IF precip10Of(resultCrop(r)) < cropPrecip10(resultCrop(r)) THEN stressDrought()
+    ELSE IF lastN(resultField(r)) AND nMin(resultCrop(r)) AND lastN(resultField(r)) < nMin(resultCrop(r)) THEN stressNitrogen()
+    ELSE stressUnmodeled();
+nameDetectStressType 'Тип стресса' (SimResult r) = OVERRIDE stName(detectStressType(r)), 'не определён';
+
+// ФТ2.6: выявление отклонения и идентификация стресса по факт-NDVI.
+// Сравнивает факт последней точки активного результата с эталонным прогнозом;
+// при превышении порога публикует событие «Выявлен стресс» и замыкает контур
+// на ФТ4.2 — создаёт рекомендацию по правилу базы знаний.
+// КФ-А5: серьёзность по диапазонам порогов культуры (DEV→Средняя, CRIT→Высокая)
+stressSeverityOf (Crop c, DOUBLE devPct) =
+    IF devPct <= -cropCritThreshold(c) THEN 'Высокая' ELSE 'Средняя';
+detectStress 'Выявить отклонение (ФТ2.6)' (SimResult r) {
+    FOR SimResultPoint p IS SimResultPoint AND result(p) = r
+        AND pointDate(p) = lastPointDate(r) AND factNdvi(p) AND ndvi(p)
+    DO {
+        IF (factNdvi(p) - ndvi(p)) * 100.0 / ndvi(p) < -cropDevThreshold(resultCrop(r)) THEN {
+            LOCAL sev = ISTRING[20] ();
+            sev() <- stressSeverityOf(resultCrop(r), (OVERRIDE ndviDeviation(p), 0.0));
+            // ХУК ПЕРВЫМ: kuPublish/kuNotify содержат APPLY, а LOCAL после
+            // APPLY не живёт (quirks §6) — sev() обнулился бы
+            // строки вычислить заранее: после kuPublish (APPLY) LOCAL sev мёртв
+            LOCAL sevTxt = ISTRING[20] ();
+            LOCAL devTxt = ISTRING[20] ();
+            LOCAL msgTxt = ISTRING[500] ();
+            sevTxt() <- (OVERRIDE sev(), '');
+            devTxt() <- OVERRIDE ('' + ndviDeviation(p)), '—';
+            msgTxt() <- 'Поле ' + name(simField(simTask(r))) + ': ' + nameDetectStressType(r)
+                + ' (серьёзность: ' + sevTxt() + '), отклонение NDVI ' + devTxt() + '% — рекомендация в разделе «Урожай»';
+            onKuStress(simField(simTask(r)), detectStressType(r), sevTxt());
+            // КФ-С1: та же детекция — в реестр (DEV/CRIT по порогам культуры)
+            refreshNdviDetections(simField(simTask(r)));
+            kuPublish(KuEventKind.stressDetected, 'Field', name(simField(simTask(r))),
+                'Тип: ' + nameDetectStressType(r) + '; серьёзность: ' + sevTxt()
+                + '; отклонение NDVI ' + devTxt() + '% (порог ' + ('' + cropDevThreshold(resultCrop(r))) + '%)');
+            kuNotify('Стресс', msgTxt());
+            MESSAGE 'Выявлен стресс (' + nameDetectStressType(r) + ', серьёзность ' + sev() + '): отклонение NDVI ' + (OVERRIDE ('' + ndviDeviation(p)), '—')
+                + '% превышает порог ' + ('' + cropDevThreshold(resultCrop(r))) + '%.\nОпубликовано событие, создана рекомендация (раздел «Урожай»).';
+        } ELSE
+            MESSAGE 'Отклонение в пределах порога (' + (OVERRIDE ('' + ndviDeviation(p)), '—') + '% < ' + ('' + cropDevThreshold(resultCrop(r))) + '%)';
+    }
+    IF NOT lastPointDate(r) THEN
+        MESSAGE 'В результате нет точек ряда.';
+    APPLY;
+}
+
+// REST сценарного анализа: этап 1 — синхронный расчёт (готовый результат);
+// 202/302-паттерн Long-Running Operation — этап 2 (spec-work 10.10)
+apiSimRun 'API: запустить сценарий (засуха)' (ISTRING[16] fieldCode, INTEGER days) {
+    IF fieldByCode(fieldCode) IS Field AND currentCrop(fieldByCode(fieldCode)) THEN {
+        srSeq() <- (OVERRIDE srSeq(), 0) + 1;
+        NEW sr = ScenarioRun {
+            srCode(sr) <- 'SC-' + (OVERRIDE ('' + srSeq()), '1');
+            srField(sr) <- fieldByCode(fieldCode);
+            scenarioKind(sr) <- ScenarioKind.drought;
+            srDays(sr) <- (OVERRIDE days, 14);
+            srStartDate(sr) <- currentDate();
+        }
+        APPLY;
+        FOR ScenarioRun x IS ScenarioRun AND srCode(x) = 'SC-' + (OVERRIDE ('' + srSeq()), '1') DO
+            runScenario(x);
+        EXPORT JSON FROM
+            runId = srCode(ScenarioRun x),
+            status = nameSrStatus(x),
+            field = nameSrField(x),
+            scenario = nameScenarioKind(x)
+        WHERE srCode(x) = 'SC-' + (OVERRIDE ('' + srSeq()), '1');
+    } ELSE
+        EXPORT JSON FROM error = 'поле не найдено или без текущей культуры';
+    RETURN JSONFILE(exportFile());
+}
+
+apiSimStatus 'API: статус сценария' (ISTRING[20] runCode) {
+    EXPORT JSON FROM
+        runId = srCode(ScenarioRun x),
+        status = nameSrStatus(x),
+        field = nameSrField(x),
+        scenario = nameScenarioKind(x),
+        yieldForecast = lastYieldForecast(srResult(x))
+    WHERE srCode(x) = runCode;
+    RETURN JSONFILE(exportFile());
+}
+
+// унифицированный вход ядер (этап 2, ТЗ 4.2.2.1): базовый прогноз поля
+// выбранным ядром; внешние коннекторы DSSAT/APSIM (этап 3) используют
+// тот же контракт результата. engineCode: 'ENG-GDD' (умолчание) | 'ENG-GDW'
+lastTaskOfField (Field f) = GROUP LAST SimTask t ORDER simCreatedAt(t), t IF simField(t) = f;
+latestResultOfTask (SimTask t) = GROUP LAST SimResult r ORDER calcAt(r), r IF simTask(r) = t;
+maxBiomassOfTask (SimTask t) = GROUP MAX biomass(SimResultPoint p) IF simTask(result(p)) = t;
+etaSeasonOfTask (SimTask t) = GROUP SUM waterUse(SimResultPoint p) IF simTask(result(p)) = t;
+apiSimRunBase 'API: базовый прогноз ядром' (ISTRING[16] fieldCode, ISTRING[10] engineCode) {
+    IF fieldByCode(fieldCode) IS Field AND currentCrop(fieldByCode(fieldCode)) THEN {
+        NEW nt = SimTask {
+            simField(nt) <- fieldByCode(fieldCode);
+            horizonDays(nt) <- 14;
+            IF engineByCode((OVERRIDE engineCode, 'ENG-GDD')) THEN simEngine(nt) <- engineByCode((OVERRIDE engineCode, 'ENG-GDD'));
+        }
+        APPLY;
+        // LOCAL-объект не живёт после APPLY (quirks) — перевыборка: новейшая задача поля
+        FOR SimTask t IS SimTask AND t = lastTaskOfField(fieldByCode(fieldCode)) DO
+            runSimTask(t);
+        EXPORT JSON FROM
+            field = nameSimField(SimTask t),
+            engine = nameSimEngine(t),
+            status = nameSimStatus(t),
+            forecast = (OVERRIDE lastYieldForecast(latestResultOfTask(t)), 0.0),
+            biomassMax = (OVERRIDE maxBiomassOfTask(t), 0.0),
+            etaSeason = (OVERRIDE etaSeasonOfTask(t), 0.0),
+            maturity = (OVERRIDE ('' + resultMaturityDate(latestResultOfTask(t))), ''),
+            warnings = (OVERRIDE resultWarnings(latestResultOfTask(t)), '')
+        WHERE t = lastTaskOfField(fieldByCode(fieldCode));
+    } ELSE
+        EXPORT JSON FROM error = 'поле не найдено или без текущей культуры';
+    RETURN JSONFILE(exportFile());
+}
+
+
+// ===================== Внешние метеоданные (ФТ6.5) =====================
+// Климатические нормы: г. Омск (Западно-Сибирская равнина, НПХ «Омское» —
+// координаты демо-полей 54.9N 71.4E), нормы 1991–2020 (ряд согласован со
+// справочником ВНИИГМИ-МЦД / Казгидромет). Прогноз — провайдеры модуля
+// Weather: OpenWeatherMap (ключ в опциях) или wttr.in (открытый, без ключа).
+petropavlTemp (INTEGER m) = CASE WHEN m = 1 THEN -16.5 WHEN m = 2 THEN -14.7
+    WHEN m = 3 THEN -6.9 WHEN m = 4 THEN 4.7 WHEN m = 5 THEN 13.3 WHEN m = 6 THEN 18.1
+    WHEN m = 7 THEN 19.5 WHEN m = 8 THEN 17.4 WHEN m = 9 THEN 11.2
+    WHEN m = 10 THEN 4.3 WHEN m = 11 THEN -6.6 ELSE -13.7;
+petropavlPrecip (INTEGER m) = CASE WHEN m = 1 THEN 19.0 WHEN m = 2 THEN 16.0
+    WHEN m = 3 THEN 20.0 WHEN m = 4 THEN 24.0 WHEN m = 5 THEN 33.0 WHEN m = 6 THEN 45.0
+    WHEN m = 7 THEN 69.0 WHEN m = 8 THEN 45.0 WHEN m = 9 THEN 31.0
+    WHEN m = 10 THEN 30.0 WHEN m = 11 THEN 30.0 ELSE 25.0;
+
+// суточная температура сезона: гладкая интерполяция месячных норм (полумесяц)
+seasonTemp (DATE dt) = petropavlTemp(extractMonthNumber(dt))
+    + (petropavlTemp(extractMonthNumber(dt) + 1) - petropavlTemp(extractMonthNumber(dt))) * ((extractDay(dt) - 15) / 30.0);
+
+roundS1 (DOUBLE v) = FORMULA NUMERIC[5,1] 'round($1, 1)';
+// NDVI (0.05–0.95): округление до 1 знака (roundS1) давало на ранних точках
+// эталона ~0.25 факт 0.2 → отклонение −20% > порога стресса 15% — сплошной
+// ложный стресс на всех полях; факту нужны 3 знака
+roundS3 (DOUBLE v) = FORMULA NUMERIC[6,3] 'round($1, 3)';
+
+kuExternalSource 'Источник внешних данных (метео/NDVI)' = DATA ISTRING[200] ();
+
+// Волна 1 (08.10): календарь сезона — живые температуры из контура MITE
+// Weather (WeatherForecast погодной точки), за датами без прогноза — фолбэк
+// на метеонормы. Вызывается после каждого обновления погоды и в суточном
+// прогоне; GDD/прогресс пересчитываются автоматически (вычисляемые).
+// (объявлено ДО kuUpdateWeather/kuSimDaily — платформа требует порядок)
+refreshSeasonWeather 'Актуализировать календарь погоды' () {
+    FOR SeasonDay d IS SeasonDay DO {
+        IF kuWfHas(kuSeasonLoc(), sdDate(d)) THEN {
+            sdTemp(d) <- roundS1(kuWfTempDay(kuSeasonLoc(), sdDate(d)));
+            sdLive(d) <- TRUE;
+        } ELSE {
+            sdTemp(d) <- roundS1(seasonTemp(sdDate(d)));
+            sdLive(d) <- NULL;
+        }
+    }
+    APPLY;
+}
+
+kuUpdateWeather 'Обновить прогноз погоды' () {
+    kuJobStart('Обновление погоды');
+    // погодные точки полей: по одному Location на организацию (см. externalDataSeed);
+    // провайдер — OWM при настроенном ключе, иначе открытый wttr.in (WeatherWttr).
+    // Провайдеры гасят HTTP-ошибки, но сетевой сбой — исключение: TRY обязателен,
+    // иначе kuJobFinish не вызывается (задание «висит») и стартовый сид прерывается
+    FOR Location l IS Location AND (GROUP MAX 1 IF Field f IS Field AND location(f) = l) DO
+        TRY {
+            Weather.updateWeather(l);
+        } CATCH {
+            sendJobAlert('Обновление погоды', 'Ошибка', messageCaughtException());
+        }
+    APPLY;
+    // КФ-С3: регистр осадков — суточный прогноз ближайшего дня как прокси
+    // факта (⚠-допущение ADR-6); идемпотентный upsert по (точка, дата)
+    FOR Location l IS Location AND (GROUP MAX 1 IF Field f IS Field AND location(f) = l) DO
+        IF (OVERRIDE kuWfPrecipDay(l, currentDate()), 0.0) > 0.0 THEN {
+            IF plByLocDate(l, currentDate()) THEN
+                FOR PrecipLog p IS PrecipLog AND p = plByLocDate(l, currentDate()) DO
+                    plMm(p) <- kuWfPrecipDay(l, currentDate());
+            ELSE
+                NEW p = PrecipLog {
+                    plLocation(p) <- l;
+                    plDate(p) <- currentDate();
+                    plMm(p) <- kuWfPrecipDay(l, currentDate());
+                }
+            APPLY;
+        }
+    refreshSeasonWeather();
+    kuJobFinish('Обновление погоды', 'Выполнено',
+        'Точек обновлено: ' + (OVERRIDE ('' + (GROUP SUM 1 IF Location l IS Location AND (GROUP MAX 1 IF Field f IS Field AND location(f) = l))), '0'));
+}
+
+// КФ-М1-инвариант: на поле ровно ОДИН active basic-результат (самый свежий
+// по calcAt); факт-NDVI старых переносится в свежий ряд по датам (без
+// перезаписи уже существующих фактов), затем старые → archived.
+// Подстраховка archivePrevBasicResults: в NEWSESSION-контексте kuSimDaily
+// архивация внутри задачи не применялась (эмпирически 10.10), зачистка же
+// выполняется в основной сессии прогона — надёжно
+archiveStaleBasic 'Зачистить дубли активных результатов' () {
+    FOR SimResult old IS SimResult AND resultStatus(old) = SimResultStatus.active
+        AND forecastKind(old) = ForecastKind.basic
+        AND (OVERRIDE (GROUP SUM 1 IF SimResult r2 IS SimResult
+                AND resultStatus(r2) = SimResultStatus.active AND forecastKind(r2) = ForecastKind.basic
+                AND simField(simTask(r2)) = simField(simTask(old)) AND r2 != old
+                AND calcAt(r2) > calcAt(old)), 0) > 0
+    DO {
+        FOR SimResultPoint op IS SimResultPoint AND result(op) = old AND factNdvi(op) DO
+            FOR SimResult newest IS SimResult AND resultStatus(newest) = SimResultStatus.active
+                AND forecastKind(newest) = ForecastKind.basic
+                AND simField(simTask(newest)) = simField(simTask(old)) AND newest != old
+            DO
+                FOR SimResultPoint np IS SimResultPoint AND result(np) = newest
+                    AND pointDate(np) = pointDate(op) AND NOT factNdvi(np) DO
+                    factNdvi(np) <- factNdvi(op);
+        resultStatus(old) <- SimResultStatus.archived;
+    }
+    APPLY;
+}
+
+// ===================== Суточный прогон (СТ: оркестратор в 01:00) =====================
+// ⚪ прототип: по кнопке/при старте стенда; планировщик ОС — в промышленной версии
+kuSimDaily 'Суточный прогон моделирования' () {
+    kuJobStart('Суточный прогон моделирования');
+    refreshSeasonWeather();   // свежие температуры календаря перед прогонами
+    // задача на каждое поле с текущей культурой без ошибки/выполнения за сегодня
+    FOR Field f IS Field AND currentCrop(f)
+        AND NOT (GROUP MAX 1 IF simField(SimTask t) = f AND simCreatedAt(t) >= currentDateTime() - 86400)
+    DO NEW t = SimTask {
+        simField(t) <- f;
+        simTaskKind(t) <- SimTaskKind.planned;
+        horizonDays(t) <- 90;
+    }
+    APPLY;
+    // изоляция задач: сбой одной не прерывает прогон (NEWSESSION отбрасывает
+    // частичные изменения упавшей задачи), ошибка фиксируется и алертится
+    FOR SimTask t IS SimTask AND simStatus(t) = SimTaskStatus.queued DO
+        TRY {
+            NEWSESSION {
+                runSimTask(t);
+            }
+        } CATCH {
+            NEWSESSION {
+                simStatus(t) <- SimTaskStatus.error;
+                simError(t) <- messageCaughtException();
+                APPLY;
+            }
+            sendJobAlert('Суточный прогон моделирования', 'Ошибка', messageCaughtException());
+        }
+    APPLY;
+    // КФ-С2/С3 (11.10): детекторы датчиков почвы и осадков — раз в сутки
+    TRY {
+        runSoilMoistDetections();
+        runPrecipDetections();
+    } CATCH {
+        sendJobAlert('Суточный прогон моделирования', 'Детекторы стресса', messageCaughtException());
+    }
+    // КФ-М1-инвариант: один active basic на поле (основная сессия прогона)
+    archiveStaleBasic();
+    // КФ-М6: сводка для панели здоровья
+    kuJobFinish('Суточный прогон моделирования', 'Выполнено',
+        'Создано за сутки: ' + (OVERRIDE ('' + (GROUP SUM 1 IF simCreatedAt(SimTask t) >= currentDateTime() - 86400)), '0')
+        + '; выполнено всего: ' + (OVERRIDE ('' + (GROUP SUM 1 IF simStatus(SimTask t) = SimTaskStatus.done)), '0')
+        + '; ошибок всего: ' + (OVERRIDE ('' + (GROUP SUM 1 IF simStatus(SimTask t) = SimTaskStatus.error)), '0')
+        + '; дней живой погоды: ' + (OVERRIDE ('' + (GROUP SUM 1 IF SeasonDay d IS SeasonDay AND sdLive(d) AND NOT sdInHorizon(d))), '0'));
+}
+
+// ===================== Формы =====================
+FORM simTasks 'Задачи моделирования'
+    OBJECTS t = SimTask
+    PROPERTIES (t) READONLY nameSimField, nameSimTaskKind, nameSimStatus, nameSimEngine, horizonDays, simCreatedAt, simFinishedAt, simError
+    PROPERTIES () kuSimDaily
+    PROPERTIES (t) NEWSESSION NEW, EDIT, DELETE, runSimTask, runSimTaskGdw, cancelSimTask
+;
+
+// «Показать на карте» для результата: поле результата — на карту с подсветкой
+showSimResultOnMap 'Показать на карте' (SimResult r) {
+    FOR Field f IS Field AND f = simField(simTask(r)) DO showFieldOnMap(f);
+}
+
+FORM simResults 'Результаты моделирования'
+    OBJECTS r = SimResult
+    PROPERTIES (r) READONLY simResultField, nameResultCrop, nameForecastKind, nameResultEngine, calcAt, lastYieldForecast, resultMaturityDate, nameResultStatus
+    PROPERTIES (r) READONLY nameDetectStressType
+    PROPERTIES (r) detectStress
+    PROPERTIES (r) showSimResultOnMap
+;
+
+FORM simResult 'Результат моделирования'
+    OBJECTS r = SimResult PANEL
+    PROPERTIES (r) READONLY resultCrop, nameResultVariety, nameForecastKind, nameResultEngine, resultModelName, resultHorizon, calcAt, lastYieldForecast, resultMaturityDate, resultWarnings, weatherTemp, weatherPrecip
+    PROPERTIES (r) detectStress
+    OBJECTS p = SimResultPoint
+    PROPERTIES (p) READONLY pointDate, biomass, ndvi, phaseCode, waterUse, nUse, pUse, kUse, yieldForecast, ndviDeviation
+    PROPERTIES (p) factNdvi
+    FILTERS result(p) = r
+    ORDERS pointDate(p)
+;
+
+// ===================== Живая погода (Волна 1: контур MITE Weather) =====================
+// «Сейчас» по погодным точкам полей — из действующего прогноза WeatherForecast;
+// осадки сегодня/завтра — суточные агрегаты слоя KuLand
+kuWfNowTemp 't° сейчас, °C' (Location l) = Weather.temperature(Weather.currentForecast(l));
+kuWfNowCond 'Погода' (Location l) = Weather.conditionName(Weather.currentForecast(l));
+kuWfNowHum 'Влажность, %' (Location l) = Weather.humidity(Weather.currentForecast(l));
+kuWfNowWind 'Ветер, м/с' (Location l) = Weather.windSpeed(Weather.currentForecast(l));
+kuWfNowFetched 'Обновлено' (Location l) = Weather.fetched(Weather.currentForecast(l));
+kuWfTodayPrecip 'Осадки сегодня, %' (Location l) = kuWfPrecipDay(l, currentDate());
+kuWfTomorrowPrecip 'Осадки завтра, %' (Location l) = kuWfPrecipDay(l, currentDate() + 1);
+
+FORM weatherLive 'Живая погода'
+    OBJECTS l = Location
+    FILTERS (GROUP MAX Field f IF location(f) = l) IS Field
+    PROPERTIES (l) READONLY name, kuWfNowTemp, kuWfNowCond, kuWfNowHum, kuWfNowWind, kuWfTodayPrecip, kuWfTomorrowPrecip, kuWfNowFetched
+    PROPERTIES () kuUpdateWeather
+;
+
+FORM seasonDays 'Календарь сезона (погода модели)'
+    OBJECTS d = SeasonDay
+    PROPERTIES (d) READONLY sdDay, sdDate, sdTemp, sdLive, sdGdd, sdCumGdd, sdProgress, sdInHorizon
+    PROPERTIES () refreshSeasonWeather
+    ORDERS sdDay(d)
+;
+
+// ===================== Выбор объектов: пикеры =====================
+// Сырые объектные свойства платформа показывает числовым id — отображение
+// вычисляемыми именами, изменение ссылок — диалоговым выбором из списка.
+nameScenarioKindItem 'Сценарий' (ScenarioKind k) = staticCaption(k);
+FORM pickScenarioKind 'Выбор типа сценария'
+    OBJECTS k = ScenarioKind
+    PROPERTIES (k) READONLY nameScenarioKindItem
+;
+FORM pickSimResult 'Выбор базового результата'
+    OBJECTS r = SimResult
+    PROPERTIES (r) READONLY simResultField, nameResultCrop, calcAt, nameResultStatus
+    ORDERS calcAt(r)
+;
+setSrFieldAct 'Выбрать поле' (ScenarioRun sr) {
+    DIALOG pickField OBJECTS f = srField(sr) INPUT f NULL DO srField(sr) <- f;
+}
+setSrKindAct 'Выбрать сценарий' (ScenarioRun sr) {
+    DIALOG pickScenarioKind OBJECTS k = scenarioKind(sr) INPUT k NULL DO scenarioKind(sr) <- k;
+}
+setSrBaseAct 'Выбрать базовый результат' (ScenarioRun sr) {
+    DIALOG pickSimResult OBJECTS r = srBaseResult(sr) INPUT r NULL FILTERS resultField(r) = srField(sr) DO srBaseResult(sr) <- r;
+}
+
+FORM scenarioRuns 'Сценарный анализ'
+    OBJECTS sr = ScenarioRun
+    PROPERTIES (sr) READONLY nameSrField, nameScenarioKind, nameSrStatus, srCreatedAt
+    PROPERTIES (sr) NEWSESSION NEW, EDIT, DELETE, runScenario
+;
+
+FORM scenarioRun 'Сценарный прогон'
+    OBJECTS sr = ScenarioRun PANEL
+    PROPERTIES (sr) READONLY nameSrField, nameScenarioKind, nameSrBaseResult
+    PROPERTIES (sr) setSrFieldAct, setSrKindAct, setSrBaseAct
+    PROPERTIES (sr) nameSrElement, srDose, srAppDate, srStartDate, srDays, srIrrDate, srIrrMm, srPestPercent, srNewSowDate
+    PROPERTIES (sr) READONLY nameSrStatus, srResult
+    PROPERTIES (sr) runScenario
+    EDIT ScenarioRun OBJECT sr
+;
+
+FORM stressTypes 'Типы стресса'
+    PROPERTIES () kuPrecipMode
+    OBJECTS s = StressType
+    PROPERTIES (s) READONLY stName, stCode, stGroup, stStatus
+    PROPERTIES (s) stDescription
+    PROPERTIES (s) NEWSESSION NEW, EDIT, DELETE
+    FILTERS NOT stArchived(s)
+;
+
+FORM modelCoeffs 'Коэффициенты модели'
+    OBJECTS m = ModelCoeff
+    PROPERTIES (m) NEWSESSION NEW, EDIT, DELETE
+;
+
+// ===================== Сид =====================
+wheatSim () = GROUP MAX Crop c IF code(c) = 'ЗЕР-001';
+northSim () = GROUP MAX Field f IF code(f) = 'KH-001';
+
+simulationSeed () {
+
+    // W1.4: календарь сезона — 170 дней (156 вегетация + 14 горизонт);
+    // температура — месячная норма метеонорм с детерминированной вариацией
+    IF NOT (GROUP MAX SeasonDay d) THEN {
+        NEW d = SeasonDay { sdDay(d) <- 1; sdDate(d) <- 2027_04_15 + 0; sdTemp(d) <- 10.5; }
+        NEW d = SeasonDay { sdDay(d) <- 2; sdDate(d) <- 2027_04_15 + 1; sdTemp(d) <- 11.2; }
+        NEW d = SeasonDay { sdDay(d) <- 3; sdDate(d) <- 2027_04_15 + 2; sdTemp(d) <- 11.8; }
+        NEW d = SeasonDay { sdDay(d) <- 4; sdDate(d) <- 2027_04_15 + 3; sdTemp(d) <- 12.2; }
+        NEW d = SeasonDay { sdDay(d) <- 5; sdDate(d) <- 2027_04_15 + 4; sdTemp(d) <- 12.5; }
+        NEW d = SeasonDay { sdDay(d) <- 6; sdDate(d) <- 2027_04_15 + 5; sdTemp(d) <- 12.5; }
+        NEW d = SeasonDay { sdDay(d) <- 7; sdDate(d) <- 2027_04_15 + 6; sdTemp(d) <- 12.2; }
+        NEW d = SeasonDay { sdDay(d) <- 8; sdDate(d) <- 2027_04_15 + 7; sdTemp(d) <- 11.8; }
+        NEW d = SeasonDay { sdDay(d) <- 9; sdDate(d) <- 2027_04_15 + 8; sdTemp(d) <- 11.2; }
+        NEW d = SeasonDay { sdDay(d) <- 10; sdDate(d) <- 2027_04_15 + 9; sdTemp(d) <- 10.5; }
+        NEW d = SeasonDay { sdDay(d) <- 11; sdDate(d) <- 2027_04_15 + 10; sdTemp(d) <- 9.8; }
+        NEW d = SeasonDay { sdDay(d) <- 12; sdDate(d) <- 2027_04_15 + 11; sdTemp(d) <- 9.2; }
+        NEW d = SeasonDay { sdDay(d) <- 13; sdDate(d) <- 2027_04_15 + 12; sdTemp(d) <- 8.8; }
+        NEW d = SeasonDay { sdDay(d) <- 14; sdDate(d) <- 2027_04_15 + 13; sdTemp(d) <- 8.5; }
+        NEW d = SeasonDay { sdDay(d) <- 15; sdDate(d) <- 2027_04_15 + 14; sdTemp(d) <- 8.5; }
+        NEW d = SeasonDay { sdDay(d) <- 16; sdDate(d) <- 2027_04_15 + 15; sdTemp(d) <- 8.8; }
+        NEW d = SeasonDay { sdDay(d) <- 17; sdDate(d) <- 2027_04_15 + 16; sdTemp(d) <- 14.7; }
+        NEW d = SeasonDay { sdDay(d) <- 18; sdDate(d) <- 2027_04_15 + 17; sdTemp(d) <- 15.3; }
+        NEW d = SeasonDay { sdDay(d) <- 19; sdDate(d) <- 2027_04_15 + 18; sdTemp(d) <- 16.0; }
+        NEW d = SeasonDay { sdDay(d) <- 20; sdDate(d) <- 2027_04_15 + 19; sdTemp(d) <- 16.7; }
+        NEW d = SeasonDay { sdDay(d) <- 21; sdDate(d) <- 2027_04_15 + 20; sdTemp(d) <- 17.3; }
+        NEW d = SeasonDay { sdDay(d) <- 22; sdDate(d) <- 2027_04_15 + 21; sdTemp(d) <- 17.7; }
+        NEW d = SeasonDay { sdDay(d) <- 23; sdDate(d) <- 2027_04_15 + 22; sdTemp(d) <- 18.0; }
+        NEW d = SeasonDay { sdDay(d) <- 24; sdDate(d) <- 2027_04_15 + 23; sdTemp(d) <- 18.0; }
+        NEW d = SeasonDay { sdDay(d) <- 25; sdDate(d) <- 2027_04_15 + 24; sdTemp(d) <- 17.7; }
+        NEW d = SeasonDay { sdDay(d) <- 26; sdDate(d) <- 2027_04_15 + 25; sdTemp(d) <- 17.3; }
+        NEW d = SeasonDay { sdDay(d) <- 27; sdDate(d) <- 2027_04_15 + 26; sdTemp(d) <- 16.7; }
+        NEW d = SeasonDay { sdDay(d) <- 28; sdDate(d) <- 2027_04_15 + 27; sdTemp(d) <- 16.0; }
+        NEW d = SeasonDay { sdDay(d) <- 29; sdDate(d) <- 2027_04_15 + 28; sdTemp(d) <- 15.3; }
+        NEW d = SeasonDay { sdDay(d) <- 30; sdDate(d) <- 2027_04_15 + 29; sdTemp(d) <- 14.7; }
+        NEW d = SeasonDay { sdDay(d) <- 31; sdDate(d) <- 2027_04_15 + 30; sdTemp(d) <- 14.3; }
+        NEW d = SeasonDay { sdDay(d) <- 32; sdDate(d) <- 2027_04_15 + 31; sdTemp(d) <- 14.0; }
+        NEW d = SeasonDay { sdDay(d) <- 33; sdDate(d) <- 2027_04_15 + 32; sdTemp(d) <- 14.0; }
+        NEW d = SeasonDay { sdDay(d) <- 34; sdDate(d) <- 2027_04_15 + 33; sdTemp(d) <- 14.3; }
+        NEW d = SeasonDay { sdDay(d) <- 35; sdDate(d) <- 2027_04_15 + 34; sdTemp(d) <- 14.7; }
+        NEW d = SeasonDay { sdDay(d) <- 36; sdDate(d) <- 2027_04_15 + 35; sdTemp(d) <- 15.3; }
+        NEW d = SeasonDay { sdDay(d) <- 37; sdDate(d) <- 2027_04_15 + 36; sdTemp(d) <- 16.0; }
+        NEW d = SeasonDay { sdDay(d) <- 38; sdDate(d) <- 2027_04_15 + 37; sdTemp(d) <- 16.7; }
+        NEW d = SeasonDay { sdDay(d) <- 39; sdDate(d) <- 2027_04_15 + 38; sdTemp(d) <- 17.3; }
+        NEW d = SeasonDay { sdDay(d) <- 40; sdDate(d) <- 2027_04_15 + 39; sdTemp(d) <- 17.7; }
+        NEW d = SeasonDay { sdDay(d) <- 41; sdDate(d) <- 2027_04_15 + 40; sdTemp(d) <- 18.0; }
+        NEW d = SeasonDay { sdDay(d) <- 42; sdDate(d) <- 2027_04_15 + 41; sdTemp(d) <- 18.0; }
+        NEW d = SeasonDay { sdDay(d) <- 43; sdDate(d) <- 2027_04_15 + 42; sdTemp(d) <- 17.7; }
+        NEW d = SeasonDay { sdDay(d) <- 44; sdDate(d) <- 2027_04_15 + 43; sdTemp(d) <- 17.3; }
+        NEW d = SeasonDay { sdDay(d) <- 45; sdDate(d) <- 2027_04_15 + 44; sdTemp(d) <- 16.7; }
+        NEW d = SeasonDay { sdDay(d) <- 46; sdDate(d) <- 2027_04_15 + 45; sdTemp(d) <- 16.0; }
+        NEW d = SeasonDay { sdDay(d) <- 47; sdDate(d) <- 2027_04_15 + 46; sdTemp(d) <- 15.3; }
+        NEW d = SeasonDay { sdDay(d) <- 48; sdDate(d) <- 2027_04_15 + 47; sdTemp(d) <- 19.2; }
+        NEW d = SeasonDay { sdDay(d) <- 49; sdDate(d) <- 2027_04_15 + 48; sdTemp(d) <- 18.8; }
+        NEW d = SeasonDay { sdDay(d) <- 50; sdDate(d) <- 2027_04_15 + 49; sdTemp(d) <- 18.5; }
+        NEW d = SeasonDay { sdDay(d) <- 51; sdDate(d) <- 2027_04_15 + 50; sdTemp(d) <- 18.5; }
+        NEW d = SeasonDay { sdDay(d) <- 52; sdDate(d) <- 2027_04_15 + 51; sdTemp(d) <- 18.8; }
+        NEW d = SeasonDay { sdDay(d) <- 53; sdDate(d) <- 2027_04_15 + 52; sdTemp(d) <- 19.2; }
+        NEW d = SeasonDay { sdDay(d) <- 54; sdDate(d) <- 2027_04_15 + 53; sdTemp(d) <- 19.8; }
+        NEW d = SeasonDay { sdDay(d) <- 55; sdDate(d) <- 2027_04_15 + 54; sdTemp(d) <- 20.5; }
+        NEW d = SeasonDay { sdDay(d) <- 56; sdDate(d) <- 2027_04_15 + 55; sdTemp(d) <- 21.2; }
+        NEW d = SeasonDay { sdDay(d) <- 57; sdDate(d) <- 2027_04_15 + 56; sdTemp(d) <- 21.8; }
+        NEW d = SeasonDay { sdDay(d) <- 58; sdDate(d) <- 2027_04_15 + 57; sdTemp(d) <- 22.2; }
+        NEW d = SeasonDay { sdDay(d) <- 59; sdDate(d) <- 2027_04_15 + 58; sdTemp(d) <- 22.5; }
+        NEW d = SeasonDay { sdDay(d) <- 60; sdDate(d) <- 2027_04_15 + 59; sdTemp(d) <- 22.5; }
+        NEW d = SeasonDay { sdDay(d) <- 61; sdDate(d) <- 2027_04_15 + 60; sdTemp(d) <- 22.2; }
+        NEW d = SeasonDay { sdDay(d) <- 62; sdDate(d) <- 2027_04_15 + 61; sdTemp(d) <- 21.8; }
+        NEW d = SeasonDay { sdDay(d) <- 63; sdDate(d) <- 2027_04_15 + 62; sdTemp(d) <- 21.2; }
+        NEW d = SeasonDay { sdDay(d) <- 64; sdDate(d) <- 2027_04_15 + 63; sdTemp(d) <- 20.5; }
+        NEW d = SeasonDay { sdDay(d) <- 65; sdDate(d) <- 2027_04_15 + 64; sdTemp(d) <- 19.8; }
+        NEW d = SeasonDay { sdDay(d) <- 66; sdDate(d) <- 2027_04_15 + 65; sdTemp(d) <- 19.2; }
+        NEW d = SeasonDay { sdDay(d) <- 67; sdDate(d) <- 2027_04_15 + 66; sdTemp(d) <- 18.8; }
+        NEW d = SeasonDay { sdDay(d) <- 68; sdDate(d) <- 2027_04_15 + 67; sdTemp(d) <- 18.5; }
+        NEW d = SeasonDay { sdDay(d) <- 69; sdDate(d) <- 2027_04_15 + 68; sdTemp(d) <- 18.5; }
+        NEW d = SeasonDay { sdDay(d) <- 70; sdDate(d) <- 2027_04_15 + 69; sdTemp(d) <- 18.8; }
+        NEW d = SeasonDay { sdDay(d) <- 71; sdDate(d) <- 2027_04_15 + 70; sdTemp(d) <- 19.2; }
+        NEW d = SeasonDay { sdDay(d) <- 72; sdDate(d) <- 2027_04_15 + 71; sdTemp(d) <- 19.8; }
+        NEW d = SeasonDay { sdDay(d) <- 73; sdDate(d) <- 2027_04_15 + 72; sdTemp(d) <- 20.5; }
+        NEW d = SeasonDay { sdDay(d) <- 74; sdDate(d) <- 2027_04_15 + 73; sdTemp(d) <- 21.2; }
+        NEW d = SeasonDay { sdDay(d) <- 75; sdDate(d) <- 2027_04_15 + 74; sdTemp(d) <- 21.8; }
+        NEW d = SeasonDay { sdDay(d) <- 76; sdDate(d) <- 2027_04_15 + 75; sdTemp(d) <- 22.2; }
+        NEW d = SeasonDay { sdDay(d) <- 77; sdDate(d) <- 2027_04_15 + 76; sdTemp(d) <- 22.5; }
+        NEW d = SeasonDay { sdDay(d) <- 78; sdDate(d) <- 2027_04_15 + 77; sdTemp(d) <- 25.5; }
+        NEW d = SeasonDay { sdDay(d) <- 79; sdDate(d) <- 2027_04_15 + 78; sdTemp(d) <- 25.2; }
+        NEW d = SeasonDay { sdDay(d) <- 80; sdDate(d) <- 2027_04_15 + 79; sdTemp(d) <- 24.8; }
+        NEW d = SeasonDay { sdDay(d) <- 81; sdDate(d) <- 2027_04_15 + 80; sdTemp(d) <- 24.2; }
+        NEW d = SeasonDay { sdDay(d) <- 82; sdDate(d) <- 2027_04_15 + 81; sdTemp(d) <- 23.5; }
+        NEW d = SeasonDay { sdDay(d) <- 83; sdDate(d) <- 2027_04_15 + 82; sdTemp(d) <- 22.8; }
+        NEW d = SeasonDay { sdDay(d) <- 84; sdDate(d) <- 2027_04_15 + 83; sdTemp(d) <- 22.2; }
+        NEW d = SeasonDay { sdDay(d) <- 85; sdDate(d) <- 2027_04_15 + 84; sdTemp(d) <- 21.8; }
+        NEW d = SeasonDay { sdDay(d) <- 86; sdDate(d) <- 2027_04_15 + 85; sdTemp(d) <- 21.5; }
+        NEW d = SeasonDay { sdDay(d) <- 87; sdDate(d) <- 2027_04_15 + 86; sdTemp(d) <- 21.5; }
+        NEW d = SeasonDay { sdDay(d) <- 88; sdDate(d) <- 2027_04_15 + 87; sdTemp(d) <- 21.8; }
+        NEW d = SeasonDay { sdDay(d) <- 89; sdDate(d) <- 2027_04_15 + 88; sdTemp(d) <- 22.2; }
+        NEW d = SeasonDay { sdDay(d) <- 90; sdDate(d) <- 2027_04_15 + 89; sdTemp(d) <- 22.8; }
+        NEW d = SeasonDay { sdDay(d) <- 91; sdDate(d) <- 2027_04_15 + 90; sdTemp(d) <- 23.5; }
+        NEW d = SeasonDay { sdDay(d) <- 92; sdDate(d) <- 2027_04_15 + 91; sdTemp(d) <- 24.2; }
+        NEW d = SeasonDay { sdDay(d) <- 93; sdDate(d) <- 2027_04_15 + 92; sdTemp(d) <- 24.8; }
+        NEW d = SeasonDay { sdDay(d) <- 94; sdDate(d) <- 2027_04_15 + 93; sdTemp(d) <- 25.2; }
+        NEW d = SeasonDay { sdDay(d) <- 95; sdDate(d) <- 2027_04_15 + 94; sdTemp(d) <- 25.5; }
+        NEW d = SeasonDay { sdDay(d) <- 96; sdDate(d) <- 2027_04_15 + 95; sdTemp(d) <- 25.5; }
+        NEW d = SeasonDay { sdDay(d) <- 97; sdDate(d) <- 2027_04_15 + 96; sdTemp(d) <- 25.2; }
+        NEW d = SeasonDay { sdDay(d) <- 98; sdDate(d) <- 2027_04_15 + 97; sdTemp(d) <- 24.8; }
+        NEW d = SeasonDay { sdDay(d) <- 99; sdDate(d) <- 2027_04_15 + 98; sdTemp(d) <- 24.2; }
+        NEW d = SeasonDay { sdDay(d) <- 100; sdDate(d) <- 2027_04_15 + 99; sdTemp(d) <- 23.5; }
+        NEW d = SeasonDay { sdDay(d) <- 101; sdDate(d) <- 2027_04_15 + 100; sdTemp(d) <- 22.8; }
+        NEW d = SeasonDay { sdDay(d) <- 102; sdDate(d) <- 2027_04_15 + 101; sdTemp(d) <- 22.2; }
+        NEW d = SeasonDay { sdDay(d) <- 103; sdDate(d) <- 2027_04_15 + 102; sdTemp(d) <- 21.8; }
+        NEW d = SeasonDay { sdDay(d) <- 104; sdDate(d) <- 2027_04_15 + 103; sdTemp(d) <- 21.5; }
+        NEW d = SeasonDay { sdDay(d) <- 105; sdDate(d) <- 2027_04_15 + 104; sdTemp(d) <- 21.5; }
+        NEW d = SeasonDay { sdDay(d) <- 106; sdDate(d) <- 2027_04_15 + 105; sdTemp(d) <- 21.8; }
+        NEW d = SeasonDay { sdDay(d) <- 107; sdDate(d) <- 2027_04_15 + 106; sdTemp(d) <- 22.2; }
+        NEW d = SeasonDay { sdDay(d) <- 108; sdDate(d) <- 2027_04_15 + 107; sdTemp(d) <- 22.8; }
+        NEW d = SeasonDay { sdDay(d) <- 109; sdDate(d) <- 2027_04_15 + 108; sdTemp(d) <- 23.0; }
+        NEW d = SeasonDay { sdDay(d) <- 110; sdDate(d) <- 2027_04_15 + 109; sdTemp(d) <- 23.7; }
+        NEW d = SeasonDay { sdDay(d) <- 111; sdDate(d) <- 2027_04_15 + 110; sdTemp(d) <- 24.3; }
+        NEW d = SeasonDay { sdDay(d) <- 112; sdDate(d) <- 2027_04_15 + 111; sdTemp(d) <- 24.7; }
+        NEW d = SeasonDay { sdDay(d) <- 113; sdDate(d) <- 2027_04_15 + 112; sdTemp(d) <- 25.0; }
+        NEW d = SeasonDay { sdDay(d) <- 114; sdDate(d) <- 2027_04_15 + 113; sdTemp(d) <- 25.0; }
+        NEW d = SeasonDay { sdDay(d) <- 115; sdDate(d) <- 2027_04_15 + 114; sdTemp(d) <- 24.7; }
+        NEW d = SeasonDay { sdDay(d) <- 116; sdDate(d) <- 2027_04_15 + 115; sdTemp(d) <- 24.3; }
+        NEW d = SeasonDay { sdDay(d) <- 117; sdDate(d) <- 2027_04_15 + 116; sdTemp(d) <- 23.7; }
+        NEW d = SeasonDay { sdDay(d) <- 118; sdDate(d) <- 2027_04_15 + 117; sdTemp(d) <- 23.0; }
+        NEW d = SeasonDay { sdDay(d) <- 119; sdDate(d) <- 2027_04_15 + 118; sdTemp(d) <- 22.3; }
+        NEW d = SeasonDay { sdDay(d) <- 120; sdDate(d) <- 2027_04_15 + 119; sdTemp(d) <- 21.7; }
+        NEW d = SeasonDay { sdDay(d) <- 121; sdDate(d) <- 2027_04_15 + 120; sdTemp(d) <- 21.3; }
+        NEW d = SeasonDay { sdDay(d) <- 122; sdDate(d) <- 2027_04_15 + 121; sdTemp(d) <- 21.0; }
+        NEW d = SeasonDay { sdDay(d) <- 123; sdDate(d) <- 2027_04_15 + 122; sdTemp(d) <- 21.0; }
+        NEW d = SeasonDay { sdDay(d) <- 124; sdDate(d) <- 2027_04_15 + 123; sdTemp(d) <- 21.3; }
+        NEW d = SeasonDay { sdDay(d) <- 125; sdDate(d) <- 2027_04_15 + 124; sdTemp(d) <- 21.7; }
+        NEW d = SeasonDay { sdDay(d) <- 126; sdDate(d) <- 2027_04_15 + 125; sdTemp(d) <- 22.3; }
+        NEW d = SeasonDay { sdDay(d) <- 127; sdDate(d) <- 2027_04_15 + 126; sdTemp(d) <- 23.0; }
+        NEW d = SeasonDay { sdDay(d) <- 128; sdDate(d) <- 2027_04_15 + 127; sdTemp(d) <- 23.7; }
+        NEW d = SeasonDay { sdDay(d) <- 129; sdDate(d) <- 2027_04_15 + 128; sdTemp(d) <- 24.3; }
+        NEW d = SeasonDay { sdDay(d) <- 130; sdDate(d) <- 2027_04_15 + 129; sdTemp(d) <- 24.7; }
+        NEW d = SeasonDay { sdDay(d) <- 131; sdDate(d) <- 2027_04_15 + 130; sdTemp(d) <- 25.0; }
+        NEW d = SeasonDay { sdDay(d) <- 132; sdDate(d) <- 2027_04_15 + 131; sdTemp(d) <- 25.0; }
+        NEW d = SeasonDay { sdDay(d) <- 133; sdDate(d) <- 2027_04_15 + 132; sdTemp(d) <- 24.7; }
+        NEW d = SeasonDay { sdDay(d) <- 134; sdDate(d) <- 2027_04_15 + 133; sdTemp(d) <- 24.3; }
+        NEW d = SeasonDay { sdDay(d) <- 135; sdDate(d) <- 2027_04_15 + 134; sdTemp(d) <- 23.7; }
+        NEW d = SeasonDay { sdDay(d) <- 136; sdDate(d) <- 2027_04_15 + 135; sdTemp(d) <- 23.0; }
+        NEW d = SeasonDay { sdDay(d) <- 137; sdDate(d) <- 2027_04_15 + 136; sdTemp(d) <- 22.3; }
+        NEW d = SeasonDay { sdDay(d) <- 138; sdDate(d) <- 2027_04_15 + 137; sdTemp(d) <- 21.7; }
+        NEW d = SeasonDay { sdDay(d) <- 139; sdDate(d) <- 2027_04_15 + 138; sdTemp(d) <- 21.3; }
+        NEW d = SeasonDay { sdDay(d) <- 140; sdDate(d) <- 2027_04_15 + 139; sdTemp(d) <- 16.0; }
+        NEW d = SeasonDay { sdDay(d) <- 141; sdDate(d) <- 2027_04_15 + 140; sdTemp(d) <- 16.0; }
+        NEW d = SeasonDay { sdDay(d) <- 142; sdDate(d) <- 2027_04_15 + 141; sdTemp(d) <- 16.3; }
+        NEW d = SeasonDay { sdDay(d) <- 143; sdDate(d) <- 2027_04_15 + 142; sdTemp(d) <- 16.7; }
+        NEW d = SeasonDay { sdDay(d) <- 144; sdDate(d) <- 2027_04_15 + 143; sdTemp(d) <- 17.3; }
+        NEW d = SeasonDay { sdDay(d) <- 145; sdDate(d) <- 2027_04_15 + 144; sdTemp(d) <- 18.0; }
+        NEW d = SeasonDay { sdDay(d) <- 146; sdDate(d) <- 2027_04_15 + 145; sdTemp(d) <- 18.7; }
+        NEW d = SeasonDay { sdDay(d) <- 147; sdDate(d) <- 2027_04_15 + 146; sdTemp(d) <- 19.3; }
+        NEW d = SeasonDay { sdDay(d) <- 148; sdDate(d) <- 2027_04_15 + 147; sdTemp(d) <- 19.7; }
+        NEW d = SeasonDay { sdDay(d) <- 149; sdDate(d) <- 2027_04_15 + 148; sdTemp(d) <- 20.0; }
+        NEW d = SeasonDay { sdDay(d) <- 150; sdDate(d) <- 2027_04_15 + 149; sdTemp(d) <- 20.0; }
+        NEW d = SeasonDay { sdDay(d) <- 151; sdDate(d) <- 2027_04_15 + 150; sdTemp(d) <- 19.7; }
+        NEW d = SeasonDay { sdDay(d) <- 152; sdDate(d) <- 2027_04_15 + 151; sdTemp(d) <- 19.3; }
+        NEW d = SeasonDay { sdDay(d) <- 153; sdDate(d) <- 2027_04_15 + 152; sdTemp(d) <- 18.7; }
+        NEW d = SeasonDay { sdDay(d) <- 154; sdDate(d) <- 2027_04_15 + 153; sdTemp(d) <- 18.0; }
+        NEW d = SeasonDay { sdDay(d) <- 155; sdDate(d) <- 2027_04_15 + 154; sdTemp(d) <- 17.3; }
+        NEW d = SeasonDay { sdDay(d) <- 156; sdDate(d) <- 2027_04_15 + 155; sdTemp(d) <- 16.7; }
+        NEW d = SeasonDay { sdDay(d) <- 157; sdDate(d) <- 2027_04_15 + 156; sdTemp(d) <- 16.3; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 158; sdDate(d) <- 2027_04_15 + 157; sdTemp(d) <- 16.0; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 159; sdDate(d) <- 2027_04_15 + 158; sdTemp(d) <- 16.0; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 160; sdDate(d) <- 2027_04_15 + 159; sdTemp(d) <- 16.3; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 161; sdDate(d) <- 2027_04_15 + 160; sdTemp(d) <- 16.7; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 162; sdDate(d) <- 2027_04_15 + 161; sdTemp(d) <- 17.3; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 163; sdDate(d) <- 2027_04_15 + 162; sdTemp(d) <- 18.0; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 164; sdDate(d) <- 2027_04_15 + 163; sdTemp(d) <- 18.7; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 165; sdDate(d) <- 2027_04_15 + 164; sdTemp(d) <- 19.3; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 166; sdDate(d) <- 2027_04_15 + 165; sdTemp(d) <- 19.7; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 167; sdDate(d) <- 2027_04_15 + 166; sdTemp(d) <- 20.0; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 168; sdDate(d) <- 2027_04_15 + 167; sdTemp(d) <- 20.0; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 169; sdDate(d) <- 2027_04_15 + 168; sdTemp(d) <- 19.7; sdInHorizon(d) <- TRUE; }
+        NEW d = SeasonDay { sdDay(d) <- 170; sdDate(d) <- 2027_04_15 + 169; sdTemp(d) <- 13.3; sdInHorizon(d) <- TRUE; }
+        APPLY;
+    }
+    // метеонормы (КП05): умеренный климат Краснодарского края, мм/°C по месяцам
+    IF NOT (GROUP MAX KuWeatherNorm w) THEN {
+        NEW w = KuWeatherNorm { wnMonth(w) <- 1; tempAvg(w) <- -2.0; precipMm(w) <- 78.0; }
+        NEW w = KuWeatherNorm { wnMonth(w) <- 2; tempAvg(w) <- -1.0; precipMm(w) <- 66.0; }
+        NEW w = KuWeatherNorm { wnMonth(w) <- 3; tempAvg(w) <- 4.0; precipMm(w) <- 58.0; }
+        NEW w = KuWeatherNorm { wnMonth(w) <- 4; tempAvg(w) <- 10.5; precipMm(w) <- 52.0; }
+        NEW w = KuWeatherNorm { wnMonth(w) <- 5; tempAvg(w) <- 16.0; precipMm(w) <- 60.0; }
+        NEW w = KuWeatherNorm { wnMonth(w) <- 6; tempAvg(w) <- 20.5; precipMm(w) <- 68.0; }
+        NEW w = KuWeatherNorm { wnMonth(w) <- 7; tempAvg(w) <- 23.5; precipMm(w) <- 54.0; }
+        NEW w = KuWeatherNorm { wnMonth(w) <- 8; tempAvg(w) <- 23.0; precipMm(w) <- 45.0; }
+        NEW w = KuWeatherNorm { wnMonth(w) <- 9; tempAvg(w) <- 18.0; precipMm(w) <- 42.0; }
+        NEW w = KuWeatherNorm { wnMonth(w) <- 10; tempAvg(w) <- 12.0; precipMm(w) <- 55.0; }
+        NEW w = KuWeatherNorm { wnMonth(w) <- 11; tempAvg(w) <- 6.0; precipMm(w) <- 68.0; }
+        NEW w = KuWeatherNorm { wnMonth(w) <- 12; tempAvg(w) <- 0.0; precipMm(w) <- 80.0; }
+        APPLY;
+    }
+    IF NOT (GROUP MAX ModelCoeff m) THEN {
+        NEW m = ModelCoeff { coeffCode(m) <- 'baseTempN'; coeffValue(m) <- 8.0; coeffDescription(m) <- 'Базовая температура, °C'; }
+        NEW m = ModelCoeff { coeffCode(m) <- 'gddToHarvest'; coeffValue(m) <- 1150.0; coeffDescription(m) <- 'САТ до уборки (1150: календарь сезона набирает ~1209 GDD)'; }
+        NEW m = ModelCoeff { coeffCode(m) <- 'biomassMaxT'; coeffValue(m) <- 12.0; coeffDescription(m) <- 'Макс. биомасса, т/га'; }
+        NEW m = ModelCoeff { coeffCode(m) <- 'scnFertEffect'; coeffValue(m) <- 1.05; coeffDescription(m) <- 'Эффект удобрения/полива, множитель (этап 1)'; }
+        NEW m = ModelCoeff { coeffCode(m) <- 'scnDroughtPerDayPct'; coeffValue(m) <- 1.2; coeffDescription(m) <- 'Потери за день засухи, % (этап 1)'; }
+        APPLY;
+    }
+    // ядра моделей (этап 2) + коэффициенты GDW — идемпотентно по кодам
+    //(отдельные IF NOT: на живой БД общий блок коэффициентов уже закрыт)
+    IF NOT engineByCode('ENG-GDD') THEN NEW e = SimEngine {
+        seCode(e) <- 'ENG-GDD'; seName(e) <- 'KuGDD-1.0 (градусо-дни)';
+        seDescription(e) <- 'Эталонное ядро: прогресс вегетации по накопленным GDD календаря, биомасса пропорционально прогрессу'; }
+    IF NOT engineByCode('ENG-GDW') THEN NEW e = SimEngine {
+        seCode(e) <- 'ENG-GDW'; seName(e) <- 'KuGDW-2.0 (GDD + вода, DSSAT-класс)';
+        seDescription(e) <- 'Суточный водно-тепловой баланс: ET0 по Хargreves (Ra/широта), Kc/Ks, WUE-биомасса, урожайность по индексу водной обеспеченности'; }
+    IF NOT coeffByCode('wueKgHaMm') THEN NEW m = ModelCoeff { coeffCode(m) <- 'wueKgHaMm'; coeffValue(m) <- 25.0; coeffDescription(m) <- 'WUE ядра GDW, кг/га биомассы на мм ETa'; }
+    IF NOT coeffByCode('awcMm') THEN NEW m = ModelCoeff { coeffCode(m) <- 'awcMm'; coeffValue(m) <- 170.0; coeffDescription(m) <- 'Доступная влага корнеобитаемого слоя, мм (GDW)'; }
+    IF NOT coeffByCode('swStartFrac') THEN NEW m = ModelCoeff { coeffCode(m) <- 'swStartFrac'; coeffValue(m) <- 0.65; coeffDescription(m) <- 'Стартовый запас влаги, доля AWC (GDW)'; }
+    IF NOT coeffByCode('diurnalRangeN') THEN NEW m = ModelCoeff { coeffCode(m) <- 'diurnalRangeN'; coeffValue(m) <- 9.0; coeffDescription(m) <- 'Типичная амплитуда Tmax−Tmin, °C (Хargreves GDW)'; }
+    IF NOT coeffByCode('kcMid') THEN NEW m = ModelCoeff { coeffCode(m) <- 'kcMid'; coeffValue(m) <- 1.10; coeffDescription(m) <- 'Пиковый культурный коэффициент Kc (GDW)'; }
+    APPLY;
+    // Tbase развития по культурам (справочные; пусто → дефолт движка 4.0)
+    FOR Crop c IS Crop AND code(c) = 'ЗЕР-001' AND NOT cropTBase(c) DO cropTBase(c) <- 3.0;   // пшеница озимая
+    FOR Crop c IS Crop AND code(c) = 'ЗЕР-002' AND NOT cropTBase(c) DO cropTBase(c) <- 3.0;   // ячмень
+    FOR Crop c IS Crop AND code(c) = 'ЗЕР-003' AND NOT cropTBase(c) DO cropTBase(c) <- 8.0;   // кукуруза
+    FOR Crop c IS Crop AND code(c) = 'ЗЕР-004' AND NOT cropTBase(c) DO cropTBase(c) <- 7.0;   // соя
+    FOR Crop c IS Crop AND code(c) = 'ЗЕР-005' AND NOT cropTBase(c) DO cropTBase(c) <- 3.0;   // рожь
+    FOR Crop c IS Crop AND code(c) = 'ЗЕР-006' AND NOT cropTBase(c) DO cropTBase(c) <- 3.0;   // овёс
+    FOR Crop c IS Crop AND code(c) = 'ЗЕР-007' AND NOT cropTBase(c) DO cropTBase(c) <- 7.0;   // гречиха
+    FOR Crop c IS Crop AND code(c) = 'БОБ-001' AND NOT cropTBase(c) DO cropTBase(c) <- 4.5;   // горох
+    FOR Crop c IS Crop AND code(c) = 'ОВО-001' AND NOT cropTBase(c) DO cropTBase(c) <- 6.0;   // картофель
+    FOR Crop c IS Crop AND code(c) = 'ОВО-002' AND NOT cropTBase(c) DO cropTBase(c) <- 8.0;   // томат
+    APPLY;
+    IF NOT (GROUP MAX StressType s) THEN {
+        NEW s = StressType { stName(s) <- 'Засуха'; stDescription(s) <- 'Дефицит влаги'; }
+        NEW s = StressType { stName(s) <- 'Заморозок'; stDescription(s) <- 'Низкие температуры'; }
+        NEW s = StressType { stName(s) <- 'Дефицит азота'; stDescription(s) <- 'N ниже нормы'; }
+        NEW s = StressType { stName(s) <- 'Вредители'; stDescription(s) <- 'Поражение вредителями'; }
+        NEW s = StressType { stName(s) <- 'Болезни'; stDescription(s) <- 'Поражение болезнями'; }
+        APPLY;
+    }
+    IF NOT (GROUP MAX StressType st IF stName(st) = 'Немоделируемый фактор') THEN {
+        NEW st = StressType { stName(st) <- 'Немоделируемый фактор'; stDescription(st) <- 'Причина не определяется моделью — ручной анализ (ТЗ 4.2.2.2)'; }
+        APPLY;
+    }
+    // базовая задача по KH-001 (пшеница): выполнена с результатом
+    IF NOT (GROUP MAX SimTask t) AND northSim() AND wheatSim() AND currentCrop(northSim()) THEN {
+        NEW t = SimTask { simField(t) <- northSim(); horizonDays(t) <- 90; simStatus(t) <- SimTaskStatus.done; simFinishedAt(t) <- currentDateTime(); }
+        APPLY;
+        NEW r = SimResult {
+            simTask(r) <- GROUP MAX SimTask t IF simField(t) = northSim();
+            resultCrop(r) <- currentCrop(northSim());
+            resultHorizon(r) <- 90;
+            forecastKind(r) <- ForecastKind.basic;
+        }
+        APPLY;
+        FOR SimResult r IS SimResult AND forecastKind(r) = ForecastKind.basic
+            AND simField(simTask(r)) = northSim()
+        DO {
+            makeDailySeason(r, 1.0, 0.0);
+        }
+        APPLY;
+    }
+    // сценарий «Засуха 14 дней» (выполнен, результат связан)
+    IF NOT (GROUP MAX ScenarioRun sr) AND northSim() AND currentCrop(northSim()) THEN {
+        NEW sr = ScenarioRun {
+            srField(sr) <- northSim();
+            scenarioKind(sr) <- ScenarioKind.drought;
+            srDays(sr) <- 14;
+            srStartDate(sr) <- 2027_06_15;
+        }
+        APPLY;
+    }
+    // дочинка: сценарии без результата выполняются (идемпотентно)
+    FOR ScenarioRun sr IS ScenarioRun
+        AND (srStatus(sr) = SimTaskStatus.queued OR srStatus(sr) = SimTaskStatus.processing)
+        AND NOT srResult(sr)
+    DO runScenario(sr);
+    APPLY;
+    // ФТ2.6 (демо): факт-NDVI последней точки базового результата KH-001 ниже
+    // эталона на ~28% — материал для демонстрации автовыявления стресса
+    FOR SimResult r IS SimResult AND forecastKind(r) = ForecastKind.basic
+        AND simField(simTask(r)) = northSim()
+    DO {
+        FOR SimResultPoint p IS SimResultPoint AND pointDate(p) = lastPointDate(r) AND ndvi(p) AND NOT factNdvi(p) DO
+            factNdvi(p) <- ndvi(p) * 0.72;
+    }
+    APPLY;
+}
+
+// ===================== Актуализация внешних данных (идемпотентно) =====================
+externalDataSeed () {
+    IF NOT kuExternalSource() THEN {
+        // 1) метеонормы — реальные нормы ст. Петропавловск-35779 (1991–2020)
+        FOR KuWeatherNorm n DO {
+            tempAvg(n) <- petropavlTemp(wnMonth(n));
+            precipMm(n) <- petropavlPrecip(wnMonth(n));
+        }
+        IF NOT kuRainThreshold() THEN kuRainThreshold() <- 50;
+        // 2) календарь сезона — температуры по нормам (вместо демо-значений);
+        //    живые данные подключит refreshSeasonWeather (после фетча прогноза)
+        FOR SeasonDay d DO {
+            sdTemp(d) <- roundS1(seasonTemp(sdDate(d)));
+            sdLive(d) <- NULL;
+        }
+        // 3) погодные точки: по одной на организацию (координаты первого поля),
+        //    привязка всех полей организации к точке
+        FOR Organization o IS Organization
+            AND (GROUP MAX Field f IF organization(f) = o AND centerLat(f))
+            AND NOT locationByCode('WX-' + name(o))
+        DO {
+            LOCAL loc = Location ();
+            NEW l = Location {
+                name(l) <- 'Метеоточка ' + name(o);
+                code(l) <- 'WX-' + name(o);
+                latitude(l) <- centerLat(GROUP MAX Field f IF organization(f) = o AND centerLat(f));
+                longitude(l) <- centerLon(GROUP MAX Field f IF organization(f) = o AND centerLon(f));
+                loc() <- l;
+            }
+            FOR Field f IS Field AND organization(f) = o DO location(f) <- loc();
+        }
+        // 4) базовые прогнозы для всех полей с культурой (если ещё нет активных)
+        FOR Field f IS Field AND currentCrop(f)
+            AND NOT (GROUP MAX 1 IF resultStatus(SimResult r) = SimResultStatus.active
+                AND forecastKind(r) = ForecastKind.basic AND simField(simTask(r)) = f)
+        DO NEW t = SimTask {
+            simField(t) <- f;
+            simTaskKind(t) <- SimTaskKind.planned;
+            horizonDays(t) <- 90;
+        }
+        APPLY;
+        FOR SimTask t IS SimTask AND simStatus(t) = SimTaskStatus.queued DO
+            TRY {
+                NEWSESSION {
+                    runSimTask(t);
+                }
+            } CATCH {
+                NEWSESSION {
+                    simStatus(t) <- SimTaskStatus.error;
+                    simError(t) <- messageCaughtException();
+                    APPLY;
+                }
+            }
+        // 5) фактический NDVI: открытых анонимных источников нет (Sentinel-2
+        //    требует регистрации) — правдоподобная оценка по косвенным
+        //    признакам: эталон × плавная вариация по фазе сезона
+        //    (KH-001 — демо-стресс, не трогаем)
+        FOR SimResult r IS SimResult AND resultStatus(r) = SimResultStatus.active
+            AND forecastKind(r) = ForecastKind.basic
+            AND code(simField(simTask(r))) != 'KH-001'
+        DO FOR SimResultPoint p IS SimResultPoint AND result(p) = r AND ndvi(p) AND NOT factNdvi(p) DO
+            factNdvi(p) <- roundS3(ndvi(p) * (0.93 + 0.09 * extractDay(pointDate(p)) / 30.0));
+        kuExternalSource() <- 'метео: нормы 1991-2020 по г.Омск (ВНИИГМИ-МЦД); NDVI: модельная оценка по косвенным признакам';
+        APPLY;
+    }
+}
+

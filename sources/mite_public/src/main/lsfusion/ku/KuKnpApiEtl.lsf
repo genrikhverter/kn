@@ -1,0 +1,151 @@
+MODULE KuKnpApiEtl;
+
+// Код Урожая: REST-ручки интеграции KNP, зависящие от DWH/ETL (KuEtl).
+// Отдельный модуль: KuEtl требует KuAnalytics, и в одном модуле с остальными
+// ручками возникал цикл REQUIRE (KuAnalytics <- KuEtl <- KuKnpApi <- KuAnalytics).
+REQUIRE KuEtl, KuKnpApi, KuAnalytics;
+
+NAMESPACE Ku;
+
+apiKnpCropPnl 'API KNP: P&L по культурам' () {
+    EXPORT JSON FROM
+        crop = dcpCropName(DmCropPnl m),
+        income = dcpIncome(m),
+        expense = dcpExpense(m),
+        margin = dcpMargin(m),
+        rentabPct = dcpRentab(m);
+    RETURN JSONFILE(exportFile());
+}
+
+apiKnpFieldSeason 'API KNP: витрина поле×сезон' (INTEGER season) {
+    EXPORT JSON FROM
+        field = nameDmsField(DmFieldSeason m),
+        season = dmsSeason(m),
+        crop = dmsCropName(m),
+        areaHa = dmsAreaHa(m),
+        harvestT = dmsHarvestT(m),
+        yieldC = dmsYieldC(m),
+        forecastC = dmsForecast(m)
+    WHERE dmsSeason(m) = season AND dmsRlsOk(m);   // КФ-ДТ2: RLS по организации
+    RETURN JSONFILE(exportFile());
+}
+
+// КФ-ДТ3: REST метаданных витрин — реестр MartFieldDesc (канонический URL
+// /api/dwh/metadata — этап 2 через API-шлюз; здесь — /exec-контур)
+apiMartMetadata 'API: метаданные полей витрин' () {
+    EXPORT JSON FROM
+        mart = staticCaption(mfdMart(MartFieldDesc d)),
+        code = mfdCode(d),
+        caption = mfdCaption(d),
+        orderNo = mfdOrder(d)
+    ORDER mfdMart(d), mfdOrder(d);
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== Слот yield: баланс NPK =====================
+// Последняя (макс. версия) версия комплексного плана поля
+rcHarvestT 'Факт урожая, т' (Field f) = GROUP MAX dmsHarvestT(DmFieldSeason m) IF dmsField(m) = f;
+rcPlanYield 'Целевая урожайность, ц/га' (Field f) =
+    GROUP MAX targetYieldPlan(ComplexPlan c)
+    IF ypField(c) = f AND ypVersion(c) = (GROUP MAX ypVersion(ComplexPlan x) IF ypField(x) = f);
+rcStrawT 'Солома (расчёт), т' (Field f) =
+    OVERRIDE rcHarvestT(f), (OVERRIDE areaHa(f), 0) * ((OVERRIDE rcPlanYield(f), 0) / 10.0);
+
+apiKnpRecycling 'API KNP: рассчитать переработку' (ISTRING[16] fieldCode, ISTRING[20] kind) {
+    // whitelist способа: параметр идёт в URL без санитизации
+    IF NOT (kind = 'biogas' OR kind = 'bsf' OR kind = 'pellets' OR kind = 'microwave' OR kind = 'hemp') THEN {
+        EXPORT JSON FROM error = 'неизвестный способ переработки (доступно: biogas, bsf, pellets, microwave, hemp)';
+        RETURN JSONFILE(exportFile());
+    }
+    IF NOT (fieldByCode(fieldCode) IS Field AND rcStrawT(fieldByCode(fieldCode)) > 0) THEN {
+        EXPORT JSON FROM error = 'поле не найдено или нет данных об урожае';
+        RETURN JSONFILE(exportFile());
+    }
+    NEW r = RecyclingCalc {
+        rcKind(r) <- kind;
+        rcField(r) <- fieldByCode(fieldCode);
+        rcMassT(r) <- rcStrawT(fieldByCode(fieldCode));
+    }
+    // не-2xx/нет связи — runtime-исключение (раньше без TRY ручка падала 500-й,
+    // а ветка failedHttp была мёртвой)
+    TRY {
+        EXTERNAL HTTP GET kuRecyclingBridgeUrl() + '/api/v1/ku/recycling/' + kind
+            + '?mass_t=' + ('' + rcStrawT(fieldByCode(fieldCode))) TO exportFile;
+    } CATCH {
+        EXPORT JSON FROM error = 'сервис переработки недоступен: ' + (OVERRIDE messageCaughtException(), 'нет связи');
+        RETURN JSONFILE(exportFile());
+    }
+    LOCAL revenue = NUMERIC[16,2] ();
+    LOCAL opex = NUMERIC[16,2] ();
+    LOCAL net_profit = NUMERIC[16,2] ();
+    LOCAL roi_percent = NUMERIC[10,2] ();
+    LOCAL co2_prevented_kg = NUMERIC[14,2] ();
+    IMPORT JSON FROM exportFile() TO () revenue, opex, net_profit, roi_percent, co2_prevented_kg;
+    FOR RecyclingCalc r IS RecyclingCalc
+        AND rcField(r) = fieldByCode(fieldCode) AND NOT rcJson(r)
+    DO {
+        rcJson(r) <- STRING(JSONFILE(exportFile()));
+        rcRevenue(r) <- revenue();
+        rcOpex(r) <- opex();
+        rcNetProfit(r) <- net_profit();
+        rcRoi(r) <- roi_percent();
+        rcCo2(r) <- co2_prevented_kg();
+    }
+    kuPublish(KuEventKind.recyclingDone, 'RecyclingCalc', fieldCode,
+        kind + ': сырьё ' + ('' + rcStrawT(fieldByCode(fieldCode))) + ' т');
+    APPLY;
+    EXPORT JSON FROM
+        field = code(rcField(RecyclingCalc r)),
+        kind = rcKind(r),
+        massT = rcMassT(r),
+        revenue = rcRevenue(r),
+        netProfit = rcNetProfit(r),
+        roiPercent = rcRoi(r),
+        co2Kg = rcCo2(r)
+    WHERE rcField(r) = fieldByCode(fieldCode);
+    RETURN JSONFILE(exportFile());
+}
+
+
+// фид данных для Jupyter-ноутбуков; вызов /exec?action=Ku.apiJupyterData
+// (basic-авторизация). КФ-РП3: режимы mode: 'pnl' (по умолчанию, прежний
+// контракт), 'fieldseason' (витрина поле×сезон, параметр season — 0/NULL =
+// все), 'budget' (БДР по статьям с помесячной детализацией). Скаляры и
+// массивы в одном EXPORT не смешиваются (quirks) — режимы разнесены
+apiJupyterData 'API: данные аналитики (notebooks)' (ISTRING[20] mode, INTEGER season) {
+    IF (OVERRIDE mode, 'pnl') = 'fieldseason' THEN
+        EXPORT JSON FROM
+            field = nameDmsField(DmFieldSeason m),
+            season = dmsSeason(m),
+            crop = dmsCropName(m),
+            areaHa = dmsAreaHa(m),
+            harvestT = dmsHarvestT(m),
+            yieldC = dmsYieldC(m),
+            forecastC = dmsForecast(m)
+        WHERE dmsRlsOk(m) AND ((OVERRIDE season, 0) = 0 OR dmsSeason(m) = season);
+    ELSE IF (OVERRIDE mode, 'pnl') = 'budget' THEN
+        EXPORT JSON FROM
+            costItem = ciName(costItem(BudgetPLItem it)),
+            kind = staticCaption(ciKind(costItem(it))),
+            month = bplMonth(it),
+            amount = bplAmount(it),
+            crop = (OVERRIDE nameCrop(bplCrop(it)), '');
+    ELSE
+        EXPORT JSON FROM
+            crop = name(Crop c),
+            income = pnlIncome(c),
+            expense = pnlExpense(c),
+            margin = pnlMargin(c),
+            rentab = pnlRentab(c)
+        WHERE pnlIncome(c) OR pnlExpense(c);
+    RETURN JSONFILE(exportFile());
+}
+
+// PNL-секция дашборда kuhome: читает витрину DWH (DmCropPnl), поэтому
+// живёт здесь — KuAnalytics не может требовать KuEtl (цикл REQUIRE),
+// секция дописывается расширением действия после основного снапшота.
+kuHomeAppendSections () + {
+    kuHomeData() <- kuHomeData() + '||PNL';
+    FOR DmCropPnl x IS DmCropPnl DO
+        kuHomeData() <- kuHomeData() + '~' + dcpCropName(x) + '^' + ('' + (OVERRIDE dcpIncome(x), 0)) + '^' + ('' + (OVERRIDE dcpExpense(x), 0)) + '^' + ('' + (OVERRIDE dcpMargin(x), 0)) + '^' + ('' + (OVERRIDE dcpRentab(x), 0));
+}

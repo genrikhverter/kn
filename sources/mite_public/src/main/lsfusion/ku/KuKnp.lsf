@@ -1,0 +1,87 @@
+// =====================================================================
+// KuKnp — раздел «Платформа КНП» (витрины функций платформы KNP).
+// Третья вкладка навигатора после «MITE»: функции их микросервисов
+// размещены у нас (решение пользователя 08.10): ИИ-ассистент (ai-agent
+// через шлюз, ходит из браузера — компонент kuai.js) и переработка
+// остатков (recycling-калькулятор, apiKnpRecycling из KuKnpApiEtl).
+// =====================================================================
+MODULE KuKnp;
+REQUIRE KuKnpApiEtl, KuLand;
+NAMESPACE Ku; // иначе 'Field' неоднозначна (Ku.Field vs StoreTask.Field из REQUIRE-цепочки KuYield)
+
+// ===================== ИИ-ассистент KNP =====================
+// Компонент самолокален: история в JS, запросы идут из браузера в
+// api-gateway KNP (:8088), который уже отвечает цифрами LSfusion
+// (grounded). ON CHANGE не нужен — состояние на сервер не пишем.
+knpAiChatData 'Чат ассистента' = DATA TEXT ();
+
+FORM knpAssistant 'ИИ-ассистент (KNP)'
+    PROPERTIES () knpAiChatData CUSTOM 'kuai'
+;
+
+// ===================== Портал ЦУП КНП (карта) =====================
+// iframe knp_frontend (:8092): главный экран портала — карта с живыми
+// полями прототипа; разделы платформы (экономика, диспетчеризация…).
+knpPortalData 'Портал' = DATA TEXT ();
+
+FORM knpPortal 'Портал ЦУП КНП (карта)'
+    PROPERTIES () knpPortalData CUSTOM 'kuportal'
+;
+
+// ===================== Переработка остатков =====================
+// Панель запуска: сессионное поле + 5 способов (whitelist моста),
+// журнал расчётов (RecyclingCalc) — под панелью.
+knpRecField 'Поле для расчёта' = DATA Field ();
+nameKnpRecField 'Поле' () = OVERRIDE name(knpRecField()), '— выберите поле —';
+knpRecStrawT 'Сырьё (солома), т' () = OVERRIDE rcStrawT(knpRecField()), 0;
+
+setKnpRecFieldAct 'Выбрать поле…' () {
+    DIALOG pickField OBJECTS f = knpRecField() INPUT f NULL DO knpRecField() <- f;
+}
+
+// После вызова API показываем итог последнего расчёта этого поля.
+runKnpRecyclingAct 'Рассчитать переработку' (ISTRING[20] kind) {
+    IF NOT knpRecField() IS Field THEN
+        MESSAGE 'Сначала выберите поле (кнопка «Выбрать поле…») — расчёт идёт от факта урожая/соломы.'; // ; перед ELSE обязательна (quirks §6)
+    ELSE {
+        apiKnpRecycling(code(knpRecField()), kind);
+        FOR RecyclingCalc rc IS RecyclingCalc
+            AND rcField(rc) = knpRecField()
+            AND rcAt(rc) = (GROUP MAX rcAt(RecyclingCalc x) IF rcField(x) = knpRecField())
+        DO MESSAGE CONCAT 'Переработка (', rcKind(rc), ') — сырьё ', rcMassT(rc), ' т: выручка ',
+            rcRevenue(rc), ' ₽, чистая прибыль ', rcNetProfit(rc), ' ₽, ROI ', rcRoi(rc),
+            '%, CO2 предотвращено ', rcCo2(rc), ' кг. Строка добавлена в журнал.';
+    }
+}
+
+runRecBiogas 'Биогаз' () { runKnpRecyclingAct('biogas'); }
+runRecBsf 'Личинка чёрной львинки (BSF)' () { runKnpRecyclingAct('bsf'); }
+runRecPellets 'Топливные гранулы' () { runKnpRecyclingAct('pellets'); }
+runRecMicrowave 'СВЧ-сушка зерна' () { runKnpRecyclingAct('microwave'); }
+runRecHemp 'Плиты из конопли' () { runKnpRecyclingAct('hemp'); }
+
+FORM knpRecycling 'Переработка остатков (KNP)'
+    PROPERTIES () nameKnpRecField, knpRecStrawT, setKnpRecFieldAct
+    PROPERTIES () runRecBiogas, runRecBsf, runRecPellets, runRecMicrowave, runRecHemp
+    OBJECTS r = RecyclingCalc
+    PROPERTIES (r) READONLY rcAt, rcKind, nameRcField, rcMassT, rcRevenue, rcNetProfit, rcRoi, rcCo2
+    ORDERS rcAt(r) DESC
+;
+
+DESIGN knpRecycling {
+    NEW recPanel {
+        caption = 'Новый расчёт (сырьё — солома по факту урожая поля)';
+        MOVE PROPERTY(nameKnpRecField());
+        MOVE PROPERTY(knpRecStrawT());
+        MOVE PROPERTY(setKnpRecFieldAct());
+    }
+    NEW recButtons {
+        caption = 'Способ переработки';
+        horizontal = TRUE;
+        MOVE PROPERTY(runRecBiogas());
+        MOVE PROPERTY(runRecBsf());
+        MOVE PROPERTY(runRecPellets());
+        MOVE PROPERTY(runRecMicrowave());
+        MOVE PROPERTY(runRecHemp());
+    }
+}

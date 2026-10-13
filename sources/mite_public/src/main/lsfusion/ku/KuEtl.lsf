@@ -1,0 +1,1059 @@
+MODULE KuEtl;
+
+// Код Урожая: файловый импорт (Волна 2, шаг 1 — ТЗ 4.2.4.5 «Ручной ввод и
+// импорт данных из файлов») и фундамент ETL-контура (конвейеры/карантин —
+// следующие шаги Волны 2). Поддерживаемые форматы: CSV с заголовком,
+// разделитель «;», кодировка UTF-8.
+REQUIRE KuSimulation, KuYield, KuProdPlan, KuAnalytics;
+
+NAMESPACE Ku;
+
+// ===================== Журнал загрузок (ТЗ 4.2.4.5) =====================
+CLASS ImportKind 'Тип загрузки' {
+    planYield 'План урожайности (CSV: code;plan)',
+    ndviFact 'Факт NDVI (CSV: code;date;ndvi)'
+}
+CLASS ImportStatus 'Статус загрузки' {
+    queued 'В очереди', done 'Завершена', error 'Ошибка'
+}
+CLASS ImportFile 'Загрузка из файла';
+TABLE importFile (ImportFile);
+impKind 'Тип' = DATA ImportKind (ImportFile) NONULL;
+nameImpKind 'Тип' (ImportFile f) = staticCaption(impKind(f));
+impFile 'Файл' = DATA FILE (ImportFile);
+impStatus 'Статус' = DATA ImportStatus (ImportFile) NONULL;
+nameImpStatus 'Статус' (ImportFile f) = staticCaption(impStatus(f));
+impAt 'Создана' = DATA DATETIME (ImportFile);
+impUser 'Пользователь' = DATA ISTRING[80] (ImportFile);
+impRowsTotal 'Строк всего' = DATA INTEGER (ImportFile);
+impRowsOk 'Принято' = DATA INTEGER (ImportFile);
+impRowsRejected 'Отбраковано' = DATA INTEGER (ImportFile);
+impMessage 'Сообщение' = DATA ISTRING[250] (ImportFile);
+WHEN SET (ImportFile f IS ImportFile) DO {
+    impStatus(f) <- ImportStatus.queued;
+    impAt(f) <- currentDateTime();
+    IF currentUser() THEN impUser(f) <- login(currentUser());
+}
+
+// карантин ошибочных строк (ТЗ: «журнал ошибок загрузки и обработки данных»)
+CLASS ImportRowError 'Карантин строки';
+TABLE importRowError (ImportRowError);
+ireImport 'Загрузка' = DATA ImportFile (ImportRowError) AUTOSET;
+ireLineNo 'Строка' = DATA INTEGER (ImportRowError);
+ireLineText 'Содержимое' = DATA ISTRING[200] (ImportRowError);
+// КФ-ДТ4: код причины по спеке (INVALID_FORMAT/UNKNOWN_REF/NO_BASE_SERIES;
+// SPATIAL_JOIN_FAILED/INVALID_GEO — этап 2, точечные данные)
+ireCode 'Код' = DATA ISTRING[30] (ImportRowError);
+ireError 'Ошибка' = DATA ISTRING[200] (ImportRowError);
+
+// ===================== Импорт: план урожайности полей =====================
+// CSV: code;plan — код поля, плановая урожайность ц/га. Диапазон 5–150
+// (агрономическая валидация), незнакомый код — карантин.
+doImportPlanYield (ImportFile f) {
+    // паттерн Mite.lsf (DBF): TO во временные NESTED-массивы с row-параметром,
+    // затем FOR по строкам (FIELDS+DO выполняет тело только на последней строке)
+    LOCAL NESTED code = ISTRING[16] (INTEGER);
+    LOCAL NESTED plan = DOUBLE (INTEGER);
+    IMPORT CSV ';' HEADER CHARSET 'UTF-8' FROM impFile(f) TO code, plan
+
+    impRowsTotal(f) <- GROUP SUM 1 IF code(INTEGER row);
+    impRowsOk(f) <- GROUP SUM 1 IF code(INTEGER row)
+        AND (GROUP MAX 1 IF Field x IS Field AND code(x) = code(row))
+        AND plan(row) >= 5.0 AND plan(row) <= 150.0;
+    impRowsRejected(f) <- GROUP SUM 1 IF code(INTEGER row)
+        AND NOT ((GROUP MAX 1 IF Field y IS Field AND code(y) = code(row))
+            AND plan(row) >= 5.0 AND plan(row) <= 150.0);
+    // паттерн Mite.lsf: итерация по объектному множеству (вложенный FOR
+    // row→объект в этом пине не срабатывал — значения не применялись)
+    FOR [GROUP SUM 1 IF Field x = fieldByCode(code(INTEGER row)) AND plan(row) >= 5.0 AND plan(row) <= 150.0 BY x](Field x) DO {
+        APPLY FOR x = fieldByCode(code(INTEGER row)) DO
+            planYield(x) <- plan(row);
+        IF canceled() THEN BREAK;
+    }
+    FOR code(INTEGER row)
+        AND NOT ((GROUP MAX 1 IF Field y IS Field AND code(y) = code(row))
+            AND plan(row) >= 5.0 AND plan(row) <= 150.0) DO
+        NEW e = ImportRowError {
+            ireImport(e) <- f;
+            ireLineNo(e) <- row + 2;   // row 0-based после заголовка, +2 = номер строки файла
+            ireLineText(e) <- (OVERRIDE code(row), '—') + ';' + (OVERRIDE ('' + plan(row)), '—');
+            ireCode(e) <- IF NOT (GROUP MAX 1 IF Field z IS Field AND code(z) = code(row))
+                THEN 'UNKNOWN_REF' ELSE 'INVALID_FORMAT';
+            ireError(e) <- IF NOT (GROUP MAX 1 IF Field z IS Field AND code(z) = code(row))
+                THEN 'UNKNOWN_REF: поле ' + (OVERRIDE code(row), '—') + ' не найдено'
+                ELSE 'INVALID_FORMAT: значение вне диапазона 5–150 ц/га';
+        }
+    IF (OVERRIDE impRowsTotal(f), 0) > 0 THEN {
+        impStatus(f) <- ImportStatus.done;
+        impMessage(f) <- 'Загружено: ' + (OVERRIDE ('' + impRowsOk(f)), '0')
+            + ', отбраковано: ' + (OVERRIDE ('' + impRowsRejected(f)), '0');
+    } ELSE {
+        impStatus(f) <- ImportStatus.error;
+        impMessage(f) <- 'Файл пуст или не распознан (ожидается CSV с заголовком: code;plan)';
+    }
+    kuPublish(KuEventKind.fileImported, 'ImportFile', nameImpKind(f),
+        'Строк: ' + (OVERRIDE ('' + impRowsTotal(f)), '0') + ', принято: ' + (OVERRIDE ('' + impRowsOk(f)), '0'));
+    APPLY;
+}
+
+// ===================== Импорт: факт NDVI по полям =====================
+// CSV: code;date;ndvi — код поля, дата (YYYY-MM-DD), фактический NDVI
+// (спутник/полевые наблюдения, ФТ2.6). Значение попадает в точку ряда
+// активного базового результата моделирования; нет ряда на дату — карантин.
+// точка ряда активного базового результата поля на дату (для Mite-паттерна)
+ndviPoint (ISTRING[16] fieldCode, DATE dt) = GROUP MAX SimResultPoint p
+    IF pointDate(p) = dt AND forecastKind(result(p)) = ForecastKind.basic
+        AND resultStatus(result(p)) = SimResultStatus.active
+        AND code(simField(simTask(result(p)))) = fieldCode;
+doImportNdviFact (ImportFile f) {
+    LOCAL NESTED code = ISTRING[16] (INTEGER);
+    LOCAL NESTED dt = DATE (INTEGER);
+    LOCAL NESTED ndvi = DOUBLE (INTEGER);
+    IMPORT CSV ';' HEADER CHARSET 'UTF-8' FROM impFile(f) TO code, dt, ndvi
+
+    impRowsTotal(f) <- GROUP SUM 1 IF code(INTEGER row);
+    impRowsOk(f) <- GROUP SUM 1 IF code(INTEGER row)
+        AND ndvi(row) >= 0.05 AND ndvi(row) <= 0.95
+        AND (GROUP MAX 1 IF SimResultPoint p IS SimResultPoint
+            AND pointDate(p) = dt(row) AND forecastKind(result(p)) = ForecastKind.basic
+            AND resultStatus(result(p)) = SimResultStatus.active
+            AND code(simField(simTask(result(p)))) = code(row));
+    impRowsRejected(f) <- GROUP SUM 1 IF code(INTEGER row)
+        AND NOT (ndvi(row) >= 0.05 AND ndvi(row) <= 0.95
+            AND (GROUP MAX 1 IF SimResultPoint q IS SimResultPoint
+                AND pointDate(q) = dt(row) AND forecastKind(result(q)) = ForecastKind.basic
+                AND resultStatus(result(q)) = SimResultStatus.active
+                AND code(simField(simTask(result(q)))) = code(row)));
+    // паттерн Mite.lsf: итерация по объектному множеству точек ряда
+    FOR [GROUP SUM 1 IF SimResultPoint p = ndviPoint(code(INTEGER row), dt(row)) AND ndvi(row) >= 0.05 AND ndvi(row) <= 0.95 BY p](SimResultPoint p) DO {
+        APPLY FOR p = ndviPoint(code(INTEGER row), dt(row)) DO
+            factNdvi(p) <- ndvi(row);
+        IF canceled() THEN BREAK;
+    }
+    FOR code(INTEGER row)
+        AND NOT (ndvi(row) >= 0.05 AND ndvi(row) <= 0.95
+            AND (GROUP MAX 1 IF SimResultPoint q IS SimResultPoint
+                AND pointDate(q) = dt(row) AND forecastKind(result(q)) = ForecastKind.basic
+                AND resultStatus(result(q)) = SimResultStatus.active
+                AND code(simField(simTask(result(q)))) = code(row))) DO
+        NEW e = ImportRowError {
+            ireImport(e) <- f;
+            ireLineNo(e) <- row + 2;   // row 0-based после заголовка, +2 = номер строки файла
+            ireLineText(e) <- (OVERRIDE code(row), '—') + ';' + (OVERRIDE ('' + dt(row)), '—') + ';' + (OVERRIDE ('' + ndvi(row)), '—');
+            ireCode(e) <- IF NOT (GROUP MAX 1 IF Field z IS Field AND code(z) = code(row))
+                THEN 'UNKNOWN_REF'
+                ELSE IF NOT (ndvi(row) >= 0.05 AND ndvi(row) <= 0.95) THEN 'INVALID_FORMAT'
+                ELSE 'NO_BASE_SERIES';
+            ireError(e) <- IF NOT (GROUP MAX 1 IF Field z IS Field AND code(z) = code(row))
+                THEN 'UNKNOWN_REF: поле ' + (OVERRIDE code(row), '—') + ' не найдено'
+                ELSE IF NOT (ndvi(row) >= 0.05 AND ndvi(row) <= 0.95) THEN 'INVALID_FORMAT: NDVI вне диапазона 0.05–0.95'
+                ELSE 'NO_BASE_SERIES: нет активного базового ряда на дату';
+        }
+    IF (OVERRIDE impRowsTotal(f), 0) > 0 THEN {
+        impStatus(f) <- ImportStatus.done;
+        impMessage(f) <- 'Загружено: ' + (OVERRIDE ('' + impRowsOk(f)), '0')
+            + ', отбраковано: ' + (OVERRIDE ('' + impRowsRejected(f)), '0');
+    } ELSE {
+        impStatus(f) <- ImportStatus.error;
+        impMessage(f) <- 'Файл пуст или не распознан (ожидается CSV с заголовком: code;date;ndvi)';
+    }
+    kuPublish(KuEventKind.fileImported, 'ImportFile', nameImpKind(f),
+        'Строк: ' + (OVERRIDE ('' + impRowsTotal(f)), '0') + ', принято: ' + (OVERRIDE ('' + impRowsOk(f)), '0'));
+    APPLY;
+}
+
+// выполнение очереди загрузок (для регламентного запуска и REST)
+doImportQueued 'Выполнить загрузки из очереди' () {
+    FOR ImportFile f IS ImportFile AND impStatus(f) = ImportStatus.queued DO {
+        IF impKind(f) = ImportKind.planYield THEN doImportPlanYield(f);
+        IF impKind(f) = ImportKind.ndviFact THEN doImportNdviFact(f);
+    }
+    APPLY;
+}
+
+// демо-загрузки для проверки контура без UI (и сид): программное создание
+// файла через stringToFile → resultFile() (паттерн Scheduler.lsf);
+// перевод строки — nl() через SQL (escape в литералах не разворачивается)
+nl () = [FORMULA STRING[1] 'chr(10)']();
+importDemo 'Создать демо-загрузки' () {
+    IF NOT (GROUP MAX ImportFile x IS ImportFile AND impKind(x) = ImportKind.planYield) THEN {
+        stringToFile('code;plan' + nl() + 'KH-001;72.5' + nl() + 'KH-002;68.0' + nl() + 'XX-999;50.0' + nl() + 'KH-003;500.0' + nl());
+        NEW f = ImportFile { impKind(f) <- ImportKind.planYield; impFile(f) <- resultFile(); }
+        APPLY;
+    }
+    IF NOT (GROUP MAX ImportFile x IS ImportFile AND impKind(x) = ImportKind.ndviFact) THEN {
+        stringToFile('code;date;ndvi' + nl() + 'KH-005;2027-07-17;0.31' + nl() + 'KH-006;2027-07-17;0.75' + nl());
+        NEW f = ImportFile { impKind(f) <- ImportKind.ndviFact; impFile(f) <- resultFile(); }
+        APPLY;
+    }
+    doImportQueued();
+}
+
+apiImportRun 'API: выполнить загрузки из очереди' () {
+    doImportQueued();
+    // КФ-ДТ7: первые 10 строк карантина — разбор без открытия формы.
+    // ⚠ EXPORT не смешивает скаляры и NESTED-массивы («операция над
+    // множеством некорректна») — сводной строкой «строка: код — текст»
+    LOCAL qtop = ISTRING[900] ();
+    LOCAL qn = INTEGER ();
+    FOR ImportRowError e IS ImportRowError ORDER ireLineNo(e), e DO {
+        qn() <- (OVERRIDE qn(), 0) + 1;
+        IF qn() <= 10 THEN
+            qtop() <- (OVERRIDE qtop(), '')
+                + (IF qn() > 1 THEN '; ' ELSE '')
+                + 'строка ' + (OVERRIDE ('' + ireLineNo(e)), '—') + ': '
+                + (OVERRIDE ireCode(e), '—') + ' — ' + (OVERRIDE ireError(e), '');
+    }
+    EXPORT JSON FROM
+        done = (GROUP SUM 1 IF ImportFile f IS ImportFile AND impStatus(f) = ImportStatus.done),
+        failed = (GROUP SUM 1 IF ImportFile f IS ImportFile AND impStatus(f) = ImportStatus.error),
+        quarantined = (GROUP SUM 1 IF ImportRowError e IS ImportRowError),
+        quarantineTop10 = qtop();
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== Формы =====================
+doImportOne 'Выполнить импорт' (ImportFile f) {
+    IF impStatus(f) = ImportStatus.queued THEN {
+        IF impKind(f) = ImportKind.planYield THEN doImportPlanYield(f);
+        IF impKind(f) = ImportKind.ndviFact THEN doImportNdviFact(f);
+    } ELSE
+        MESSAGE 'Загрузка уже выполнена.';
+}
+
+FORM importFile 'Загрузка из файла'
+    OBJECTS f = ImportFile PANEL
+    PROPERTIES (f) impKind, impFile
+    PROPERTIES (f) READONLY nameImpStatus, impAt, impUser, impRowsTotal, impRowsOk, impRowsRejected, impMessage
+    PROPERTIES (f) doImportOne
+    EDIT ImportFile OBJECT f
+;
+
+FORM importFiles 'Загрузка из файлов'
+    OBJECTS f = ImportFile
+    PROPERTIES (f) READONLY nameImpKind, nameImpStatus, impAt, impUser, impRowsTotal, impRowsOk, impRowsRejected, impMessage
+    PROPERTIES (f) NEWSESSION NEW, EDIT, DELETE
+    PROPERTIES () doImportQueued, importDemo
+    ORDERS impAt(f) DESC
+;
+
+EXTEND FORM importFile
+    OBJECTS e = ImportRowError
+    PROPERTIES (e) READONLY ireLineNo, ireLineText, ireError
+    FILTERS ireImport(e) = f
+;
+
+// ===================== ETL-конвейеры (Волна 2, шаг 2 — ФТ5.1 / ТЗ 4.2.4.1+) =====================
+// Конвейер = именованный регламентный поток данных с журналом запусков
+// (EtlRun: статусы, счётчики записей, ошибки). На стенде источники:
+// модельный контур (kuSimDaily), земельный контур (kuLandDaily), файловая
+// очередь (телеметрия/NDVI из CSV). Расписание в промышленном контуре —
+// планировщик LSfusion (Служебное/Задачи); на стенде — кнопка/REST.
+CLASS EtlPipeline 'Конвейер данных';
+TABLE etlPipeline (EtlPipeline);
+epName 'Наименование' = DATA ISTRING[60] (EtlPipeline) NONULL IN id;
+epSource 'Источник (описание)' = DATA ISTRING[60] (EtlPipeline);
+// КФ-ДТ5: типизированный источник этапа 1 {internal: simulation/land/files/dwh}
+// (строка + CONSTRAINT — смена типа колонки на енум на живой БД обходится
+// дороже пользы; внешние источники REST/1С/MQTT — этап 2, ФТ6.1/6.5)
+epSourceKind 'Тип источника' = DATA ISTRING[20] (EtlPipeline);
+nameEpSourceKind 'Тип источника' (EtlPipeline p) =
+    IF epSourceKind(p) = 'simulation' THEN 'Моделирование (внутр.)'
+    ELSE IF epSourceKind(p) = 'land' THEN 'Земельный контур (внутр.)'
+    ELSE IF epSourceKind(p) = 'files' THEN 'Файловая очередь (внутр.)'
+    ELSE IF epSourceKind(p) = 'dwh' THEN 'DWH (внутр.)'
+    ELSE '';
+CONSTRAINT EtlPipeline p IS EtlPipeline AND epSourceKind(p)
+    AND NOT (epSourceKind(p) = 'simulation' OR epSourceKind(p) = 'land'
+        OR epSourceKind(p) = 'files' OR epSourceKind(p) = 'dwh')
+    CHECKED BY epSourceKind MESSAGE 'Тип источника: simulation / land / files / dwh';
+epSchedule 'Расписание (целевое)' = DATA ISTRING[60] (EtlPipeline);
+epEnabled 'Включён' = DATA BOOLEAN (EtlPipeline);
+
+CLASS EtlRun 'Запуск конвейера';
+TABLE etlRun (EtlRun);
+erPipeline 'Конвейер' = DATA EtlPipeline (EtlRun) AUTOSET;
+erStarted 'Старт' = DATA DATETIME (EtlRun) NONULL;
+erFinished 'Финиш' = DATA DATETIME (EtlRun);
+erStatus 'Статус' = DATA ISTRING[20] (EtlRun);
+erRecords 'Записей обработано' = DATA INTEGER (EtlRun);
+erMessage 'Сообщение' = DATA ISTRING[250] (EtlRun);
+nameErPipeline 'Конвейер' (EtlRun r) = epName(erPipeline(r));
+
+// ===================== DWH: измерение, факты, витрины (Волна 2, шаг 3 — ФТ5.2) =====================
+// Измерение Dim_Field с SCD2 (история изменений поля), факты (операции,
+// урожай, БДР) и витрины dm_field_season / dm_crop_pnl. Пересчёт —
+// конвейером «Обновление витрин DWH» (замена Airflow/Arenadata по v2.0).
+
+// --- измерение: поле (SCD2 по ТЗ 4.2.4.6 / ФТ.DWH.2) ---
+// КФ-И5 (связка): история сезонов — операционный профиль FieldSeason
+// (KuLand); DwhField — версии ИЗМЕРЕНИЯ (SCD2 по currentCrop/areaHa).
+// При расхождении приоритет — FieldSeason
+CLASS DwhField 'Измерение: поле (SCD2)';
+TABLE dwhField (DwhField);
+dfField 'Поле' = DATA Field (DwhField);
+dfAreaHa 'Площадь (срез), га' = DATA NUMERIC[10,1] (DwhField);
+dfCropName 'Культура (срез)' = DATA ISTRING[100] (DwhField);
+dfSoilName 'Почва (срез)' = DATA ISTRING[60] (DwhField);
+dfValidFrom 'Действует с' = DATA DATE (DwhField) NONULL;
+// КФ-ДТ6: valid_to — дата закрытия версии (спека v2: 9999-12-31; на одной
+// БД достаточно NULL + is_current); surrogate-ключи и etl_batch_id —
+// этап 2 (Staging Area, примечания раздела DWH)
+dfValidTo 'Действует по' = DATA DATE (DwhField);
+dfIsCurrent 'Актуальная' = DATA BOOLEAN (DwhField);
+nameDfField 'Поле' (DwhField d) = OVERRIDE name(dfField(d)), '';
+
+// смена ключевого атрибута поля закрывает текущую версию и открывает новую
+rollDwhField (Field f) {
+    FOR DwhField d IS DwhField AND dfField(d) = f AND dfIsCurrent(d) DO {
+        dfValidTo(d) <- currentDate();
+        dfIsCurrent(d) <- NULL;
+    }
+    NEW nd = DwhField {
+        dfField(nd) <- f;
+        dfAreaHa(nd) <- areaHa(f);
+        dfCropName(nd) <- (OVERRIDE nameCurrentCrop(f), '—');
+        dfSoilName(nd) <- (OVERRIDE nameSoilType(f), '—');
+        dfValidFrom(nd) <- currentDate();
+        dfIsCurrent(nd) <- TRUE;
+    }
+    kuAuditChange('DWH: измерение поля', name(f), 'Версия SCD2', '—', 'открыта новая версия');
+}
+// IS Field: без гарда срабатывало и при удалении поля (мусорные версии SCD2)
+WHEN CHANGED (currentCrop(Field f)) AND f IS Field DO rollDwhField(f);
+WHEN CHANGED (areaHa(Field f)) AND f IS Field DO rollDwhField(f);
+
+// --- факты (детальные, загружаются конвейером из операционного контура) ---
+CLASS FactFieldOp 'Факт: операция на поле';
+TABLE factFieldOp (FactFieldOp);
+foField 'Поле' = DATA Field (FactFieldOp);
+foOperation 'Операция (источник)' = DATA SeasonalOperation (FactFieldOp);
+foSeason 'Сезон' = DATA INTEGER (FactFieldOp);
+foDate 'Дата' = DATA DATE (FactFieldOp);
+foWork 'Вид работы' = DATA ISTRING[100] (FactFieldOp);
+nameFoField 'Поле' (FactFieldOp o) = OVERRIDE name(foField(o)), '';
+
+CLASS FactHarvest 'Факт: урожай';
+TABLE factHarvest (FactHarvest);
+fhField 'Поле' = DATA Field (FactHarvest);
+fhActItem 'Строка акта (источник)' = DATA HarvestActItem (FactHarvest);
+fhSeason 'Сезон' = DATA INTEGER (FactHarvest);
+fhDate 'Дата' = DATA DATE (FactHarvest);
+fhCropName 'Культура' = DATA ISTRING[100] (FactHarvest);
+fhGrossT 'Валовой вес, т' = DATA NUMERIC[12,3] (FactHarvest);
+fhNetT 'Зачётный вес, т' = DATA NUMERIC[12,3] (FactHarvest);
+fhYieldC 'Урожайность, ц/га' = DATA NUMERIC[10,2] (FactHarvest);
+nameFhField 'Поле' (FactHarvest h) = OVERRIDE name(fhField(h)), '';
+
+// --- витрины (денормализованные агрегаты по ТЗ 4.2.4.7 / ФТ.DWH.3) ---
+CLASS DmFieldSeason 'Витрина: поле × сезон';
+TABLE dmFieldSeason (DmFieldSeason);
+dmsField 'Поле' = DATA Field (DmFieldSeason);
+dmsSeason 'Сезон' = DATA INTEGER (DmFieldSeason);
+// КФ-ДТ2: организация строки (RLS-фильтр витрины)
+dmsOrg 'Организация' = DATA Organization (DmFieldSeason);
+dmsCropName 'Культура' = DATA ISTRING[100] (DmFieldSeason);
+dmsAreaHa 'Площадь, га' = DATA NUMERIC[10,1] (DmFieldSeason);
+dmsOps 'Операций' = DATA INTEGER (DmFieldSeason);
+dmsHarvestT 'Убрано (зачёт), т' = DATA NUMERIC[12,3] (DmFieldSeason);
+dmsYieldC 'Урожайность, ц/га' = DATA NUMERIC[10,2] (DmFieldSeason);
+dmsForecast 'Прогноз, ц/га' = DATA NUMERIC[10,2] (DmFieldSeason);
+nameDmsField 'Поле' (DmFieldSeason m) = OVERRIDE name(dmsField(m)), '';
+// КФ-ДТ2: RLS этапа 1 — организация текущего пользователя при назначенной
+// роли КУ (у org-пользователей КУ организация задана); без организации
+// (admin/демо) — все строки (по образцу kuMapOrgOk: «пусто = все»)
+dmsRlsOk (DmFieldSeason m) =
+    NOT organization(currentUser()) OR NOT dmsOrg(m) OR dmsOrg(m) = organization(currentUser());
+// P&L-витрина — агрегат по культурам всех полей: фильтрация по организациям
+// полей исказила бы доли; RLS P&L — этап 2 (спека-примечание)
+
+CLASS DmCropPnl 'Витрина: культура (P&L)';
+TABLE dmCropPnl (DmCropPnl);
+dcpCropName 'Культура' = DATA ISTRING[100] (DmCropPnl) NONULL;
+dcpIncome 'Доход, ₽' = DATA NUMERIC[14,2] (DmCropPnl);
+dcpExpense 'Расход, ₽' = DATA NUMERIC[14,2] (DmCropPnl);
+dcpMargin 'Маржа, ₽' = DATA NUMERIC[14,2] (DmCropPnl);
+dcpRentab 'Рентабельность, %' = DATA NUMERIC[8,2] (DmCropPnl);
+
+// конвейер DWH в диспетчере ETL
+// (обработка имени «Обновление витрин DWH» — см. runEtl ниже)
+
+// актуальный прогноз по полю (для витрины)
+lastForecastC (Field f) = GROUP MAX lastYieldForecast(SimResult r)
+    IF resultStatus(r) = SimResultStatus.active AND forecastKind(r) = ForecastKind.basic AND simField(simTask(r)) = f;
+
+etlFactYieldC (Field f) =
+    (OVERRIDE (GROUP SUM fhNetT(FactHarvest h) IF fhField(h) = f), 0.0) * 10.0
+    / (OVERRIDE areaHa(f), 1.0);
+
+// пересчёт DWH: измерение (начальное заполнение) + факты + витрины
+refreshDwh 'Пересчитать DWH' () {
+    // измерение: текущие версии для полей без них
+    FOR Field f IS Field AND NOT (GROUP MAX 1 IF DwhField d IS DwhField AND dfField(d) = f AND dfIsCurrent(d)) DO
+        NEW nd = DwhField {
+            dfField(nd) <- f;
+            dfAreaHa(nd) <- areaHa(f);
+            dfCropName(nd) <- (OVERRIDE nameCurrentCrop(f), '—');
+            dfSoilName(nd) <- (OVERRIDE nameSoilType(f), '—');
+            dfValidFrom(nd) <- currentDate();
+            dfIsCurrent(nd) <- TRUE;
+        }
+    APPLY;
+    // факты операций (из сезонных карт); дедуп — по стабильной ссылке на
+    // операцию: прежде NULL-даты подменялись currentDate() и каждый суточный
+    // прогон плодил новый факт на ту же операцию
+    FOR SeasonalOperation o IS SeasonalOperation AND complexPlan(seasonalCard(o)) IS ComplexPlan DO
+        IF NOT (GROUP MAX 1 IF FactFieldOp x IS FactFieldOp AND foOperation(x) = o) THEN
+            NEW nfo = FactFieldOp {
+                foField(nfo) <- ypField(complexPlan(seasonalCard(o)));
+                foOperation(nfo) <- o;
+                // КФ-ДТ1: сезон — год даты факта (не константа)
+                foSeason(nfo) <- extractYear((OVERRIDE soPlannedDate(o), 2027_01_01));
+                foDate(nfo) <- soPlannedDate(o);
+                foWork(nfo) <- nameSoWorkType(o);
+            }
+    // факты урожая (из проведённых актов); дедуп — по строке акта
+    FOR HarvestActItem h IS HarvestActItem AND act(h) IS HarvestAct AND haStatus(act(h)) = HarvestActStatus.posted DO
+        IF NOT (GROUP MAX 1 IF FactHarvest x IS FactHarvest AND fhActItem(x) = h) THEN
+            NEW nfh = FactHarvest {
+                fhField(nfh) <- hiField(h);
+                fhActItem(nfh) <- h;
+                // КФ-ДТ1: сезон факта — seasonYearOf (год ПЛАНА акта, фолбэк — год
+                // проведения): сид проводит акты текущей датой — буквальный год
+                // даты отправил бы факт-2027 в 2026 и рассинхронил витрину с
+                // FieldSeason (решение исполнителя, см. spec-work 10.10)
+                fhSeason(nfh) <- seasonYearOf(act(h));
+                fhDate(nfh) <- DATE(OVERRIDE haPostedAt(act(h)), currentDateTime());
+                // КФ-И5: культура факта — из FieldSeason (приоритет истории),
+                // фолбэк — строка акта
+                fhCropName(nfh) <- (OVERRIDE nameFsFactCrop(seasonOf(hiField(h), seasonYearOf(act(h)))), nameHiCrop(h));
+                fhGrossT(nfh) <- grossWeight(h);
+                fhNetT(nfh) <- netWeight(h);
+                fhYieldC(nfh) <- factYieldT(h) * 10.0;
+            }
+    APPLY;
+    // витрина поле × сезон (пересборка)
+    DELETE DmFieldSeason m WHERE m IS DmFieldSeason;
+    FOR Field f IS Field DO
+        NEW m = DmFieldSeason {
+            dmsField(m) <- f;
+            dmsSeason(m) <- 2027;
+            dmsOrg(m) <- organization(f);
+            dmsCropName(m) <- (OVERRIDE nameCurrentCrop(f), '—');
+            dmsAreaHa(m) <- areaHa(f);
+            dmsOps(m) <- GROUP SUM 1 IF FactFieldOp o IS FactFieldOp AND foField(o) = f;
+            dmsHarvestT(m) <- GROUP SUM fhNetT(FactHarvest h) IF fhField(h) = f;
+            dmsYieldC(m) <- etlFactYieldC(f);
+            dmsForecast(m) <- lastForecastC(f);
+        }
+    // витрина культуры (P&L из БДР)
+    DELETE DmCropPnl cp WHERE cp IS DmCropPnl;
+    FOR Crop c IS Crop AND (pnlIncome(c) OR pnlExpense(c)) DO
+        NEW ncp = DmCropPnl {
+            dcpCropName(ncp) <- nameCrop(c);
+            dcpIncome(ncp) <- pnlIncome(c);
+            dcpExpense(ncp) <- pnlExpense(c);
+            dcpMargin(ncp) <- pnlMargin(c);
+            dcpRentab(ncp) <- pnlRentab(c);
+        }
+    APPLY;
+}
+
+// диспетчеризация по наименованию конвейера (расширяемая точка ФТ5.1)
+runEtl 'Выполнить' (EtlPipeline p) {
+    IF NOT (OVERRIDE epEnabled(p), TRUE) THEN RETURN;
+    NEW r = EtlRun {
+        erPipeline(r) <- p;
+        erStarted(r) <- currentDateTime();
+        erStatus(r) <- 'Выполняется';
+    }
+    APPLY;
+    // закрываем только СВОИ запуски этого конвейера: прежде FOR по всем
+    // «Выполняется» закрывал чужие/зависшие запуски ложным результатом
+    FOR EtlRun r IS EtlRun AND erPipeline(r) = p AND erStatus(r) = 'Выполняется' DO {
+        TRY {
+            IF epName(p) = 'Суточный прогон моделирования' THEN {
+                kuSimDaily();
+                erRecords(r) <- GROUP SUM 1 IF SimTask t IS SimTask AND simStatus(t) = SimTaskStatus.done;
+                erMessage(r) <- 'Задач моделирования выполнено (всего)';
+            } ELSE IF epName(p) = 'Суточные задачи земли' THEN {
+                kuLandDaily();
+                erRecords(r) <- GROUP SUM 1 IF LeaseNotificationLog l IS LeaseNotificationLog;
+                erMessage(r) <- 'Записей в журнале уведомлений (всего)';
+            } ELSE IF epName(p) = 'Очередь загрузки файлов' THEN {
+                doImportQueued();
+                erRecords(r) <- GROUP SUM 1 IF ImportFile f IS ImportFile AND impStatus(f) = ImportStatus.done;
+                erMessage(r) <- 'Файлов загружено (всего со статусом «Завершена»)';
+            } ELSE IF epName(p) = 'Обновление витрин DWH' THEN {
+                refreshDwh();
+                erRecords(r) <- GROUP SUM 1 IF DmFieldSeason m IS DmFieldSeason;
+                erMessage(r) <- 'Строк витрины поле×сезон пересчитано';
+            } ELSE {
+                erStatus(r) <- 'Ошибка';
+                erMessage(r) <- 'Неизвестный конвейер: ' + (OVERRIDE epName(p), '—');
+            }
+            IF NOT erStatus(r) = 'Ошибка' THEN erStatus(r) <- 'Выполнено';
+            erFinished(r) <- currentDateTime();
+        } CATCH {
+            erFinished(r) <- currentDateTime();
+            erStatus(r) <- 'Ошибка';
+            erMessage(r) <- messageCaughtException();
+        }
+        kuPublish(KuEventKind.jobDone, 'EtlPipeline', (OVERRIDE epName(p), '—'),
+            (OVERRIDE erStatus(r), '') + ': ' + (OVERRIDE erMessage(r), ''));
+        APPLY;
+    }
+}
+
+runEtlAll 'Выполнить конвейеры' () {
+    FOR EtlPipeline p IS EtlPipeline DO runEtl(p);
+}
+
+apiEtlRun 'API: выполнить конвейеры' (ISTRING[60] name) {
+    FOR EtlPipeline p IS EtlPipeline AND epName(p) = name DO runEtl(p);
+    EXPORT JSON FROM
+        pipeline = epName(EtlPipeline p),
+        status = (GROUP MAX erStatus(EtlRun r) IF erPipeline(r) = p),
+        records = (GROUP MAX erRecords(EtlRun r) IF erPipeline(r) = p)
+    WHERE epName(p) = name;
+    RETURN JSONFILE(exportFile());
+}
+
+FORM etlPipeline 'Конвейер данных'
+    OBJECTS p = EtlPipeline PANEL
+    PROPERTIES (p) epName, epSource, epSourceKind, epSchedule, epEnabled
+    PROPERTIES (p) runEtl
+    OBJECTS r = EtlRun
+    PROPERTIES (r) READONLY erStarted, erFinished, erStatus, erRecords, erMessage
+    FILTERS erPipeline(r) = p
+    ORDERS erStarted(r) DESC
+    EDIT EtlPipeline OBJECT p
+;
+
+FORM etlPipelines 'Конвейеры данных'   // ФТ5.1
+    OBJECTS p = EtlPipeline
+    PROPERTIES (p) READONLY epName, nameEpSourceKind, epSource, epSchedule, epEnabled
+    PROPERTIES (p) NEWSESSION NEW, EDIT, DELETE, runEtl
+    PROPERTIES () runEtlAll
+;
+
+etlSeed () {
+    IF NOT (GROUP MAX EtlPipeline p) THEN {
+        NEW p = EtlPipeline { epName(p) <- 'Суточный прогон моделирования'; epSource(p) <- 'План агротехмероприятий + метеонормы'; epSchedule(p) <- 'ежедневно 01:00 (СТ)'; }
+        NEW p = EtlPipeline { epName(p) <- 'Суточные задачи земли'; epSource(p) <- 'Реестры договоров/уведомлений'; epSchedule(p) <- 'ежедневно 02:00 (СТ)'; }
+        NEW p = EtlPipeline { epName(p) <- 'Очередь загрузки файлов'; epSource(p) <- 'CSV-файлы: планы, NDVI, телеметрия'; epSchedule(p) <- 'по поступлению (очередь)'; }
+        NEW p = EtlPipeline { epName(p) <- 'Обновление витрин DWH'; epSource(p) <- 'Операционный контур → факты → витрины'; epSchedule(p) <- 'после загрузки данных (СТ)'; }
+        APPLY;
+    }
+    // КФ-ДТ5: типы источников (идемпотентная дозаправка живой БД)
+    FOR EtlPipeline p IS EtlPipeline AND NOT epSourceKind(p) DO {
+        IF epName(p) = 'Суточный прогон моделирования' THEN epSourceKind(p) <- 'simulation';
+        IF epName(p) = 'Суточные задачи земли' THEN epSourceKind(p) <- 'land';
+        IF epName(p) = 'Очередь загрузки файлов' THEN epSourceKind(p) <- 'files';
+        IF epName(p) = 'Обновление витрин DWH' THEN epSourceKind(p) <- 'dwh';
+    }
+    APPLY;
+}
+
+apiDwhRefresh 'API: пересчитать DWH' () {
+    refreshDwh();
+    EXPORT JSON FROM
+        dimFields = (GROUP SUM 1 IF DwhField d IS DwhField AND dfIsCurrent(d)),
+        factOps = (GROUP SUM 1 IF FactFieldOp o IS FactFieldOp),
+        factHarvest = (GROUP SUM 1 IF FactHarvest h IS FactHarvest),
+        dmRows = (GROUP SUM 1 IF DmFieldSeason m IS DmFieldSeason),
+        dmCrops = (GROUP SUM 1 IF DmCropPnl cp IS DmCropPnl);
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== Формы DWH =====================
+FORM dmFieldSeasons 'Витрина: поля × сезон'
+    OBJECTS m = DmFieldSeason
+    PROPERTIES (m) READONLY nameDmsField, dmsSeason, dmsCropName, dmsAreaHa, dmsOps, dmsHarvestT, dmsYieldC, dmsForecast
+    FILTERS dmsRlsOk(m)   // КФ-ДТ2: RLS по организации пользователя
+    PROPERTIES () refreshDwh
+;
+
+FORM dmCropPnls 'Витрина: культуры (прибыли и убытки)'
+    OBJECTS cp = DmCropPnl
+    PROPERTIES (cp) READONLY dcpCropName, dcpIncome, dcpExpense, dcpMargin, dcpRentab
+;
+
+FORM dwhFields 'Измерение: поля (SCD2)'
+    OBJECTS d = DwhField
+    PROPERTIES (d) READONLY nameDfField, dfAreaHa, dfCropName, dfSoilName, dfValidFrom, dfValidTo, dfIsCurrent
+    ORDERS dfIsCurrent(d) DESC, dfValidFrom(d) DESC
+;
+
+// ===================== Отчёты из витрин (Волна 2, шаг 4 — ТЗ 4.2.4.12, 4.2.4.16) =====================
+// Данные — из витрин DWH (dm_field_season / dm_crop_pnl) и плановых контуров
+// (МТР, севооборот); ТЗ: «не менее 90% типовых запросов — до 30 сек» (сек).
+
+// --- 4.2.4.12: план-факт структуры посевных площадей и севооборота ---
+// план га — из утверждённого севооборота (год 1); факт га — витрина сезона
+CLASS AreaPlanFact 'Строка: план-факт площадей';
+TABLE areaPlanFact (AreaPlanFact);
+apfCropName 'Культура' = DATA ISTRING[100] (AreaPlanFact) NONULL IN id;
+apfPlanHa 'План, га' = DATA NUMERIC[10,1] (AreaPlanFact);
+apfFactHa 'Факт, га' = DATA NUMERIC[10,1] (AreaPlanFact);
+apfDevHa 'Отклонение, га' (AreaPlanFact a) = (OVERRIDE apfFactHa(a), 0.0) - (OVERRIDE apfPlanHa(a), 0.0);
+apfDevPct 'Отклонение, %' (AreaPlanFact a) =
+    IF (OVERRIDE apfPlanHa(a), 0.0) > 0 THEN apfDevHa(a) * 100.0 / apfPlanHa(a);
+
+planHaByCrop (ISTRING[100] cn) =
+    GROUP SUM areaHa(Field f) IF (OVERRIDE nameCurrentCrop(f), '') = cn;
+factHaByCrop (ISTRING[100] cn) =
+    GROUP SUM dmsAreaHa(DmFieldSeason m) IF (OVERRIDE dmsCropName(m), '') = cn;
+
+currentCropUse (Crop c) = GROUP SUM 1 IF Field f IS Field AND currentCrop(f) = c;
+
+// КФ-РП1 (правка спеки 10.10): план сезона — по план-культуре Истории
+// поля (fsPlanCrop сезона); фолбэк при отсутствии истории — строки ГП
+// сезона (ppCrop). Прежний источник (currentCrop поля) — неверный: текущая
+// культура отражает только год 1 и меняется утверждением любого плана
+apfPlanHaOf (Crop c) =
+    (OVERRIDE (GROUP SUM areaHa(Field f) IF fsPlanCrop(seasonOf(f, 2027)) = c),
+        (GROUP SUM ppArea(ProdPlanItem i) IF planYear(ppPlan(i)) = 2027 AND ppCrop(i) = c));
+buildAreaPlanFact 'Пересчитать отчёт' () {
+    DELETE AreaPlanFact a WHERE a IS AreaPlanFact;
+    FOR Crop c IS Crop
+        AND (apfPlanHaOf(c) OR (GROUP MAX 1 IF DmFieldSeason m IS DmFieldSeason
+                AND dmsSeason(m) = 2027 AND (OVERRIDE dmsCropName(m), '') = nameCrop(c)))
+    DO
+        NEW a = AreaPlanFact {
+            apfCropName(a) <- nameCrop(c);
+            apfPlanHa(a) <- apfPlanHaOf(c);
+            apfFactHa(a) <- GROUP SUM dmsAreaHa(DmFieldSeason m)
+                IF dmsSeason(m) = 2027 AND (OVERRIDE dmsCropName(m), '') = nameCrop(c);
+        }
+    APPLY;
+}
+
+// --- 4.2.4.16: эффективность использования ресурсов (план-факт МТР) ---
+// план — потребность МТР из плана бюджета; факт — себестоимость статей БДР
+CLASS ResourceUseFact 'Строка: ресурс план-факт';
+TABLE resourceUseFact (ResourceUseFact);
+rufNomName 'Номенклатура' = DATA ISTRING[255] (ResourceUseFact) NONULL IN id;
+rufPlanQty 'План (потребность)' = DATA NUMERIC[14,3] (ResourceUseFact);
+rufPlanCost 'План, ₽' = DATA NUMERIC[14,2] (ResourceUseFact);
+rufUnit 'Ед.' = DATA ISTRING[20] (ResourceUseFact);
+rufDevPct 'Отклонение, %' (ResourceUseFact r) =
+    IF (OVERRIDE rufPlanCost(r), 0.0) > 0 THEN
+        ((OVERRIDE (GROUP SUM bplAmount(BudgetPLItem it) IF ciName(costItem(it)) = rufNomName(r)), 0.0)
+            - (OVERRIDE rufPlanCost(r), 0.0)) * 100.0 / rufPlanCost(r);
+
+mtrUse (Nomenclature n) = GROUP SUM 1 IF MtrPlanItem it IS MtrPlanItem AND mtrNomenclature(it) = n;
+
+buildResourceUseFact 'Пересчитать отчёт' () {
+    DELETE ResourceUseFact r WHERE r IS ResourceUseFact;
+    FOR Nomenclature n IS Nomenclature AND mtrUse(n) DO
+        NEW r = ResourceUseFact {
+            rufNomName(r) <- nomName(n);
+            rufPlanQty(r) <- GROUP SUM mtrQty(MtrPlanItem it) IF mtrNomenclature(it) = n;
+            rufPlanCost(r) <- GROUP SUM mtrQty(MtrPlanItem it) * psiPrice(itemByScenarioNom(mtrScenario(mtrPlan(it)), n))
+                IF mtrNomenclature(it) = n;
+            rufUnit(r) <- nameNomUnit(n);
+        }
+    APPLY;
+}
+
+exportAreaPlanFactXls 'Выгрузить в Excel' () ABSTRACT;
+exportResourceUseXls 'Выгрузить в Excel' () ABSTRACT;
+
+FORM areaPlanFactReport 'План-факт посевных площадей'   // ТЗ 4.2.4.12
+    OBJECTS a = AreaPlanFact
+    PROPERTIES (a) READONLY apfCropName, apfPlanHa, apfFactHa, apfDevHa, apfDevPct
+    PROPERTIES () buildAreaPlanFact
+    PROPERTIES () exportAreaPlanFactXls
+;
+
+// КФ-РП4 (ТЗ 4.2.4.14, частично): анализ урожайности поле × сезон —
+// витрина + план-урожайность Истории поля (карты с комбайнов — этап 2)
+CLASS YieldAnalysisRow 'Строка: анализ урожайности';
+TABLE yieldAnalysisRow (YieldAnalysisRow);
+yaFieldName 'Поле' = DATA ISTRING[60] (YieldAnalysisRow) NONULL IN id;
+yaPlanCrop 'Культура (план)' = DATA ISTRING[60] (YieldAnalysisRow);
+yaFactCrop 'Культура (факт)' = DATA ISTRING[60] (YieldAnalysisRow);
+yaAreaHa 'Площадь, га' = DATA NUMERIC[10,1] (YieldAnalysisRow);
+yaPlanYieldC 'План, ц/га' = DATA NUMERIC[10,2] (YieldAnalysisRow);
+yaFactYieldC 'Факт, ц/га' = DATA NUMERIC[10,2] (YieldAnalysisRow);
+yaForecastC 'Прогноз, ц/га' = DATA NUMERIC[10,2] (YieldAnalysisRow);
+yaDevPct 'Отклонение факт/план, %' (YieldAnalysisRow r) =
+    IF (OVERRIDE yaPlanYieldC(r), 0.0) > 0 AND yaFactYieldC(r) THEN
+        (yaFactYieldC(r) - yaPlanYieldC(r)) * 100.0 / yaPlanYieldC(r);
+fsPlanYieldOf (Field f, INTEGER yr) = GROUP MAX fsPlanYieldC(FieldSeason s) IF fsField(s) = f AND fsYear(s) = yr;
+
+buildYieldAnalysis 'Пересчитать отчёт' () {
+    DELETE YieldAnalysisRow r WHERE r IS YieldAnalysisRow;
+    FOR DmFieldSeason m IS DmFieldSeason AND dmsRlsOk(m) DO
+        NEW r = YieldAnalysisRow {
+            yaFieldName(r) <- (OVERRIDE nameDmsField(m), '—');
+            yaPlanCrop(r) <- (OVERRIDE nameFsPlanCrop(seasonOf(dmsField(m), dmsSeason(m))), '');
+            yaFactCrop(r) <- (OVERRIDE dmsCropName(m), '');
+            yaAreaHa(r) <- dmsAreaHa(m);
+            yaPlanYieldC(r) <- fsPlanYieldOf(dmsField(m), dmsSeason(m));
+            yaFactYieldC(r) <- dmsYieldC(m);
+            yaForecastC(r) <- dmsForecast(m);
+        }
+    APPLY;
+}
+exportYieldAnalysisXls 'Выгрузить в Excel' () ABSTRACT;
+FORM yieldAnalysisReport 'Анализ урожайности'   // ТЗ 4.2.4.14
+    OBJECTS r = YieldAnalysisRow
+    PROPERTIES (r) READONLY yaFieldName, yaPlanCrop, yaFactCrop, yaAreaHa, yaPlanYieldC, yaFactYieldC, yaForecastC, yaDevPct
+    PROPERTIES () buildYieldAnalysis
+    PROPERTIES () exportYieldAnalysisXls
+;
+
+FORM resourceUseReport 'Эффективность ресурсов'   // ТЗ 4.2.4.16
+    OBJECTS r = ResourceUseFact
+    PROPERTIES (r) READONLY rufNomName, rufUnit, rufPlanQty, rufPlanCost, rufDevPct
+    PROPERTIES () buildResourceUseFact
+    PROPERTIES () exportResourceUseXls
+;
+
+exportAreaPlanFactXls () + {
+    PRINT areaPlanFactReport XLSX SHEET 'План-факт площадей' TO exportFile;
+    open(exportFile());
+}
+exportResourceUseXls () + {
+    PRINT resourceUseReport XLSX SHEET 'Ресурсы план-факт' TO exportFile;
+    open(exportFile());
+}
+kuHomeShowReport (ISTRING[20] nm) + {
+    IF nm = 'areaplan' THEN SHOW areaPlanFactReport;
+    ELSE IF nm = 'yield' THEN SHOW yieldAnalysisReport;
+}
+
+exportYieldAnalysisXls () + {
+    PRINT yieldAnalysisReport XLSX SHEET 'Анализ урожайности' TO exportFile;
+    open(exportFile());
+}
+
+// ===================== Конструктор отчётов (Волна 2, шаг 5 — ФТ5.3 / ТЗ 4.2.4.9) =====================
+// Пользователь самостоятельно собирает отчёт: источник (витрина/факт DWH),
+// состав колонок (до 8 слотов), фильтр-подстрока; результат материализуется
+// в ReportRow и экспортируется в XLSX. Асинхронность (ТЗ: >5 сек → фон):
+// на стенде выполнение <1 сек — журналируется как задача с длительностью.
+
+CLASS ReportMart 'Источник отчёта' {
+    dmField 'Витрина: поля × сезон',
+    dmCrop 'Витрина: культуры (P&L)',
+    factHarvest 'Факт: урожай'
+}
+CLASS ReportTemplate 'Шаблон отчёта';
+TABLE reportTemplate (ReportTemplate);
+rtName 'Наименование' = DATA ISTRING[100] (ReportTemplate) NONULL IN id;
+rtMart 'Источник' = DATA ReportMart (ReportTemplate) NONULL;
+nameRtMart 'Источник' (ReportTemplate t) = staticCaption(rtMart(t));
+rtFilter 'Фильтр (содержит, регистронезависимо)' = DATA ISTRING[100] (ReportTemplate);
+// этап 1 — «Общий»; уровни доступа и снимок прав при запуске — этап 2 (спека)
+rtAccess 'Доступ' = DATA ISTRING[20] (ReportTemplate);
+rtOwner 'Автор' = DATA CustomUser (ReportTemplate);
+rtCreatedAt 'Создан' = DATA DATETIME (ReportTemplate);
+WHEN SET (ReportTemplate t IS ReportTemplate) DO {
+    rtCreatedAt(t) <- currentDateTime();
+    rtOwner(t) <- currentUser();
+    rtAccess(t) <- 'Общий';
+}
+
+CLASS ReportRow 'Строка отчёта';
+TABLE reportRow (ReportRow);
+rrTemplate 'Шаблон' = DATA ReportTemplate (ReportRow) AUTOSET;
+rrCol1 'Колонка 1' = DATA ISTRING[150] (ReportRow);
+rrCol2 'Колонка 2' = DATA ISTRING[150] (ReportRow);
+rrCol3 'Колонка 3' = DATA ISTRING[150] (ReportRow);
+rrCol4 'Колонка 4' = DATA ISTRING[150] (ReportRow);
+rrCol5 'Колонка 5' = DATA ISTRING[150] (ReportRow);
+rrCol6 'Колонка 6' = DATA ISTRING[150] (ReportRow);
+rrCol7 'Колонка 7' = DATA ISTRING[150] (ReportRow);
+rrCol8 'Колонка 8' = DATA ISTRING[150] (ReportRow);
+
+// журнал запусков (асинхронный паттерн: задача + статус + длительность)
+CLASS ReportRun 'Запуск отчёта';
+TABLE reportRun (ReportRun);
+rrtTemplate 'Шаблон' = DATA ReportTemplate (ReportRun);
+rrtStarted 'Старт' = DATA DATETIME (ReportRun) NONULL;
+rrtFinished 'Финиш' = DATA DATETIME (ReportRun);
+rrtRows 'Строк' = DATA INTEGER (ReportRun);
+rrtStatus 'Статус' = DATA ISTRING[20] (ReportRun);
+// КФ-КС3: длительность формирования, мс (разница DATETIME — секунды → мс)
+rrtDurationMs 'Длительность, мс' (ReportRun r) =
+    IF rrtFinished(r) THEN (rrtFinished(r) - rrtStarted(r)) * 1000.0;
+
+// доступные поля источника (для подсказки в конструкторе)
+CLASS MartFieldDesc 'Поле источника';
+TABLE martFieldDesc (MartFieldDesc);
+mfdMart 'Источник' = DATA ReportMart (MartFieldDesc) NONULL;
+mfdCode 'Код' = DATA ISTRING[30] (MartFieldDesc) NONULL;
+mfdCaption 'Подпись' = DATA ISTRING[60] (MartFieldDesc) NONULL;
+// КФ-КС5: единица измерения/формат — подсказка бизнес-пользователю
+mfdUnit 'Ед. изм./формат' = DATA ISTRING[20] (MartFieldDesc);
+mfdOrder '№' = DATA INTEGER (MartFieldDesc);
+
+// соответствие код→значение для витрины полей
+// round1: деление numeric даёт масштаб 30+ знаков — округляем до 0.1 (эталон FORMULA: BackfillBot.lsf)
+round1 (NUMERIC[18,6] v) = FORMULA NUMERIC[10,1] 'round($1, 1)';
+// NULL в геттерах — осознанно: пустая строка '' в веб-клиенте показывается
+// буквальным «Empty string» (дефект показа отчётов, обнаружен 03.10)
+dmFieldValue (DmFieldSeason m, ISTRING[30] fc) =
+    IF fc = 'name' THEN nameDmsField(m)
+    ELSE IF fc = 'season' THEN ('' + dmsSeason(m))
+    ELSE IF fc = 'crop' THEN dmsCropName(m)
+    ELSE IF fc = 'area' THEN ('' + dmsAreaHa(m))
+    ELSE IF fc = 'ops' THEN ('' + dmsOps(m))
+    ELSE IF fc = 'harvestT' THEN ('' + dmsHarvestT(m))
+    ELSE IF fc = 'yieldC' THEN ('' + dmsYieldC(m))
+    ELSE IF fc = 'forecast' THEN ('' + dmsForecast(m))
+    // производное поле (кредитная справка): факт / прогноз × 100; без факта — пусто
+    ELSE IF fc = 'execPct' THEN IF (OVERRIDE dmsYieldC(m), 0.0) > 0 AND dmsForecast(m) > 0 THEN
+        ('' + round1(dmsYieldC(m) * 100.0 / dmsForecast(m)));
+
+dmCropFieldValue (DmCropPnl cp, ISTRING[30] fc) =
+    IF fc = 'crop' THEN dcpCropName(cp)
+    ELSE IF fc = 'income' THEN ('' + dcpIncome(cp))
+    ELSE IF fc = 'expense' THEN ('' + dcpExpense(cp))
+    ELSE IF fc = 'margin' THEN ('' + dcpMargin(cp))
+    ELSE IF fc = 'rentab' THEN ('' + dcpRentab(cp));
+
+fhFieldValue (FactHarvest h, ISTRING[30] fc) =
+    IF fc = 'field' THEN nameFhField(h)
+    ELSE IF fc = 'date' THEN ('' + fhDate(h))
+    ELSE IF fc = 'crop' THEN fhCropName(h)
+    ELSE IF fc = 'grossT' THEN ('' + fhGrossT(h))
+    ELSE IF fc = 'netT' THEN ('' + fhNetT(h))
+    ELSE IF fc = 'yieldC' THEN ('' + fhYieldC(h));
+
+rowMatchesFilter (ReportTemplate t, ISTRING[500] concat) =
+    NOT rtFilter(t) OR concat LIKE '%' + rtFilter(t) + '%';
+
+// слоты шаблона (коды полей выбираются из справочника MartFieldDesc)
+rtCol1 'Колонка 1 (код)' = DATA ISTRING[30] (ReportTemplate);
+rtCol2 'Колонка 2 (код)' = DATA ISTRING[30] (ReportTemplate);
+rtCol3 'Колонка 3 (код)' = DATA ISTRING[30] (ReportTemplate);
+rtCol4 'Колонка 4 (код)' = DATA ISTRING[30] (ReportTemplate);
+rtCol5 'Колонка 5 (код)' = DATA ISTRING[30] (ReportTemplate);
+rtCol6 'Колонка 6 (код)' = DATA ISTRING[30] (ReportTemplate);
+rtCol7 'Колонка 7 (код)' = DATA ISTRING[30] (ReportTemplate);
+rtCol8 'Колонка 8 (код)' = DATA ISTRING[30] (ReportTemplate);
+// материализация отчёта
+runReport 'Сформировать отчёт' (ReportTemplate t) {
+    NEW rn = ReportRun {
+        rrtTemplate(rn) <- t;
+        rrtStarted(rn) <- currentDateTime();
+        rrtStatus(rn) <- 'Выполняется';
+    }
+    APPLY;
+    DELETE ReportRow r WHERE r IS ReportRow AND rrTemplate(r) = t;
+    IF rtMart(t) = ReportMart.dmField THEN
+        // КФ-КС1: RLS строк поле×сезон — организация пользователя (ДТ2)
+        FOR DmFieldSeason m IS DmFieldSeason AND dmsRlsOk(m)
+            AND rowMatchesFilter(t, (OVERRIDE nameDmsField(m), '') + ' ' + (OVERRIDE dmsCropName(m), '')) DO
+            NEW r = ReportRow {
+                rrTemplate(r) <- t;
+                rrCol1(r) <- dmFieldValue(m, rtCol1(t));
+                rrCol2(r) <- dmFieldValue(m, rtCol2(t));
+                rrCol3(r) <- dmFieldValue(m, rtCol3(t));
+                rrCol4(r) <- dmFieldValue(m, rtCol4(t));
+                rrCol5(r) <- dmFieldValue(m, rtCol5(t));
+                rrCol6(r) <- dmFieldValue(m, rtCol6(t));
+                rrCol7(r) <- dmFieldValue(m, rtCol7(t));
+                rrCol8(r) <- dmFieldValue(m, rtCol8(t));
+            }
+    IF rtMart(t) = ReportMart.dmCrop THEN
+        FOR DmCropPnl cp IS DmCropPnl AND rowMatchesFilter(t, (OVERRIDE dcpCropName(cp), '')) DO
+            NEW r = ReportRow {
+                rrTemplate(r) <- t;
+                rrCol1(r) <- dmCropFieldValue(cp, rtCol1(t));
+                rrCol2(r) <- dmCropFieldValue(cp, rtCol2(t));
+                rrCol3(r) <- dmCropFieldValue(cp, rtCol3(t));
+                rrCol4(r) <- dmCropFieldValue(cp, rtCol4(t));
+                rrCol5(r) <- dmCropFieldValue(cp, rtCol5(t));
+                rrCol6(r) <- dmCropFieldValue(cp, rtCol6(t));
+                rrCol7(r) <- dmCropFieldValue(cp, rtCol7(t));
+                rrCol8(r) <- dmCropFieldValue(cp, rtCol8(t));
+            }
+    IF rtMart(t) = ReportMart.factHarvest THEN
+        // КФ-КС1: RLS фактов — через организацию поля факта
+        FOR FactHarvest h IS FactHarvest
+            AND (NOT organization(currentUser()) OR NOT organization(fhField(h))
+                OR organization(fhField(h)) = organization(currentUser()))
+            AND rowMatchesFilter(t, (OVERRIDE nameFhField(h), '') + ' ' + (OVERRIDE fhCropName(h), '')) DO
+            NEW r = ReportRow {
+                rrTemplate(r) <- t;
+                rrCol1(r) <- fhFieldValue(h, rtCol1(t));
+                rrCol2(r) <- fhFieldValue(h, rtCol2(t));
+                rrCol3(r) <- fhFieldValue(h, rtCol3(t));
+                rrCol4(r) <- fhFieldValue(h, rtCol4(t));
+                rrCol5(r) <- fhFieldValue(h, rtCol5(t));
+                rrCol6(r) <- fhFieldValue(h, rtCol6(t));
+                rrCol7(r) <- fhFieldValue(h, rtCol7(t));
+                rrCol8(r) <- fhFieldValue(h, rtCol8(t));
+            }
+    FOR ReportRun rn IS ReportRun AND rrtTemplate(rn) = t AND rrtStatus(rn) = 'Выполняется' DO {
+        rrtRows(rn) <- GROUP SUM 1 IF ReportRow r IS ReportRow AND rrTemplate(r) = t;
+        rrtFinished(rn) <- currentDateTime();
+        rrtStatus(rn) <- 'Завершено';
+    }
+    // КФ-КС3: предупреждение при гигантском результате
+    IF (OVERRIDE (GROUP MAX rrtRows(ReportRun rn) IF rrtTemplate(rn) = t), 0) > 100000 THEN
+        MESSAGE 'Результат превышает 100 000 строк — выгрузка может быть долгой (лимиты — этап 2).';
+    kuPublish(KuEventKind.jobDone, 'ReportTemplate', (OVERRIDE rtName(t), '—'),
+        'Отчёт сформирован: ' + (OVERRIDE ('' + (GROUP SUM 1 IF ReportRow r IS ReportRow AND rrTemplate(r) = t)), '0') + ' строк');
+    APPLY;
+}
+
+col1Caption 'Колонка 1' (ReportTemplate t) = (GROUP MAX mfdCaption(MartFieldDesc d) IF mfdMart(d) = rtMart(t) AND mfdCode(d) = rtCol1(t));
+col2Caption 'Колонка 2' (ReportTemplate t) = (GROUP MAX mfdCaption(MartFieldDesc d) IF mfdMart(d) = rtMart(t) AND mfdCode(d) = rtCol2(t));
+col3Caption 'Колонка 3' (ReportTemplate t) = (GROUP MAX mfdCaption(MartFieldDesc d) IF mfdMart(d) = rtMart(t) AND mfdCode(d) = rtCol3(t));
+col4Caption 'Колонка 4' (ReportTemplate t) = (GROUP MAX mfdCaption(MartFieldDesc d) IF mfdMart(d) = rtMart(t) AND mfdCode(d) = rtCol4(t));
+col5Caption 'Колонка 5' (ReportTemplate t) = (GROUP MAX mfdCaption(MartFieldDesc d) IF mfdMart(d) = rtMart(t) AND mfdCode(d) = rtCol5(t));
+col6Caption 'Колонка 6' (ReportTemplate t) = (GROUP MAX mfdCaption(MartFieldDesc d) IF mfdMart(d) = rtMart(t) AND mfdCode(d) = rtCol6(t));
+col7Caption 'Колонка 7' (ReportTemplate t) = (GROUP MAX mfdCaption(MartFieldDesc d) IF mfdMart(d) = rtMart(t) AND mfdCode(d) = rtCol7(t));
+col8Caption 'Колонка 8' (ReportTemplate t) = (GROUP MAX mfdCaption(MartFieldDesc d) IF mfdMart(d) = rtMart(t) AND mfdCode(d) = rtCol8(t));
+
+exportReportXls 'Выгрузить в Excel' (ReportTemplate t) ABSTRACT;
+
+FORM reportConstructor 'Конструктор отчётов'   // ФТ5.3
+    OBJECTS t = ReportTemplate PANEL
+    PROPERTIES (t) rtName, rtMart, rtFilter, rtAccess
+    PROPERTIES (t) rtCol1, rtCol2, rtCol3, rtCol4, rtCol5, rtCol6, rtCol7, rtCol8
+    PROPERTIES (t) runReport, exportReportXls
+    OBJECTS d = MartFieldDesc
+    PROPERTIES (d) READONLY mfdCode, mfdCaption, mfdUnit
+    FILTERS mfdMart(d) = rtMart(t)
+    ORDERS mfdOrder(d)
+    EDIT ReportTemplate OBJECT t
+;
+
+FORM reportTemplates 'Библиотека отчётов'
+    OBJECTS t = ReportTemplate
+    PROPERTIES (t) READONLY rtName, nameRtMart, rtFilter, rtAccess, rtCreatedAt
+    PROPERTIES (t) NEWSESSION NEW, EDIT, DELETE, runReport, exportReportXls
+;
+
+EXTEND FORM reportConstructor
+    OBJECTS r = ReportRow
+    PROPERTIES (r) READONLY rrCol1, rrCol2, rrCol3, rrCol4, rrCol5, rrCol6, rrCol7, rrCol8
+    FILTERS rrTemplate(r) = t
+    OBJECTS rn = ReportRun
+    PROPERTIES (rn) READONLY rrtStarted, rrtFinished, rrtStatus, rrtRows, rrtDurationMs
+    FILTERS rrtTemplate(rn) = t
+;
+
+
+FORM reportResult 'Результат отчёта'
+    OBJECTS t = ReportTemplate PANEL
+    PROPERTIES (t) READONLY rtName, nameRtMart
+    OBJECTS r = ReportRow
+    PROPERTIES (r) READONLY rrCol1, rrCol2, rrCol3, rrCol4, rrCol5, rrCol6, rrCol7, rrCol8
+    FILTERS rrTemplate(r) = t
+;
+
+exportReportXls (ReportTemplate t) + {
+    PRINT reportResult XLSX SHEET (OVERRIDE rtName(t), 'Отчёт') TO exportFile;
+    open(exportFile());
+}
+
+
+martFieldsSeed () {
+    // КФ-КС5: единицы измерения (идемпотентная дозаправка)
+    FOR MartFieldDesc d IS MartFieldDesc AND NOT mfdUnit(d) DO {
+        IF mfdCode(d) = 'area' THEN mfdUnit(d) <- 'га';
+        IF mfdCode(d) = 'harvestT' THEN mfdUnit(d) <- 'т';
+        IF mfdCode(d) = 'yieldC' OR mfdCode(d) = 'forecast' THEN mfdUnit(d) <- 'ц/га';
+        IF mfdCode(d) = 'ops' THEN mfdUnit(d) <- 'шт';
+        IF mfdCode(d) = 'season' THEN mfdUnit(d) <- 'год';
+        IF mfdCode(d) = 'income' OR mfdCode(d) = 'expense' OR mfdCode(d) = 'margin' THEN mfdUnit(d) <- '₽';
+        IF mfdCode(d) = 'rentabPct' OR mfdCode(d) = 'rentab' THEN mfdUnit(d) <- '%';
+        IF mfdCode(d) = 'execPct' THEN mfdUnit(d) <- '%';
+        IF mfdCode(d) = 'grossT' OR mfdCode(d) = 'netT' THEN mfdUnit(d) <- 'т';
+    }
+    APPLY;
+    IF NOT (GROUP MAX MartFieldDesc d) THEN {
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmField; mfdCode(d) <- 'name'; mfdCaption(d) <- 'Поле'; mfdOrder(d) <- 1; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmField; mfdCode(d) <- 'season'; mfdCaption(d) <- 'Сезон'; mfdOrder(d) <- 2; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmField; mfdCode(d) <- 'crop'; mfdCaption(d) <- 'Культура'; mfdOrder(d) <- 3; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmField; mfdCode(d) <- 'area'; mfdCaption(d) <- 'Площадь, га'; mfdOrder(d) <- 4; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmField; mfdCode(d) <- 'ops'; mfdCaption(d) <- 'Операций'; mfdOrder(d) <- 5; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmField; mfdCode(d) <- 'harvestT'; mfdCaption(d) <- 'Убрано, т'; mfdOrder(d) <- 6; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmField; mfdCode(d) <- 'yieldC'; mfdCaption(d) <- 'Урожайность, ц/га'; mfdOrder(d) <- 7; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmField; mfdCode(d) <- 'forecast'; mfdCaption(d) <- 'Прогноз, ц/га'; mfdOrder(d) <- 8; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmCrop; mfdCode(d) <- 'crop'; mfdCaption(d) <- 'Культура'; mfdOrder(d) <- 1; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmCrop; mfdCode(d) <- 'income'; mfdCaption(d) <- 'Доход, ₽'; mfdOrder(d) <- 2; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmCrop; mfdCode(d) <- 'expense'; mfdCaption(d) <- 'Расход, ₽'; mfdOrder(d) <- 3; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmCrop; mfdCode(d) <- 'margin'; mfdCaption(d) <- 'Маржа, ₽'; mfdOrder(d) <- 4; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmCrop; mfdCode(d) <- 'rentab'; mfdCaption(d) <- 'Рентабельность, %'; mfdOrder(d) <- 5; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.factHarvest; mfdCode(d) <- 'field'; mfdCaption(d) <- 'Поле'; mfdOrder(d) <- 1; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.factHarvest; mfdCode(d) <- 'date'; mfdCaption(d) <- 'Дата'; mfdOrder(d) <- 2; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.factHarvest; mfdCode(d) <- 'crop'; mfdCaption(d) <- 'Культура'; mfdOrder(d) <- 3; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.factHarvest; mfdCode(d) <- 'grossT'; mfdCaption(d) <- 'Валовой вес, т'; mfdOrder(d) <- 4; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.factHarvest; mfdCode(d) <- 'netT'; mfdCaption(d) <- 'Зачётный вес, т'; mfdOrder(d) <- 5; }
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.factHarvest; mfdCode(d) <- 'yieldC'; mfdCaption(d) <- 'Урожайность, ц/га'; mfdOrder(d) <- 6; }
+        APPLY;
+    }
+    IF NOT (GROUP MAX ReportTemplate t) THEN {
+        NEW t = ReportTemplate {
+            rtName(t) <- 'Поля сезона (основное)';
+            rtMart(t) <- ReportMart.dmField;
+            rtCol1(t) <- 'name'; rtCol2(t) <- 'crop'; rtCol3(t) <- 'area';
+            rtCol4(t) <- 'ops'; rtCol5(t) <- 'harvestT'; rtCol6(t) <- 'forecast';
+        }
+        NEW t = ReportTemplate {
+            rtName(t) <- 'P&L по культурам';
+            rtMart(t) <- ReportMart.dmCrop;
+            rtCol1(t) <- 'crop'; rtCol2(t) <- 'income'; rtCol3(t) <- 'expense';
+            rtCol4(t) <- 'margin'; rtCol5(t) <- 'rentab';
+        }
+        APPLY;
+    }
+    // дозаполнение на уже засеянном стенде — свои гварды по коду/имени
+    IF NOT (GROUP MAX MartFieldDesc d IF mfdMart(d) = ReportMart.dmField AND mfdCode(d) = 'execPct') THEN {
+        NEW d = MartFieldDesc { mfdMart(d) <- ReportMart.dmField; mfdCode(d) <- 'execPct'; mfdCaption(d) <- 'Исполнение прогноза, %'; mfdOrder(d) <- 9; }
+        APPLY;
+    }
+    // «Кредитная справка: поля заёмщика» (docs/11-demo-scenarios.md Б7):
+    // производственный паспорт портфеля полей для кредитного комитета
+    IF NOT (GROUP MAX ReportTemplate t IF rtName(t) = 'Кредитная справка: поля заёмщика') THEN {
+        NEW t = ReportTemplate {
+            rtName(t) <- 'Кредитная справка: поля заёмщика';
+            rtMart(t) <- ReportMart.dmField;
+            rtCol1(t) <- 'name'; rtCol2(t) <- 'crop'; rtCol3(t) <- 'area';
+            rtCol4(t) <- 'forecast'; rtCol5(t) <- 'yieldC'; rtCol6(t) <- 'execPct'; rtCol7(t) <- 'harvestT';
+        }
+        APPLY;
+    }
+}
+
+// C2: async-контракт (202-паттерн этапа 2 — прототип синхронный <1 сек)
+apiReportRunAsync 'API: отчёт (async-контракт)' (ISTRING[100] name) {
+    FOR ReportTemplate t IS ReportTemplate AND rtName(t) = name DO runReport(t);
+    EXPORT JSON FROM
+        template = rtName(ReportTemplate t),
+        rows = (GROUP SUM 1 IF ReportRow r IS ReportRow AND rrTemplate(r) = t),
+        durationMs = (GROUP MAX rrtDurationMs(ReportRun rn) IF rrtTemplate(rn) = t)
+    WHERE rtName(t) = name;
+    RETURN JSONFILE(exportFile());
+}
+apiReportRun 'API: сформировать отчёт' (ISTRING[100] name) {
+    FOR ReportTemplate t IS ReportTemplate AND rtName(t) = name DO runReport(t);
+    EXPORT JSON FROM
+        template = rtName(ReportTemplate t),
+        rows = (GROUP SUM 1 IF ReportRow r IS ReportRow AND rrTemplate(r) = t)
+    WHERE rtName(t) = name;
+    RETURN JSONFILE(exportFile());
+}
+
+// горячие фильтры DWH (дедуп фактов, roll SCD2, пересборка витрин); в конце
+// модуля — после объявления всех индексируемых свойств
+INDEX dfField(DwhField d), dfIsCurrent(d);
+INDEX foOperation(FactFieldOp o);
+INDEX fhActItem(FactHarvest h);
+INDEX dmsField(DmFieldSeason m);
+INDEX ireImport(ImportRowError e);
+INDEX rrTemplate(ReportRow r);
+INDEX erPipeline(EtlRun r);
+
+// КФ-ДТ8: горячий индекс витрины (RLS-фильтр по организации) — по правилу
+// «INDEX после объявлений» в конце модуля
+INDEX dmsField(DmFieldSeason m), dmsOrg(m);

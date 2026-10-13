@@ -1,0 +1,589 @@
+MODULE KuAnalytics;
+
+// Код Урожая: аналитические панели (ПМИ КП08) + дашборд «сегодня» (UI-002)
+// и глоссарий (UI-702). Спецификация: docs/03-logic-KuAnalytics.md.
+REQUIRE KuLand, KuRotation, KuProdPlan, KuBudget, KuYield, KuSimulation, KuIntegration, KuKnpApi;
+
+NAMESPACE Ku;
+
+// ===================== Агрегаты «сегодня» =====================
+kuFieldsTotal 'Полей' () = GROUP SUM 1 IF Field f IS Field;
+kuAreaTotal 'Площадь, га' () = GROUP SUM areaHa(Field f);
+kuPlotsLeased 'Участков в аренде' () = GROUP SUM 1 IF LandPlot p IS LandPlot AND plotStatus(p) = PlotStatus.leased;
+kuRentBalance 'Сальдо аренды, ₽' () = GROUP SUM balanceContract(LeaseContract c);
+kuContractsExpiring 'Договоров истекает' () =
+    GROUP SUM 1 IF LeaseContract c IS LeaseContract AND contractStatus(c) = LeaseContractStatus.active
+        AND dateTo(c) < currentDate() + 90;
+kuPlansDraft 'Планов севооборота (черновики)' () = GROUP SUM 1 IF RotationPlan p IS RotationPlan AND planStatus(p) = RotationPlanStatus.draft;
+kuPlansViolations 'Критических нарушений' () = GROUP SUM 1 IF RotationViolation v IS RotationViolation AND severity(v) = Severity.critical;
+kuMargin 'Маржа БДР, ₽' () = GROUP SUM margin(BudgetPL b) IF bplStatus(b) = DocCalcStatus.approved; // только утверждённые: стресс-БДР (черновик) не портит сводку
+kuSimActive 'Прогнозов активно' () = GROUP SUM 1 IF SimResult r IS SimResult AND resultStatus(r) = SimResultStatus.active;
+kuRecommendations 'Рекомендаций новых' () = GROUP SUM 1 IF CorrectionRecommendation x IS CorrectionRecommendation AND crStatus(x) = RecommendationStatus.newR;
+kuContractsActive 'Договоров действует' () = GROUP SUM 1 IF LeaseContract c IS LeaseContract AND contractStatus(c) = LeaseContractStatus.active;
+kuTechCardsApproved 'ТК утверждено' () = GROUP SUM 1 IF TechCard c IS TechCard AND cardStatus(c) = TechCardStatus.approved;
+hthStressEvents 'Событий «Выявлен стресс»' () = GROUP SUM 1 IF eventKind(KuEvent e) = KuEventKind.stressDetected;
+
+
+// ===================== Сквозной процесс: статусы шагов =====================
+// docs/07-process.md: 9 шагов сезонного цикла, каждый — вычисляемый статус
+stepLandReady () = (GROUP SUM 1 IF Field f IS Field AND areaHa(f) > 0 AND organization(f) IS Organization) > 0;
+stepRotationReady () = (GROUP SUM 1 IF RotationPlan p IS RotationPlan AND planStatus(p) = RotationPlanStatus.approved) > 0;
+stepTechCardReady () = (GROUP SUM 1 IF TechCard c IS TechCard AND cardStatus(c) = TechCardStatus.approved AND opCount(c) > 0) > 0;
+stepProdPlanReady () = (GROUP SUM 1 IF ProdPlan p IS ProdPlan AND ppStatus(p) = ProdPlanStatus.approvedG AND itemsNoCard(p) = 0) > 0;
+stepBudgetReady () = (GROUP SUM 1 IF BudgetPL b IS BudgetPL AND bplStatus(b) = DocCalcStatus.approved) > 0;
+stepNpkReady () = (GROUP SUM 1 IF ComplexPlan c IS ComplexPlan AND ypStatus(c) = YieldPlanStatus.approvedY) > 0;
+stepForecastReady () = (GROUP SUM 1 IF SimResult r IS SimResult AND resultStatus(r) = SimResultStatus.active) > 0;
+stepHarvestReady () = (GROUP SUM 1 IF HarvestAct a IS HarvestAct AND haStatus(a) = HarvestActStatus.posted) > 0;
+stepCycleClosed () = (GROUP SUM 1 IF Field f IS Field AND lastCrop(f) IS Crop) > 0;
+
+// какой шаг следующий (первый незавершённый)
+stepName (INTEGER n) = CASE WHEN n = 1 THEN 'Земля: заведите участки и поля'
+    WHEN n = 2 THEN 'Севооборот: создайте и утвердите план'
+    WHEN n = 3 THEN 'Техкарты: подготовьте технологию'
+    WHEN n = 4 THEN 'Годовой план: назначьте ТК полям'
+    WHEN n = 5 THEN 'Бюджет: рассчитайте МТР/БДР/БДДС'
+    WHEN n = 6 THEN 'NPK: запрограммируйте урожай'
+    WHEN n = 7 THEN 'Прогноз: запустите симуляцию'
+    WHEN n = 8 THEN 'Уборка: проведите акт урожая'
+    WHEN n = 9 THEN 'Замыкание: обновите поля фактом'
+    ELSE 'готово';
+
+processGroup (STRING label) =
+    '<span style="display:inline-block;padding:3px 6px 3px 0;font-size:10px;font-weight:700;'
+    + 'color:#8a93a0;letter-spacing:0.4px;text-transform:uppercase">' + label + '</span>';
+processChip (STRING label, BOOLEAN done) =
+    '<span style="display:inline-block;padding:3px 8px;border-radius:10px;font-size:11px;'
+    + 'background:' + (IF done THEN '#1f9d6b' ELSE '#e8e8e8') + ';'
+    + 'color:' + (IF done THEN '#fff' ELSE '#555') + '">'
+    + (IF done THEN '✓ ' ELSE '○ ') + label + '</span>';
+
+stepCurrent () =
+    IF NOT stepLandReady() THEN 1
+    ELSE IF NOT stepRotationReady() THEN 2
+    ELSE IF NOT stepTechCardReady() THEN 3
+    ELSE IF NOT stepProdPlanReady() THEN 4
+    ELSE IF NOT stepBudgetReady() THEN 5
+    ELSE IF NOT stepNpkReady() THEN 6
+    ELSE IF NOT stepForecastReady() THEN 7
+    ELSE IF NOT stepHarvestReady() THEN 8
+    ELSE IF NOT stepCycleClosed() THEN 9
+    ELSE 0;   // всё готово
+
+// Снапшоты панелей дашборда: gigantское HTML-выражение в одном SQL даёт
+// декартово произведение подзапросов всех карточек и запрос на 10+ минут
+// (SQL-взрыв, 00-context §5.1; урок 03.10.2026). Значения читаются мелкими
+// запросами в действии, конкатенация — императивно (эталон: Agro.lsf).
+processSnapshot = DATA TEXT ();
+kuHomeSnapshot = DATA TEXT ();
+// Плоский снапшот для CUSTOM-компонента kuhome (карточки + датасеты ECharts).
+// Транспорт как у карты: секции через ||, строки через ~, поля через ^
+// (JSON на сервере не строится: фигурные скобки — маркеры локализации).
+kuHomeData = DATA TEXT ();   // подпись пуста: заголовок формы достаточен (замечание UI-обзор п.2)
+
+// датасеты графиков (данные из БД, конвейер DWH и операционные контуры)
+bdrIncomeM 'Доход по месяцу, ₽' (INTEGER m) = GROUP SUM bplAmount(BudgetPLItem it)
+    IF bplStatus(budgetPL(it)) = DocCalcStatus.approved AND bplMonth(it) = m AND ciKind(costItem(it)) = CostItemKind.income;
+bdrExpenseM 'Расход по месяцу, ₽' (INTEGER m) = GROUP SUM bplAmount(BudgetPLItem it)
+    IF bplStatus(budgetPL(it)) = DocCalcStatus.approved AND bplMonth(it) = m AND ciKind(costItem(it)) = CostItemKind.expense;
+// структура расходов БДР по статьям (для пирога дашборда): в демо-данных
+// первый год плана однокультурный, а статьи затрат всегда разнообразны
+dashCostByItem 'Расход по статье, ₽' (CostItem ci) = GROUP SUM bplAmount(BudgetPLItem it)
+    IF bplStatus(budgetPL(it)) = DocCalcStatus.approved AND costItem(it) = ci AND ciKind(ci) = CostItemKind.expense;
+kuRecyclingCount 'Расчётов переработки' () = GROUP SUM 1 IF RecyclingCalc r IS RecyclingCalc;
+heroResult () = GROUP MAX SimResult r
+    IF resultStatus(r) = SimResultStatus.active AND forecastKind(r) = ForecastKind.basic AND simField(simTask(r)) = fieldByCode('KH-001');
+
+// HTML-виджет: горизонтальная полоса статусов
+processHtml 'Сезонный цикл' () = HTML(
+    (OVERRIDE processSnapshot(), '<div style="font-family:sans-serif;color:#8a93a0;padding:12px 14px">Сезонный цикл: нажмите «Обновить сводку»</div>'));
+
+
+
+// ===================== КП08: выполнение плана по уборке =====================
+harvestPlanArea 'План уборки, га' () = GROUP SUM ppArea(ProdPlanItem pi);
+harvestFactArea 'Факт уборки, га' () = GROUP SUM areaHa(Field f)
+    IF (GROUP MAX 1 IF hiField(HarvestActItem h) = f AND haStatus(act(h)) = HarvestActStatus.posted);
+harvestPlanTon 'План, т' () = GROUP SUM targetYield(ppCrop(pi)) / 10.0 * ppArea(pi);
+harvestFactTon 'Факт, т' () = GROUP SUM netWeight(HarvestActItem h) IF haStatus(act(h)) = HarvestActStatus.posted;
+harvestPct '% уборки (га)' () = IF harvestPlanArea() THEN harvestFactArea() / harvestPlanArea() * 100.0;
+
+harvestHtml 'Уборка: план/факт' () = HTML(
+    '<div style="font-family:sans-serif;padding:12px 14px">'
+  + '<div style="font-size:15px;font-weight:700;margin-bottom:10px">Выполнение плана по уборке</div>'
+  + '<div style="display:flex;gap:20px;flex-wrap:wrap">'
+    + '<div><div style="font-size:11px;color:#8a93a0">План, га</div><div style="font-size:22px;font-weight:800">' + (OVERRIDE ('' + INTEGER(harvestPlanArea())), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Факт, га</div><div style="font-size:22px;font-weight:800;color:#2b6cb0">' + (OVERRIDE ('' + INTEGER(harvestFactArea())), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">План, т</div><div style="font-size:22px;font-weight:800">' + (OVERRIDE ('' + INTEGER(harvestPlanTon())), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Факт, т</div><div style="font-size:22px;font-weight:800;color:#2b6cb0">' + (OVERRIDE ('' + INTEGER(harvestFactTon())), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Убрано</div><div style="font-size:22px;font-weight:800;color:#1f9d6b">' + (OVERRIDE ('' + INTEGER(harvestPct())), '0') + ' %</div></div>'
+  + '</div></div>');
+
+fieldHarvestPlan 'План, га' (Field f) = GROUP SUM ppArea(ProdPlanItem pi) IF ppField(pi) = f;
+fieldHarvestFact 'Факт, т' (Field f) = GROUP SUM netWeight(HarvestActItem h) IF hiField(h) = f AND haStatus(act(h)) = HarvestActStatus.posted;
+fieldHarvestDone 'Убрано' (Field f) = GROUP MAX 1 IF hiField(HarvestActItem h) = f AND haStatus(act(h)) = HarvestActStatus.posted;
+
+FORM harvestProgress 'Уборка: план/факт'
+    PROPERTIES () harvestHtml
+    OBJECTS f = Field
+    PROPERTIES (f) READONLY name, fieldHarvestPlan, fieldHarvestFact, fieldHarvestDone
+    FILTERS fieldHarvestPlan(f)
+;
+
+// ===================== КП08: P&L по культурам =====================
+baseBpl () = GROUP MAX BudgetPL b IF bplStatus(b) = DocCalcStatus.approved;
+baseBplScenarioP () = GROUP MAX PriceScenario s IF (GROUP MAX 1 IF PriceScenarioItem it IS PriceScenarioItem AND scenario(it) = s) AND s IS PriceScenario;
+bplScenarioOf () = OVERRIDE (GROUP MAX bplScenario(BudgetPL b) IF bplStatus(b) = DocCalcStatus.approved), (GROUP MAX PriceScenario s IF psStatus(s) = PriceScenarioStatus.approved);
+
+// именованный флаг: джойн статуса БДР прямо в IF pnlIncome разрастал дерево
+// запроса во вложенных агрегатах — компиляция при старте падала с 4 до 36 минут
+bplIncomeApproved (BudgetPLItem it) = ciKind(costItem(it)) = CostItemKind.income
+    AND bplStatus(budgetPL(it)) = DocCalcStatus.approved;   // A3: только approved БДР (регресс 03.10 №4)
+pnlIncome 'Доход, ₽' (Crop c) = GROUP SUM bplAmount(BudgetPLItem it)
+    IF bplCrop(it) = c AND bplIncomeApproved(it);
+pnlMatExpense 'Материалы, ₽' (Crop c) = GROUP SUM matRate(OperationMaterial m) * ppArea(ProdPlanItem pi) * (OVERRIDE priceOf(bplScenarioOf(), nomenclature(m)), 0.0)
+    IF ppCrop(pi) = c AND techCard(pi) IS TechCard AND card(operation(m)) = techCard(pi);
+pnlFuelExpense 'ГСМ, ₽' (Crop c) = GROUP SUM fuelRate(OperationFuel f2) * ppArea(ProdPlanItem pi) * (OVERRIDE priceOf(bplScenarioOf(), fuelNomenclature(f2)), 0.0)
+    IF ppCrop(pi) = c AND techCard(pi) IS TechCard AND card(operation(f2)) = techCard(pi);
+pnlLaborExpense 'ФОТ, ₽' (Crop c) = GROUP SUM timeRate(OperationLabor l) * (OVERRIDE baseRate(profession(l)), 500.0) * ppArea(ProdPlanItem pi)   // КФ-П1
+    IF ppCrop(pi) = c AND techCard(pi) IS TechCard AND card(operation(l)) = techCard(pi);
+pnlExpense 'Расход, ₽' (Crop c) = pnlMatExpense(c) + pnlFuelExpense(c) + pnlLaborExpense(c);
+pnlMargin 'Маржа, ₽' (Crop c) = pnlIncome(c) - pnlExpense(c);
+pnlRentab 'Рентабельность, %' (Crop c) = IF pnlIncome(c) THEN pnlMargin(c) / pnlIncome(c) * 100.0;
+// КФ-РП2: плановый доход культуры — ГП сезона × цена продукции
+// approved-сценария; план-рентабельность — против расхода витрины (допущение)
+approvedProdPriceOf (Crop c) =
+    OVERRIDE (GROUP MAX priceOf(PriceScenario s, Nomenclature n)
+        IF psStatus(s) = PriceScenarioStatus.approved AND nomType(n) = NomType.product AND prodCrop(n) = c), 0.0;
+planIncomeOf 'План: доход, ₽' (Crop c) =
+    GROUP SUM ppVolume(ProdPlanItem i) * approvedProdPriceOf(c)
+        IF ppCrop(i) = c AND planYear(ppPlan(i)) = 2027 AND ppStatus(ppPlan(i)) = ProdPlanStatus.approvedG;
+planRentabOf 'План: рентабельность, %' (Crop c) =
+    IF planIncomeOf(c) THEN (planIncomeOf(c) - (OVERRIDE pnlExpense(c), 0.0)) / planIncomeOf(c) * 100.0;
+kuIncomeTotal 'Доход по плану, ₽' () = GROUP SUM bplAmount(BudgetPLItem it)
+    IF bplCrop(it) AND bplIncomeApproved(it);   // выпрямлено из GROUP SUM pnlIncome(Crop) — убран уровень вложенности агрегатов
+
+FORM cropPnL 'Прибыли и убытки по культурам'
+    OBJECTS c = Crop
+    PROPERTIES (c) READONLY name, pnlIncome, pnlMatExpense, pnlFuelExpense, pnlLaborExpense, pnlExpense, pnlMargin, pnlRentab
+    FILTERS pnlIncome(c) OR pnlExpense(c)
+    ORDERS pnlRentab(c) DESC
+;
+
+// ===================== КП08: структура себестоимости =====================
+ciExpense 'Расход, ₽' (CostItem ci) = GROUP SUM bplAmount(BudgetPLItem it) IF costItem(it) = ci AND ciKind(ci) = CostItemKind.expense;
+ciIncomeTotal 'Доход, ₽' (CostItem ci) = GROUP SUM bplAmount(BudgetPLItem it) IF costItem(it) = ci AND ciKind(ci) = CostItemKind.income;
+// КП08: сравнение с предыдущим сезоном
+ciPrevDelta 'Δ к пред. сезону, %' (CostItem ci) =
+    IF prevSeasonCost(ci) AND (ciExpense(ci) OR ciIncomeTotal(ci))
+    THEN ((OVERRIDE ciExpense(ci), ciIncomeTotal(ci)) - prevSeasonCost(ci)) * 100.0 / prevSeasonCost(ci);
+
+FORM costStructure 'Себестоимость по статьям'
+    OBJECTS ci = CostItem
+    PROPERTIES (ci) READONLY ciName, ciGroup, ciExpense, ciIncomeTotal, prevSeasonCost, ciPrevDelta
+    FILTERS ciExpense(ci) OR ciIncomeTotal(ci)
+;
+
+// ===================== КП08: полевые работы (техника) =====================
+// простой техники: доля маршрутных заданий в статусе «Ожидает синхронизации»
+fleetTasksTotal 'Заданий всего' () = GROUP SUM 1 IF RoutingTask t IS RoutingTask AND rtStatus(t) != RoutingTaskStatus.cancelledT;
+fleetTasksIdle 'Ожидают (простой)' () = GROUP SUM 1 IF RoutingTask t IS RoutingTask AND rtStatus(t) = RoutingTaskStatus.awaitingT;
+fleetIdlePct 'Простой техники, %' () = IF fleetTasksTotal() > 0 THEN 100.0 * fleetTasksIdle() / fleetTasksTotal() ELSE 0.0;
+
+// ===================== ECharts: графики аналитики (Волна 5) =====================
+// Снапшот kudash.js: PNL (культура^доход^расход^маржа^рентабельность),
+// HARVEST (поле^план га^факт т), COSTS (статья^расход). Сбор императивный
+// (SQL-взрыв предупреждён — kuHome); обновление кнопкой.
+kuDashData 'Данные графиков' = DATA TEXT ();
+// снапшот обновляется действием (TTL-кэш — этап 2)
+refreshKuDash 'Обновить графики' () {
+    kuDashData() <- '';
+    // КФ-РП2: рядом с фактом — план (доход из ГП×цена approved-сценария;
+    // плановый расход по культурам в БДР не размечен — маржа плана против
+    // фактического расхода витрины, допущение этапа 1)
+    FOR Crop c IS Crop AND (pnlIncome(c) OR pnlExpense(c)) ORDER pnlRentab(c) DO
+        kuDashData() <- (OVERRIDE kuDashData(), '') + '||PNL~' + (OVERRIDE name(c), '—')
+            + '^' + (OVERRIDE ('' + pnlIncome(c)), '0')
+            + '^' + (OVERRIDE ('' + pnlExpense(c)), '0')
+            + '^' + (OVERRIDE ('' + pnlMargin(c)), '0')
+            + '^' + (OVERRIDE ('' + pnlRentab(c)), '0')
+            + '^' + (OVERRIDE ('' + planIncomeOf(c)), '0')
+            + '^' + (OVERRIDE ('' + planRentabOf(c)), '0');
+    FOR Field f IS Field AND fieldHarvestPlan(f) ORDER name(f) DO
+        kuDashData() <- (OVERRIDE kuDashData(), '') + '||HARVEST~' + (OVERRIDE name(f), '—')
+            + '^' + (OVERRIDE ('' + fieldHarvestPlan(f)), '0')
+            + '^' + (OVERRIDE ('' + fieldHarvestFact(f)), '0');
+    FOR CostItem ci IS CostItem AND ciExpense(ci) ORDER ciExpense(ci) DO
+        kuDashData() <- (OVERRIDE kuDashData(), '') + '||COSTS~' + (OVERRIDE ciName(ci), '—')
+            + '^' + (OVERRIDE ('' + ciExpense(ci)), '0');
+    APPLY;
+}
+
+FORM kuDash 'Аналитика (графики ECharts)'
+    PROPERTIES () kuDashData CUSTOM 'kudash'
+    PROPERTIES () refreshKuDash
+;
+
+// C1.6: данные для ECharts-графика флота (снапшот — паттерн kuDashData)
+fleetChartData 'Данные графика флота' = DATA TEXT ();
+refreshFleetChart 'Обновить график флота' () {
+    fleetChartData() <- '';
+    // статусы заданий: запланировано/ожидает/отменено
+    fleetChartData() <- (OVERRIDE fleetChartData(), '') + '~Планируется^' + ('' + (OVERRIDE (GROUP SUM 1 IF RoutingTask t IS RoutingTask AND rtStatus(t) = RoutingTaskStatus.plannedT), 0));
+    fleetChartData() <- (OVERRIDE fleetChartData(), '') + '~Ожидает^' + ('' + (OVERRIDE (GROUP SUM 1 IF RoutingTask t IS RoutingTask AND rtStatus(t) = RoutingTaskStatus.awaitingT), 0));
+    fleetChartData() <- (OVERRIDE fleetChartData(), '') + '~Отменено^' + ('' + (OVERRIDE (GROUP SUM 1 IF RoutingTask t IS RoutingTask AND rtStatus(t) = RoutingTaskStatus.cancelledT), 0));
+    APPLY;
+}
+FORM fleetPanel 'Полевые работы (техника)'
+    PROPERTIES () READONLY fleetTasksTotal, fleetTasksIdle, fleetIdlePct
+    PROPERTIES () fleetChartData CUSTOM 'kudash'
+    PROPERTIES () refreshFleetChart
+    OBJECTS so = SeasonalOperation
+    PROPERTIES (so) READONLY soSeq, nameSoWorkType, soPlannedDate
+    OBJECTS rt = RoutingTask
+    PROPERTIES (rt) READONLY equipmentId, equipmentKind, nameRtStatus
+    PROPERTIES (rt) READONLY nameRtTask, nameRtTaskStatus, rtTaskDeadline
+    PROPERTIES () kuWeatherHoldTasks
+    OBJECTS rs = RoutingStep
+    PROPERTIES (rs) READONLY nameRsField, rsWorkType, startTime, endTime, expectedVolume
+    FILTERS routingTask(rs) = rt
+;
+
+// ===================== Глоссарий (UI-702, полноценный справочник) =====================
+// Состав атрибутов — схема экранных форм v2.0: термин, аббревиатура,
+// английский эквивалент, определение, пример, связанные термины
+CLASS GlossaryTerm 'Термин глоссария';
+TABLE glossaryTerm (GlossaryTerm);
+gtTerm 'Термин' = DATA ISTRING[100] (GlossaryTerm) NONULL IN id;
+gtAbbreviation 'Аббревиатура' = DATA ISTRING[24] (GlossaryTerm);
+gtEng 'Английский эквивалент' = DATA ISTRING[100] (GlossaryTerm);
+gtDefinition 'Определение' = DATA TEXT (GlossaryTerm) NONULL;
+gtExample 'Пример использования' = DATA TEXT (GlossaryTerm);
+gtRelated 'Связанные термины' = DATA ISTRING[200] (GlossaryTerm);
+
+FORM kuGlossary 'Глоссарий'   // UI-702
+    OBJECTS g = GlossaryTerm
+    PROPERTIES (g) READONLY gtTerm, gtAbbreviation, gtEng, gtDefinition
+    PROPERTIES (g) NEWSESSION NEW, EDIT, DELETE
+    ORDERS gtTerm(g)
+;
+DESIGN kuGlossary {
+    PROPERTY(gtTerm(g)) { charWidth = 18; }
+    PROPERTY(gtDefinition(g)) { charWidth = 90; }
+}
+
+glossarySeed () {
+    IF NOT (GROUP MAX GlossaryTerm g) THEN {
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Акт учёта урожая'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Harvest Record'; gtDefinition(g) <- 'Документ фиксации фактической уборки: валовой вес, влажность, сорность; зачётный вес и урожайность рассчитываются системой (ФТ1.6).'; gtExample(g) <- 'АУ-2027-0001 по полю KH-001: 612 т валового веса при влажности 14%.'; gtRelated(g) <- 'Зачётный вес, Урожайность'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Баланс питательных веществ (NPK)'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Nutrient Balance'; gtDefinition(g) <- 'Балансовый метод расчёта доз удобрений: вынос с урожаем минус запас почвы с учётом коэффициентов усвоения (ФТ4.1.1).'; gtExample(g) <- 'Д = (В×У - Пз×Кп) / Куд.'; gtRelated(g) <- 'Действующее вещество, Комплексный план'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'БДР'; gtAbbreviation(g) <- 'БДР'; gtEng(g) <- 'P&L Budget'; gtDefinition(g) <- 'Бюджет доходов и расходов — плановые доходы и расходы по статьям и месяцам (ФТ1.5.1).'; gtExample(g) <- 'Статья «Семена», май — 780 000 ₽.'; gtRelated(g) <- 'БДДС, Сценарий цен'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'БДДС'; gtAbbreviation(g) <- 'БДДС'; gtEng(g) <- 'Cash Flow Budget'; gtDefinition(g) <- 'Бюджет движения денежных средств — помесячный график поступлений и выплат с учётом условий оплаты (ФТ1.5.1).'; gtExample(g) <- 'Отсрочка платежа 30 дней сдвигает выплату за удобрения на месяц.'; gtRelated(g) <- 'БДР, Условия оплаты'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Действующее вещество'; gtAbbreviation(g) <- 'д.в.'; gtEng(g) <- 'Active Ingredient'; gtDefinition(g) <- 'Количество питательного вещества (N, P, K) в удобрении; пересчёт физической дозы ведётся через массовую долю д.в.'; gtExample(g) <- 'Карбамид 46% д.в.: 100 кг = 46 кг N.'; gtRelated(g) <- 'Баланс NPK'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Зачётный вес'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Conditioned Weight'; gtDefinition(g) <- 'Вес продукции, приведённый к базисной влажности и сорности (ФТ1.6.2).'; gtExample(g) <- 'Валовой 612 т × (1 - (18-14)/100) при базисе 14%.'; gtRelated(g) <- 'Акт учёта урожая'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Земельный участок'; gtAbbreviation(g) <- 'ЗУ'; gtEng(g) <- 'Land Parcel'; gtDefinition(g) <- 'Юридическая единица с кадастровым номером и правовым статусом (ФТ3.1).'; gtExample(g) <- '23:34:010101:101, статус «В аренде».'; gtRelated(g) <- 'Кадастровый номер, Поле, Состав поля'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Кадастровый номер'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Cadastral Number'; gtDefinition(g) <- 'Уникальный номер участка в ЕГРН формата XX:XX:XXXXXX:XXX; проверяется ФЛК при вводе (ФТ3.1).'; gtExample(g) <- '77:01:0001001:123.'; gtRelated(g) <- 'Земельный участок'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Комплексный план'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Complex Plan'; gtDefinition(g) <- 'Документ интерактивного программирования урожая: поле, культура, целевая урожайность, дозы NPK, экономика (ФТ4.1).'; gtExample(g) <- 'KH-001, пшеница озимая, 65 ц/га, маржа 34%.'; gtRelated(g) <- 'Сезонная техкарта, Баланс NPK'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Культура'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Crop'; gtDefinition(g) <- 'Элемент НСИ с агрономическими атрибутами и правилами севооборота: период возврата, допустимые/запрещённые предшественники (ФТ1.1.1).'; gtExample(g) <- 'ЗЕР-001 Пшеница озимая, возврат 2 года.'; gtRelated(g) <- 'Севооборот, Предшественник'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'План севооборота'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Crop Rotation Plan'; gtDefinition(g) <- 'Матрица «поля × годы» на горизонт до 5 лет с валидацией правил и версионированием (ФТ1.1).'; gtExample(g) <- 'СС-2027-1, горизонт 5 лет, версия 2.'; gtRelated(g) <- 'Культура, Период возврата'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Поле'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Field'; gtDefinition(g) <- 'Агрономическая производственная единица с геометрией, почвой и историей севооборота; связана с ЗУ через «Состав поля».'; gtExample(g) <- 'KH-001 «Северное-1», 120 га, чернозём.'; gtRelated(g) <- 'Земельный участок, Состав поля'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Предшественник'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Predecessor Crop'; gtDefinition(g) <- 'Культура, выращенная на поле до текущей; правила допустимости задаются в справочнике культур.'; gtExample(g) <- 'Пшеница после чистого пара — допустимо.'; gtRelated(g) <- 'Севооборот, Культура'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Сезонная технологическая карта'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Seasonal Tech Card'; gtDefinition(g) <- 'Календарный план операций конкретного поля, сгенерированный из шаблона ТК с разбивкой доз по фенофазам BBCH (ФТ4.1.3).'; gtExample(g) <- '8 операций: 30% N до посева, 40% в кущение, 30% в трубку.'; gtRelated(g) <- 'Технологическая карта, Комплексный план'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Состав поля'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Field Composition'; gtDefinition(g) <- 'Связь «поле ↔ земельный участок» многие-к-многим с долей вхождения (примечания к справочникам, спецификация v2.0).'; gtExample(g) <- 'Поле «Северное-1» включает участок 23:34:010101:101.'; gtRelated(g) <- 'Поле, Земельный участок'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Сценарий цен'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Price Scenario'; gtDefinition(g) <- 'Версионированный набор цен на МТР и продукцию для расчёта бюджетов; создаётся копированием с коэффициентом (ФТ1.4).'; gtExample(g) <- '«Базовый 2027» → «Оптимистичный» × 1.1.'; gtRelated(g) <- 'БДР, БДДС'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Сумма активных температур'; gtAbbreviation(g) <- 'САТ, GDD'; gtEng(g) <- 'Growing Degree Days'; gtDefinition(g) <- 'Накопленная температура выше базовой за период вегетации; движок модельного времени прогноза роста (ФТ2.3).'; gtExample(g) <- 'Пшеница: базовая 8°C, до уборки ~1500 °C·дн.'; gtRelated(g) <- 'Модель KuGDD, Фенологическая стадия'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Технологическая карта'; gtAbbreviation(g) <- 'ТК'; gtEng(g) <- 'Technology Card'; gtDefinition(g) <- 'Типовой набор операций с нормами МТР, ГСМ и трудозатрат для культуры; версионированная библиотека (ФТ1.2).'; gtExample(g) <- '«Пшеница озимая — интенсивная», 12 операций.'; gtRelated(g) <- 'Годовой производственный план'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Файл-предписание'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Prescription File'; gtDefinition(g) <- 'Пространственное задание для бортового компьютера техники: зоны поля с дифференцированными дозами (ФТ4.1.4).'; gtExample(g) <- '3 зоны по NDVI: 120/150/180 кг д.в. N на га.'; gtRelated(g) <- 'Дифференцированное внесение'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Фенологическая стадия'; gtAbbreviation(g) <- 'BBCH'; gtEng(g) <- 'Phenological Stage'; gtDefinition(g) <- 'Стадия развития растения по шкале BBCH; задаёт окна агротехнических операций и критичность стрессов.'; gtExample(g) <- 'BBCH 30 — начало кущения.'; gtRelated(g) <- 'САТ, Сезонная техкарта'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Индекс вегетации'; gtAbbreviation(g) <- 'NDVI'; gtEng(g) <- 'Normalized Difference Vegetation Index'; gtDefinition(g) <- 'Спутниковый индекс состояния посевов; отклонение факта от эталонного прогноза свыше порога — признак стресса (ФТ2.6).'; gtExample(g) <- 'Факт 0.42 при эталоне 0.58 — отклонение −28%, стресс.'; gtRelated(g) <- 'Стресс, Модель KuGDD'; }
+        NEW g = GlossaryTerm { gtTerm(g) <- 'Годовой производственный план'; gtAbbreviation(g) <- ''; gtEng(g) <- 'Annual Production Plan'; gtDefinition(g) <- 'Операционный план сезона: поля с культурами из севооборота и назначенными техкартами (ФТ1.3).'; gtExample(g) <- 'ГП-2027-1: 10 полей, 10 назначений ТК.'; gtRelated(g) <- 'Технологическая карта, План севооборота'; }
+        APPLY;
+    }
+}
+
+// ===================== Дашборд «сегодня» (UI-002) =====================
+// Секции по контурам сквозного процесса (спецификация v2.0): земельный банк,
+// планирование, финансы, сезон. Только inline-стили: фигурные скобки в
+// литералах LSfusion — маркеры локализации.
+kuCard (STRING icon, STRING label, STRING value, STRING color) =
+    '<span style="font-size:20px;vertical-align:middle">' + icon + '</span>'
+  + '<div style="display:inline-block;vertical-align:middle;margin-left:8px;min-width:104px">'
+  + '<div style="font-size:10px;letter-spacing:.4px;text-transform:uppercase;color:#8a93a0">' + label + '</div>'
+  + '<div style="font-size:21px;font-weight:800;color:' + color + ';line-height:1.25">' + value + '</div></div>';
+kuSection (STRING title) =
+    '<div style="font-size:11px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;color:#5a6b7b;'
+  + 'margin:14px 0 6px;padding-bottom:3px;border-bottom:2px solid #e3e8ee">' + title + '</div>';
+kuCardBox (STRING inner, STRING warnBg) =
+    '<div style="background:' + warnBg + ';border:1px solid #e3e8ee;border-radius:8px;padding:9px 12px;'
+  + 'box-shadow:0 1px 2px rgba(16,24,40,.05)">' + inner + '</div>';
+
+// Сборка снапшотов дашборда (две панели) — см. комментарий у DATA-снапшотов
+// хук доп-секций дашборда: реализации из модулей, которым виден DWH
+// (KuKnpApiEtl — PNL из витрины DmCropPnl); KuEtl требует этот модуль,
+// поэтому напрямую секцию здесь не построить (цикл REQUIRE)
+kuHomeAppendSections 'Доп-секции дашборда' () ABSTRACT;
+
+refreshKuHome 'Обновить сводку' () {
+    LOCAL html = TEXT ();
+    // 1) полоса сезонного цикла
+    html() <- '';
+    html() <- html()
+  + '<div style="font-family:sans-serif;padding:12px 14px;border-bottom:1px solid #e0e0e0">'
+  + '<div style="font-size:13px;font-weight:700;margin-bottom:8px">Сезонный цикл — текущий шаг: '
+  + (IF stepCurrent() = 0 THEN '✓ цикл замкнут — можно планировать следующий'
+      ELSE '№' + ('' + stepCurrent()) + ' — ' + stepName(stepCurrent()))
+  + '<div style="font-size:10px;color:#8a93a0;margin-bottom:6px">зелёный — этап завершён; серый — не завершён</div>'
+  + '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">'
+    + processGroup('Подготовка')
+    + processChip('1. Земля', stepLandReady())
+    + processChip('2. Севооборот', stepRotationReady())
+    + processChip('3. Техкарты', stepTechCardReady())
+    + processGroup('Планирование')
+    + processChip('4. Год. план', stepProdPlanReady())
+    + processChip('5. Бюджет', stepBudgetReady())
+    + processGroup('Сезон')
+    + processChip('6. NPK', stepNpkReady())
+    + processChip('7. Прогноз', stepForecastReady())
+    + processGroup('Уборка')
+    + processChip('8. Уборка', stepHarvestReady())
+    + processChip('9. Цикл', stepCycleClosed())
+  + '</div></div>';
+    processSnapshot() <- html();
+    // 2) сводка «сегодня» по контурам
+    html() <- '';
+    html() <- html()
+  + '<div style="font-family:sans-serif;color:#222;padding:14px 16px;background:#f7f9fb;border-radius:8px">'
+  + '<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:2px">'
+  + '<span style="font-size:17px;font-weight:800">Код Урожая</span>'
+  + '<span style="font-size:12px;color:#8a93a0">сводка стенда — земельный банк, планы, финансы, сезон</span></div>'
+
+  + kuSection('Земельный банк')
+  + '<div style="display:flex;flex-wrap:wrap;gap:10px">'
+  + kuCardBox(kuCard('🌾', 'Полей', (OVERRIDE ('' + kuFieldsTotal()), '0'), '#2b6cb0'), '#fff')
+  + kuCardBox(kuCard('📏', 'Площадь', (OVERRIDE ('' + INTEGER(kuAreaTotal())), '0') + ' га', '#222'), '#fff')
+  + kuCardBox(kuCard('📑', 'Договоров', (OVERRIDE ('' + kuContractsActive()), '0'), '#1f9d6b'), '#fff')
+  + kuCardBox(kuCard('⏳', 'Истекает', (OVERRIDE ('' + kuContractsExpiring()), '0'), '#b07400'), '#fff')
+  + kuCardBox(kuCard('⚖', 'Сальдо аренды', (OVERRIDE ('' + INTEGER(kuRentBalance())), '0') + ' ₽', '#222'), '#fff')
+  + '</div>'
+
+  + kuSection('Планирование')
+  + '<div style="display:flex;flex-wrap:wrap;gap:10px">'
+  + kuCardBox(kuCard('🗓', 'Планов (черновики)', (OVERRIDE ('' + kuPlansDraft()), '0'), '#2b6cb0'), '#fff')
+  + kuCardBox(kuCard('📋', 'ТК утверждено', (OVERRIDE ('' + kuTechCardsApproved()), '0'), '#1f9d6b'), '#fff')
+  + kuCardBox(kuCard('⚠', 'Крит. нарушений', (OVERRIDE ('' + kuPlansViolations()), '0'), '#b3261e'), '#fdf6f2')
+  + '</div>'
+
+  + kuSection('Финансы (по сценарию плана)')
+  + '<div style="display:flex;flex-wrap:wrap;gap:10px">'
+  + kuCardBox(kuCard('📈', 'Доход', (OVERRIDE ('' + INTEGER(kuIncomeTotal())), '0') + ' ₽', '#1f9d6b'), '#fff')
+  + kuCardBox(kuCard('💰', 'Маржа БДР', (OVERRIDE ('' + INTEGER(kuMargin())), '0') + ' ₽', '#1f9d6b'), '#fff')
+  + '</div>'
+
+  + kuSection('Сезон')
+  + '<div style="display:flex;flex-wrap:wrap;gap:10px">'
+  + kuCardBox(kuCard('🚜', 'Убрано', (OVERRIDE ('' + INTEGER(harvestPct())), '0') + ' %', '#1f9d6b'), '#fff')
+  + kuCardBox(kuCard('🛰', 'Прогнозов активно', (OVERRIDE ('' + kuSimActive()), '0'), '#2b6cb0'), '#fff')
+  + kuCardBox(kuCard('🔥', 'Стресс-события', (OVERRIDE ('' + hthStressEvents()), '0'), '#b3261e'), '#fdf6f2')
+  + kuCardBox(kuCard('💡', 'Рекомендаций новых', (OVERRIDE ('' + kuRecommendations()), '0'), '#b07400'), '#fff')
+  + kuCardBox(kuCard('🛠', 'Простой техники', (OVERRIDE ('' + INTEGER(fleetIdlePct())), '0') + ' %', '#b07400'), '#fff')
+  + '</div>'
+  + '</div>';
+    kuHomeSnapshot() <- html();
+
+    // 3) плоский снапшот компонента kuhome: карточки (кликабельны), цикл,
+    //    датасеты ECharts — всё из БД конвейером выше
+    html() <- '';
+    html() <- html() + 'CARDS'
+  + '~🌾^Поля^' + (OVERRIDE ('' + kuFieldsTotal()), '0') + '^#2b6cb0^fields'
+  + '~📏^Площадь, га^' + (OVERRIDE ('' + INTEGER(kuAreaTotal())), '0') + '^#222a35^fields'
+  + '~📑^Договоров действует^' + (OVERRIDE ('' + kuContractsActive()), '0') + '^#1f9d6b^contracts'
+  + '~⏳^Истекает < 90 дн^' + (OVERRIDE ('' + kuContractsExpiring()), '0') + '^#b07400^contracts'
+  + '~⚖^Сальдо аренды, ₽^' + (OVERRIDE ('' + INTEGER(kuRentBalance())), '0') + '^#222a35^payments'
+  + '~🗓^Планов (черновики)^' + (OVERRIDE ('' + kuPlansDraft()), '0') + '^#2b6cb0^rotation'
+  + '~📋^ТК утверждено^' + (OVERRIDE ('' + kuTechCardsApproved()), '0') + '^#1f9d6b^techcards'
+  + '~⚠^Крит. нарушений^' + (OVERRIDE ('' + kuPlansViolations()), '0') + '^#b3261e^rotation'
+  + '~📈^Доход (БДР), ₽^' + (OVERRIDE ('' + INTEGER(kuIncomeTotal())), '0') + '^#1f9d6b^bdr'
+  + '~💰^Маржа БДР, ₽^' + (OVERRIDE ('' + INTEGER(kuMargin())), '0') + '^#1f9d6b^budgets'
+  + '~🚜^Убрано, %^' + (OVERRIDE ('' + INTEGER(harvestPct())), '0') + '^#1f9d6b^harvest'
+  + '~🛰^Прогнозов активно^' + (OVERRIDE ('' + kuSimActive()), '0') + '^#2b6cb0^sim'
+  + '~🔥^Стресс-события^' + (OVERRIDE ('' + hthStressEvents()), '0') + '^#b3261e^events'
+  + '~💡^Рекомендаций новых^' + (OVERRIDE ('' + kuRecommendations()), '0') + '^#b07400^corrections'
+  + '~🛠^Простой техники, %^' + (OVERRIDE ('' + INTEGER(fleetIdlePct())), '0') + '^#b07400^fleet'
+  + '~♻^Расчётов переработки^' + (OVERRIDE ('' + kuRecyclingCount()), '0') + '^#7b4fa8^recycling'
+  + '~🗺^Интерактивная карта^открыть^#0f7b6c^map';
+
+    html() <- html() + '||CYCLE'
+  + '~#Подготовка'
+  + '~1. Земля^' + (IF stepLandReady() THEN '1' ELSE '0') + '^fields'
+  + '~2. Севооборот^' + (IF stepRotationReady() THEN '1' ELSE '0') + '^rotation'
+  + '~3. Техкарты^' + (IF stepTechCardReady() THEN '1' ELSE '0') + '^techcards'
+  + '~#Планирование'
+  + '~4. Год. план^' + (IF stepProdPlanReady() THEN '1' ELSE '0') + '^prodplans'
+  + '~5. Бюджет^' + (IF stepBudgetReady() THEN '1' ELSE '0') + '^budgets'
+  + '~#Сезон'
+  + '~6. NPK^' + (IF stepNpkReady() THEN '1' ELSE '0') + '^npk'
+  + '~7. Прогноз^' + (IF stepForecastReady() THEN '1' ELSE '0') + '^sim'
+  + '~#Уборка'
+  + '~8. Уборка^' + (IF stepHarvestReady() THEN '1' ELSE '0') + '^harvest'
+  + '~9. Цикл^' + (IF stepCycleClosed() THEN '1' ELSE '0') + '^acts';
+
+    // месяцы — по «первому объекту месяца» (диапазонного FOR в языке нет;
+    // паттерн DISTINCT-строк из KuEtl), значения — агрегатами выше
+    html() <- html() + '||BDR';
+    FOR BudgetPLItem x IS BudgetPLItem AND bplStatus(budgetPL(x)) = DocCalcStatus.approved
+        AND x = (GROUP MAX BudgetPLItem f IF bplStatus(budgetPL(f)) = DocCalcStatus.approved AND bplMonth(f) = bplMonth(x))
+        ORDER bplMonth(x)
+    DO
+        html() <- html() + '~' + ('' + bplMonth(x)) + '^' + ('' + (OVERRIDE bdrIncomeM(bplMonth(x)), 0)) + '^' + ('' + (OVERRIDE bdrExpenseM(bplMonth(x)), 0));
+
+    html() <- html() + '||COSTS';
+    FOR CostItem ci IS CostItem AND dashCostByItem(ci) ORDER ciName(ci) DO
+        html() <- html() + '~' + ciName(ci) + '^' + ('' + dashCostByItem(ci));
+
+    html() <- html() + '||NDVI';
+    FOR SimResultPoint p IS SimResultPoint AND result(p) = heroResult()
+        ORDER pointDate(p)
+    DO
+        html() <- html() + '~' + ('' + pointDate(p)) + '^' + ('' + (OVERRIDE ndvi(p), 0)) + '^' + (OVERRIDE ('' + factNdvi(p)), '');
+
+    kuHomeData() <- html();
+    kuHomeAppendSections();
+    APPLY;
+}
+
+kuHomeHtml 'Код Урожая — сегодня' () = HTML(
+    (OVERRIDE kuHomeSnapshot(), '<div style="font-family:sans-serif;color:#8a93a0;padding:16px">Сводка будет построена — нажмите «Обновить сводку»</div>'));
+
+
+// ===================== Панель здоровья (ФТ7.3) =====================
+// Минимальный объём по спецификации v2.0: статусы подсистем КУ (симуляция,
+// события, регламентные задания) + ключевые счётчики; стек Grafana исключён.
+hthSimQueued 'Задач в очереди' () = GROUP SUM 1 IF simStatus(SimTask t) = SimTaskStatus.queued;
+hthSimProcessing 'Задач выполняется' () = GROUP SUM 1 IF simStatus(SimTask t) = SimTaskStatus.processing;
+hthSimDone 'Задач завершено' () = GROUP SUM 1 IF simStatus(SimTask t) = SimTaskStatus.done;
+hthSimError 'Задач с ошибкой' () = GROUP SUM 1 IF simStatus(SimTask t) = SimTaskStatus.error;
+hthEventsTotal 'Событий всего' () = GROUP SUM 1 IF KuEvent e IS KuEvent;
+hthLastEventAt 'Последнее событие' () = GROUP MAX eventAt(KuEvent e);
+hthJobsFailed 'Заданий с ошибкой' () = GROUP SUM 1 IF jobStatus(KuJob j) = 'Ошибка';
+hthLastForecast 'Последний прогноз' () = GROUP MAX calcAt(SimResult r);
+hthSimOk 'Симуляция: норма' () = NOT hthSimError() AND NOT hthSimProcessing();
+hthEventsOk 'События: поступают' () = hthEventsTotal() > 0;
+hthJobsOk 'Задания: без ошибок' () = NOT hthJobsFailed();
+
+// КФ-ИН3: доступность контуров KNP (обновляется кнопкой-пробой; контур
+// KNP поднимается отдельно — docs/13-knp-integration.md). ollama (:11434)
+// живёт в закрытой сети knp_ai и извне не публикуется — его доступность
+// отражает шлюз KNP (/api/v1 жив ⇔ шлюз+AI-контур подняты)
+kuKnpBridgeStatus 'Мост KNP' = DATA ISTRING[30] ();
+kuKnpGatewayStatus 'Шлюз KNP' = DATA ISTRING[30] ();
+kuKnpAiStatus 'AI-контур (через шлюз)' = DATA ISTRING[30] ();
+knpHostUrl () = 'http://192.168.189.129';   // host-сеть ВМ (как kuVrpBridgeUrl)
+kuHealthHtml 'Панель здоровья' () = HTML(
+    '<div style="font-family:sans-serif;padding:12px 14px">'
+  + '<div style="font-size:15px;font-weight:700;color:#222;margin-bottom:10px">Состояние подсистем «Код Урожая»</div>'
+  + '<div style="display:flex;gap:20px;flex-wrap:wrap">'
+    + '<div><div style="font-size:11px;color:#8a93a0">Симуляция</div><div style="font-size:16px;font-weight:800;color:' + (IF hthSimOk() THEN '#1f9d6b' ELSE '#b3261e') + '">' + (IF hthSimOk() THEN 'норма' ELSE 'внимание') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">События</div><div style="font-size:16px;font-weight:800;color:' + (IF hthEventsOk() THEN '#1f9d6b' ELSE '#b07400') + '">' + (OVERRIDE ('' + hthEventsTotal()), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Регламентные задания</div><div style="font-size:16px;font-weight:800;color:' + (IF hthJobsOk() THEN '#1f9d6b' ELSE '#b3261e') + '">' + (IF hthJobsOk() THEN 'норма' ELSE 'ошибка') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Очередь задач</div><div style="font-size:22px;font-weight:800;color:#2b6cb0">' + (OVERRIDE ('' + hthSimQueued()), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Завершено</div><div style="font-size:22px;font-weight:800;color:#1f9d6b">' + (OVERRIDE ('' + hthSimDone()), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Ошибки задач</div><div style="font-size:22px;font-weight:800;color:#b3261e">' + (OVERRIDE ('' + hthSimError()), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Стресс-события</div><div style="font-size:22px;font-weight:800;color:#b07400">' + (OVERRIDE ('' + hthStressEvents()), '0') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Последний прогноз</div><div style="font-size:14px;font-weight:700;color:#222">' + (OVERRIDE ('' + hthLastForecast()), '—') + '</div></div>'
+  + '</div>'
+  + '<div style="font-size:12px;font-weight:700;color:#222;margin:12px 0 4px">Контуры KNP <span style="font-weight:400;color:#8a93a0">(обновляется кнопкой «Проверить контуры KNP»; контур поднимается отдельно)</span></div>'
+  + '<div style="display:flex;gap:20px;flex-wrap:wrap">'
+    + '<div><div style="font-size:11px;color:#8a93a0">Мост :8090</div><div style="font-size:14px;font-weight:700;color:' + (IF kuKnpBridgeStatus() = 'доступен' THEN '#1f9d6b' ELSE IF kuKnpBridgeStatus() = 'недоступен' THEN '#b3261e' ELSE '#8a93a0') + '">' + (OVERRIDE kuKnpBridgeStatus(), 'не проверялся') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">Шлюз :8088</div><div style="font-size:14px;font-weight:700;color:' + (IF kuKnpGatewayStatus() = 'доступен' THEN '#1f9d6b' ELSE IF kuKnpGatewayStatus() = 'недоступен' THEN '#b3261e' ELSE '#8a93a0') + '">' + (OVERRIDE kuKnpGatewayStatus(), 'не проверялся') + '</div></div>'
+    + '<div><div style="font-size:11px;color:#8a93a0">AI-контур (ollama через шлюз)</div><div style="font-size:14px;font-weight:700;color:' + (IF kuKnpAiStatus() = 'доступен' THEN '#1f9d6b' ELSE IF kuKnpAiStatus() = 'недоступен' THEN '#b3261e' ELSE '#8a93a0') + '">' + (OVERRIDE kuKnpAiStatus(), 'не проверялся') + '</div></div>'
+  + '</div></div>');
+
+probeKnpContours 'Проверить контуры KNP' () {
+    kuKnpBridgeStatus() <- 'не проверялся';
+    kuKnpGatewayStatus() <- 'не проверялся';
+    kuKnpAiStatus() <- 'не проверялся';
+    APPLY;
+    TRY {
+        EXTERNAL HTTP GET knpHostUrl() + ':8090/health' TO exportFile;
+        kuKnpBridgeStatus() <- 'доступен';
+    } CATCH {
+        kuKnpBridgeStatus() <- 'недоступен';
+    }
+    TRY {
+        EXTERNAL HTTP GET knpHostUrl() + ':8088/openapi.json' TO exportFile;
+        kuKnpGatewayStatus() <- 'доступен';
+    } CATCH {
+        kuKnpGatewayStatus() <- 'недоступен';
+    }
+    TRY {
+        EXTERNAL HTTP GET knpHostUrl() + ':8088/api/v1/ku/map/fields' TO exportFile;
+        kuKnpAiStatus() <- 'доступен';
+    } CATCH {
+        kuKnpAiStatus() <- 'недоступен';
+    }
+    kuPublish(KuEventKind.jobDone, 'Панель здоровья', 'KNP-контуры',
+        'мост: ' + (OVERRIDE kuKnpBridgeStatus(), '—') + '; шлюз: ' + (OVERRIDE kuKnpGatewayStatus(), '—')
+        + '; AI: ' + (OVERRIDE kuKnpAiStatus(), '—'));
+    APPLY;
+}
+// КФ-ИН5 (ФТ8.4): ручная отметка контрольного восстановления бэкапа —
+// фиксация в журнале заданий (процедура — docs/08-operations.md §4а)
+markBackupRestoreCheck 'Отметить контрольное восстановление бэкапа' () {
+    INPUT ok = BOOLEAN DO
+        IF ok THEN {
+            kuJobStart('Контрольное восстановление бэкапа');
+            kuJobFinish('Контрольное восстановление бэкапа', 'Выполнено',
+                'Проверка восстановления из бэкапа по процедуре 08-operations §4а пройдена (ручная отметка)');
+        }
+}
+
+FORM kuHealth 'Панель здоровья'   // ФТ7.3
+    PROPERTIES () kuHealthHtml
+    PROPERTIES () showMiteNav, alertAdminEmail
+    PROPERTIES () probeKnpContours, markBackupRestoreCheck
+    OBJECTS j = KuJob
+    PROPERTIES (j) READONLY jobName, jobLastStart, jobLastFinish, jobStatus, jobRuns, jobMessage
+;
+
+// событие от клиента (клик по карточке/чипу kuhome): навигация на форму.
+// Паттерн kuMapClientEvent: ON CHANGE срабатывает от controller.change.
+kuHomeNav () {
+    INPUT j = JSON DO
+        IMPORT JSON FROM j FIELDS() STRING action, STRING objName DO {
+            IF action = 'nav' AND objName THEN {
+                IF objName = 'fields' THEN SHOW fields;
+                ELSE IF objName = 'areaplan' THEN kuHomeShowReport('areaplan');   // КФ-РП5 (мост в KuEtl)
+                ELSE IF objName = 'plots' THEN SHOW landPlots;
+                ELSE IF objName = 'matrix' THEN SHOW contractPlotMatrix;
+                ELSE IF objName = 'contracts' THEN SHOW leaseContracts;
+                ELSE IF objName = 'payments' THEN SHOW paymentRequests;
+                ELSE IF objName = 'rotation' THEN SHOW rotationPlans;
+                ELSE IF objName = 'techcards' THEN SHOW techCards;
+                ELSE IF objName = 'prodplans' THEN SHOW prodPlans;
+                ELSE IF objName = 'budgets' THEN SHOW budgetCompare;
+                ELSE IF objName = 'bdr' THEN SHOW budgetPLs;
+                ELSE IF objName = 'bdds' THEN SHOW budgetCFs;
+                ELSE IF objName = 'npk' THEN SHOW complexPlans;
+                ELSE IF objName = 'sim' THEN SHOW simResults;
+                ELSE IF objName = 'corrections' THEN SHOW correctionRecommendations;
+                ELSE IF objName = 'harvest' THEN SHOW harvestProgress;
+                ELSE IF objName = 'acts' THEN SHOW harvestActs;
+                ELSE IF objName = 'pnl' THEN SHOW cropPnL;
+                ELSE IF objName = 'events' THEN SHOW kuEvents;
+                ELSE IF objName = 'health' THEN SHOW kuHealth;
+                ELSE IF objName = 'audit' THEN SHOW kuAuditLog;
+                ELSE IF objName = 'fleet' THEN SHOW fleetPanel;
+                ELSE IF objName = 'recycling' THEN SHOW recyclingCalcs;
+                ELSE IF objName = 'map' THEN SHOW kuMap;
+                ELSE IF objName = 'ndvi' THEN {
+                    kuMapTheme() <- 'ndvi';
+                    refreshKuMap();
+                    SHOW kuMap;
+                }
+                ELSE MESSAGE 'Раздел ' + objName + ' не найден.';
+            }
+        }
+}
+
+FORM kuHome 'Код Урожая — сегодня'
+    PROPERTIES () refreshKuHome
+    PROPERTIES () kuHomeData CUSTOM 'kuhome' ON CHANGE kuHomeNav()
+;

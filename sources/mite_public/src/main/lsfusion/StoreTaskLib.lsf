@@ -1,0 +1,335 @@
+MODULE StoreTaskLib;
+
+// Ядро подсистемы задач StoreTask: исполнители, объекты проверки, шаблоны
+// выездов и жизненный цикл задачи. Модуль утрачен и восстановлен реверс-инжинирингом
+// по использованиям в StoreTaskMite / MiteTestData / SosediDemo / Scheme.
+// Хост-пакеты реализуют абстракции (id, name, available, in, ...) через += .
+// Мобильное API — раздел 8; контракт отправки заполнения утрачен (см. finishFilling).
+REQUIRE Authentication, SystemEvents, Utils;
+
+NAMESPACE StoreTask;
+
+// ======================= 1. Исполнители =======================
+
+// Ссылка на исполнителя: сотрудник (TaskPerformer, наращивается хостом:
+// в mite это Employee) либо подразделение (TaskUnit). Ссылка хранится там,
+// где ответственный может быть и тем, и другим: роль на объекте (person).
+CLASS RefPerformer 'Исполнитель (ссылка)';
+CLASS TaskPerformer 'Исполнитель' : RefPerformer;
+CLASS TaskUnit 'Подразделение' : RefPerformer;
+
+id = ABSTRACT ISTRING[100] (RefPerformer);
+name = ABSTRACT ISTRING[100] (RefPerformer);
+archived 'В архиве' = ABSTRACT BOOLEAN (RefPerformer);
+// выбыл из справочника: ядро выводит поверх archived (NULL-безопасно)
+retired 'Выбыл' (RefPerformer p) = OVERRIDE archived(p), NULL;
+
+// текущий пользователь как исполнитель (хост связывает с сотрудником)
+performer = ABSTRACT TaskPerformer (CustomUser);
+
+// прямое вхождение ссылки в пользователя; для подразделения — прямой состав
+in = ABSTRACT BOOLEAN (RefPerformer, User);
+
+TABLE taskUnit (TaskUnit);
+parent 'Вышестоящее' = DATA TaskUnit (TaskUnit);
+TABLE unitMember (TaskUnit, User);
+member 'Состав' = DATA BOOLEAN (TaskUnit, User);
+in (TaskUnit un, User u) += member(un, u);
+
+// Транзитивное замыкание иерархии подразделений. Оригинал строился на RECURSION,
+// но платформа 7.0-SNAPSHOT падает (NPE в RecursiveTable) на рекурсии с параметрами
+// custom-класса — заменено явной разверткой на 4 уровня вложенности; для более
+// глубоких иерархий продлить цепочку parentN.
+parent1 (TaskUnit un) = parent(un);
+parent2 (TaskUnit un) = parent(parent1(un));
+parent3 (TaskUnit un) = parent(parent2(un));
+parent4 (TaskUnit un) = parent(parent3(un));
+// все аргументы BOOLEAN: OVERRIDE требует одинаковый тип
+inUnit 'Состав' (TaskUnit un, User u) =
+    OVERRIDE member(un, u), member(parent1(un), u), member(parent2(un), u), member(parent3(un), u), member(parent4(un), u);
+// транзитивное вхождение: сам либо состав подразделения с вложенными отделами
+hasIn 'В составе' (RefPerformer p, User u) = OVERRIDE in(p, u), inUnit(p AS TaskUnit, u);
+
+// ======================= 2. Объекты проверки =======================
+
+// Место, куда исполнитель приезжает по задаче. В mite объектом стала точка
+// размещения (Location : CheckObject), а не конкретный прибор.
+CLASS CheckObject 'Объект проверки';
+
+id = ABSTRACT ISTRING[30] (CheckObject);
+name = ABSTRACT ISTRING[150] (CheckObject);
+address = ABSTRACT ISTRING[250] (CheckObject);
+latitude = ABSTRACT DOUBLE (CheckObject);
+longitude = ABSTRACT DOUBLE (CheckObject);
+
+// Канал выбора исполнителя: «исполнители, доступные на объекте».
+// Подсказка для поиска, не запрет (дизайн строк, раздел 12.5).
+available = ABSTRACT BOOLEAN (TaskPerformer, CheckObject);
+
+// Роли на объекте: ответственным в роли может стоять подразделение —
+// тогда сотрудниками объекта становится его состав (hasIn)
+CLASS ObjectRole 'Роль на объекте';
+TABLE objectRole (ObjectRole);
+name 'Название' = DATA ISTRING[100] (ObjectRole);
+active 'Действует' = DATA BOOLEAN (ObjectRole);
+
+TABLE personRole (CheckObject, ObjectRole);
+person 'Ответственный' = DATA RefPerformer (CheckObject, ObjectRole);
+
+// ======================= 3. Справочники задачи =======================
+
+CLASS TaskType 'Тип задачи';
+TABLE taskType (TaskType);
+id 'Код' = DATA ISTRING[30] (TaskType);
+name 'Название' = DATA ISTRING[100] (TaskType);
+
+CLASS TaskStatus 'Статус задачи';
+TABLE taskStatus (TaskStatus);
+id 'Код' = DATA ISTRING[30] (TaskStatus);
+name 'Название' = DATA ISTRING[100] (TaskStatus);
+
+CLASS TaskPriority 'Приоритет задачи';
+TABLE taskPriority (TaskPriority);
+id 'Код' = DATA ISTRING[30] (TaskPriority);
+name 'Название' = DATA ISTRING[100] (TaskPriority);
+
+taskType (ISTRING[30] i) = GROUP MAX TaskType tt IF id(tt) = i;
+taskStatus (ISTRING[30] i) = GROUP MAX TaskStatus s IF id(s) = i;
+taskPriority (ISTRING[30] i) = GROUP MAX TaskPriority p IF id(p) = i;
+formTaskType () = taskType('form');
+
+// статусы: new / in progress / done, приоритеты: urgent / high / normal / low —
+// идентификаторы зафиксированы использованием в SosediDemo и StoreTaskMite
+ensureDictionaries () {
+    NEWSESSION {
+        IF NOT taskStatus('new') THEN NEW s = TaskStatus { id(s) <- 'new'; name(s) <- 'Новая'; }
+        IF NOT taskStatus('in progress') THEN NEW s = TaskStatus { id(s) <- 'in progress'; name(s) <- 'В работе'; }
+        IF NOT taskStatus('done') THEN NEW s = TaskStatus { id(s) <- 'done'; name(s) <- 'Выполнена'; }
+        IF NOT taskPriority('urgent') THEN NEW p = TaskPriority { id(p) <- 'urgent'; name(p) <- 'Срочный'; }
+        IF NOT taskPriority('high') THEN NEW p = TaskPriority { id(p) <- 'high'; name(p) <- 'Высокий'; }
+        IF NOT taskPriority('normal') THEN NEW p = TaskPriority { id(p) <- 'normal'; name(p) <- 'Обычный'; }
+        IF NOT taskPriority('low') THEN NEW p = TaskPriority { id(p) <- 'low'; name(p) <- 'Низкий'; }
+        APPLY;
+    }
+}
+
+onStarted() + {
+    ensureDictionaries();
+}
+
+// ======================= 4. Шаблоны выездов =======================
+
+CLASS Template 'Шаблон';
+TABLE template (Template);
+name 'Название' = DATA ISTRING[150] (Template);
+note 'Примечание' = DATA TEXT (Template);
+resolutionRequired 'Требовать итог' = DATA BOOLEAN (Template);
+
+CLASS Section 'Раздел';
+TABLE section (Section);
+template 'Шаблон' = DATA Template (Section);
+name 'Название' = DATA ISTRING[150] (Section);
+
+CLASS Field 'Поле';
+TABLE field (Field);
+section 'Раздел' = DATA Section (Field);
+code 'Код' = DATA ISTRING[30] (Field);
+name 'Название' = DATA ISTRING[150] (Field);
+type 'Тип' = DATA FieldType (Field);
+required 'Обязательное' = DATA BOOLEAN (Field);
+unit 'Ед. изм.' = DATA ISTRING[20] (Field);
+minNorm 'Норма, от' = DATA DOUBLE (Field);
+maxNorm 'Норма, до' = DATA DOUBLE (Field);
+requirePhoto 'Фото обязательно' = DATA BOOLEAN (Field);
+hint 'Подсказка' = DATA TEXT (Field);
+optionSet 'Справочник вариантов' = DATA OptionSet (Field);
+
+CLASS FieldType 'Тип поля' {
+    scan 'Скан-код',
+    number 'Число',
+    choice 'Выбор',
+    boolean 'Да/Нет',
+    photo 'Фото',
+    longtext 'Длинный текст'
+}
+
+CLASS OptionSet 'Справочник вариантов';
+TABLE optionSet (OptionSet);
+name 'Название' = DATA ISTRING[150] (OptionSet);
+
+CLASS Option 'Вариант';
+TABLE option (Option);
+optionSet 'Справочник вариантов' = DATA OptionSet (Option);
+code 'Код' = DATA ISTRING[30] (Option);
+name 'Название' = DATA ISTRING[150] (Option);
+
+templateByName (ISTRING[150] nm) = GROUP MAX Template t IF name(t) = nm;
+optionSetByName (ISTRING[150] nm) = GROUP MAX OptionSet os IF name(os) = nm;
+// поле шаблона по коду: field(template(f), 'temp_mite')
+field (Template t, ISTRING[30] c) = GROUP MAX Field f IF template(section(f)) = t AND code(f) = c;
+
+// ======================= 5. Задача =======================
+
+CLASS Task 'Задача';
+TABLE task (Task);
+
+name 'Название' = DATA ISTRING[150] (Task);
+// заглушка: производный код из внутреннего id объекта; при восстановлении
+// мобильного API (apiTasks) заменить, если оригинал хранил код явно
+id 'Код' (Task t) = ISTRING[30](STRING(LONG(t)));
+type 'Тип' = DATA TaskType (Task);
+status 'Статус' = DATA TaskStatus (Task);
+priority 'Приоритет' = DATA TaskPriority (Task);
+checkObject 'Объект проверки' = DATA CheckObject (Task);
+assignedTo 'Исполнитель' = DATA TaskPerformer (Task);
+template 'Шаблон' = DATA Template (Task);
+deadline 'Срок' = DATA DATE (Task);
+progress 'Прогресс, %' = DATA INTEGER (Task);
+description 'Описание' = DATA TEXT (Task);
+
+// закрытые статусы; оригинальный состав шире только отменой — не выдумываем
+terminal 'Закрытый' (TaskStatus s) = id(s) = 'done';
+opened 'Открыта' (Task t) = NOT terminal(status(t));
+nameStatus 'Статус' (Task t) = name(status(t));
+namePriority 'Приоритет' (Task t) = name(priority(t));
+nameAssignedTo 'Исполнитель' (Task t) = name(assignedTo(t));
+nameCheckObject 'Объект' (Task t) = name(checkObject(t));
+
+// новая задача по умолчанию «Новая»: демо- и инцидентные задачи создаются без статуса
+WHEN SET(Task t IS Task) DO status(t) <- taskStatus('new');
+
+// ======================= 6. Заполнение и выполнение =======================
+
+// Заполнение шаблона выезда: значения полей + итог (resolution).
+// Создаётся мобильным приложением (apiTasks); шаблон — от задачи.
+CLASS Filling 'Заполнение';
+TABLE filling (Filling);
+task = DATA Task (Filling);
+template (Filling f) = template(task(f));
+
+TABLE fillingValue (Filling, Field);
+numberValue 'Число' = DATA NUMERIC[14,4] (Filling, Field);
+// TBOOLEAN (не BOOLEAN): StoreTaskMite сравнивает fixedOnSite(f) == TTRUE
+boolValue 'Да/Нет' = DATA TBOOLEAN (Filling, Field);
+textValue 'Текст' = DATA TEXT (Filling, Field);
+
+CLASS Resolution 'Итог';
+TABLE resolution (Resolution);
+caption 'Наименование' = DATA ISTRING[100] (Resolution);
+resolution 'Итог' = DATA Resolution (Filling);
+
+// хук завершения заполнения: вызывается слоем API при отправке выезда;
+// StoreTaskMite закрывает по нему инцидент ManagerLog
+onFinish (Filling f) ABSTRACT;
+
+// след выполнения: кто и когда исполнял задачу (история, акты)
+CLASS Execution 'Выполнение';
+TABLE execution (Execution);
+task = DATA Task (Execution);
+executor 'Исполнитель' = DATA TaskPerformer (Execution);
+dateTime 'Дата и время' = DATA DATETIME (Execution);
+state 'Состояние' = DATA ExecutionState (Execution);
+
+CLASS ExecutionState 'Состояние выполнения' {
+    finished 'Завершено'
+}
+
+// ======================= 7. Формы и навигатор =======================
+
+// Список — по образцу organizations: READONLY-колонки + NEWSESSION NEW/EDIT/DELETE.
+// StoreTaskMite добавляет сюда idDevice/nameUnit и орг-фильтр.
+FORM tasks 'Задачи'
+    OBJECTS t = Task
+    PROPERTIES(t) READONLY name, nameStatus, namePriority, nameCheckObject, nameAssignedTo, deadline, progress
+    PROPERTIES(t) NEWSESSION NEW, EDIT, DELETE
+;
+
+// Карточка: params — шапка с атрибутами задачи; сюда же StoreTaskMite
+// переносит «Прибор» и «Оборудование» (MOVE PROPERTY в DESIGN task).
+FORM task 'Задача'
+    OBJECTS t = Task PANEL
+    PROPERTIES(t) name, assignedTo, deadline, progress, description
+    PROPERTIES(t) READONLY nameStatus, namePriority, nameCheckObject
+    EDIT Task OBJECT t
+;
+
+DESIGN task {
+    NEW params {
+        MOVE PROPERTY(name(t));
+        MOVE PROPERTY(assignedTo(t));
+        MOVE PROPERTY(deadline(t));
+        MOVE PROPERTY(progress(t));
+        MOVE PROPERTY(nameStatus(t));
+        MOVE PROPERTY(namePriority(t));
+        MOVE PROPERTY(nameCheckObject(t));
+    }
+}
+
+// Справочник объектов проверки наполняют хосты (в mite это Location)
+FORM checkObjects 'Объекты проверки'
+    OBJECTS o = CheckObject
+    PROPERTIES(o) READONLY name, id, address
+;
+
+// Справочник исполнителей наполняют хосты (в mite — Employee, форма employees)
+FORM taskPerformers 'Исполнители'
+    OBJECTS p = TaskPerformer
+    PROPERTIES(p) READONLY name, id, retired
+;
+
+// Ветка «Управление персоналом» — единственная, разрешаемая орг-ролям
+// (permitStoreTaskFolder в StoreTaskMite): иначе дерево навигатора
+// у орг-пользователя пустое и веб-клиент падает на null root.
+// Корневая папка обязана указывать WINDOW (требование платформы).
+NAVIGATOR {
+    NEW FOLDER storeTask 'Управление персоналом' WINDOW toolbar {
+        NEW tasks FIRST;
+        NEW checkObjects;
+        NEW taskPerformers;
+    }
+}
+
+// ======================= 8. Мобильное API =======================
+// Приложение вызывает /exec?action=StoreTask.<имя>, параметры — в BODY,
+// ответ — JSON через RETURN. Паттерн EXPORT JSON FROM ... WHERE — как в Export.lsf.
+
+checkObjectById (ISTRING[30] objectId) = GROUP MAX CheckObject o IF id(o) = objectId;
+
+// Задачи исполнителя: открытые, назначенные на текущего пользователя.
+// objectId — фильтр «точки, на которой я стою» (StoreTaskMite, тикет 36775):
+// не передан — все мои задачи.
+apiTasks 'Задачи' (ISTRING[30] objectId) {
+    EXPORT JSON FROM
+        id = id(Task t),
+        name = name(t),
+        status = nameStatus(t),
+        priority = namePriority(t),
+        objectId = id(checkObject(t)),
+        deadline = deadline(t),
+        progress = progress(t),
+        description = description(t)
+    WHERE opened(t)
+        AND assignedTo(t) = performer(currentUser())
+        AND (IF objectId THEN id(checkObject(t)) = objectId ELSE TRUE);
+    RETURN JSONFILE(exportFile());
+}
+
+// Строки канала поля-ссылки (#36841): канал 'employee' — исполнители точки
+// (available — подсказка для поиска, не запрет: не нашли здесь — весь канал
+// по all=1, либо поиск по имени через query).
+apiRowSubjects 'Строки канала' (ISTRING[30] channel, ISTRING[30] objectId, ISTRING[100] query, BOOLEAN all) {
+    EXPORT JSON FROM
+        id = id(TaskPerformer p),
+        name = name(p)
+    WHERE channel = 'employee'
+        AND (IF all THEN TRUE ELSE IF objectId THEN OVERRIDE available(p, checkObjectById(objectId)), NULL ELSE TRUE)
+        AND (IF query THEN name(p) MATCH ('.*' + query + '.*') ELSE TRUE);
+    RETURN JSONFILE(exportFile());
+}
+
+// Завершение заполнения — точка входа слоя API: известный минимум контракта —
+// вызвать хук onFinish (StoreTaskMite закрывает по нему инцидент ManagerLog).
+// Имя эндпоинта и формат тела оригинала неизвестны — уточнить по клиенту.
+finishFilling 'Завершить заполнение' (Filling f) {
+    onFinish(f);
+}

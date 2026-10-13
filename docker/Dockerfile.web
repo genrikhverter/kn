@@ -1,0 +1,29 @@
+FROM registry.red-soft.ru/ubi8/ubi
+
+USER root
+RUN dnf install -y tomcat java-21-openjdk && dnf clean all
+
+RUN mkdir -p /run/tomcat /var/lib/tomcat/webapps /var/log/tomcat && \
+    chown -R tomcat:tomcat /run/tomcat /var/lib/tomcat /var/log/tomcat /usr/share/tomcat
+
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+ENV PATH=$JAVA_HOME/bin:$PATH
+
+EXPOSE 8080
+
+# В упаковке РЕД ОС нет bin/catalina.sh (systemd-запуск) — стартуем Bootstrap
+# напрямую. Bootstrap читает -Dcatalina.home/base (ENV он не видит); полный
+# CATALINA_BASE здесь — /usr/share/tomcat (conf -> /etc/tomcat, work, logs;
+# webapps — симлинк на /var/lib/tomcat/webapps). "start" после запуска
+# блокируется в catalina.await() — контейнер живой.
+# --add-opens обязательны: без них GWT-сериализация (LinkedHashMap) отдаёт
+# 500 на часть форм.
+CMD ["java", \
+     "-Dcatalina.home=/usr/share/tomcat", \
+     "-Dcatalina.base=/usr/share/tomcat", \
+     "--add-opens=java.base/java.lang=ALL-UNNAMED", \
+     "--add-opens=java.base/java.util=ALL-UNNAMED", \
+     "-Djava.util.logging.manager=org.apache.juli.ClassLoaderLogManager", \
+     "-Djava.util.logging.config.file=/etc/tomcat/logging.properties", \
+     "-classpath", "/usr/share/tomcat/bin/bootstrap.jar:/usr/share/tomcat/bin/tomcat-juli.jar", \
+     "org.apache.catalina.startup.Bootstrap", "start"]

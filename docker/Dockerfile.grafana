@@ -1,0 +1,19 @@
+FROM registry.altlinux.org/p11/base
+
+RUN apt-get update && apt-get install -y grafana \
+    && rm -rf /var/cache/apt/archives/*.rpm
+
+# Пакет ALT рассчитан на systemd-юнит с EnvironmentFile; при прямом запуске
+# без него Grafana падает: "mkdir /usr/share/grafana/data: permission denied".
+USER root
+RUN install -d -o grafana -g grafana /var/lib/grafana
+ENV GF_PATHS_DATA=/var/lib/grafana \
+    GF_PATHS_PLUGINS=/var/lib/grafana/plugins \
+    GF_PATHS_LOGS=/var/lib/grafana/log \
+    GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+
+USER grafana
+EXPOSE 3000
+
+CMD ["/usr/bin/grafana-server", "--homepath=/usr/share/grafana", \
+     "--config=/etc/grafana/grafana.ini"]

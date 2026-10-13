@@ -1,0 +1,521 @@
+MODULE KuProdPlan;
+
+// Код Урожая: годовой производственный план (ФТ1.3.1–1.3.5) и акт учёта
+// урожая. Спецификация: docs/02-data-model.md §5; docs/03-logic-KuProdPlan.md.
+REQUIRE KuRotation, KuTechCard, KuLand, Authentication;
+
+NAMESPACE Ku;
+
+CLASS ProdPlanStatus 'Статус плана' {
+    draft 'Черновик', approvedG 'Утвержден', archived 'Архивный'
+}
+CLASS HarvestActStatus 'Статус акта' {
+    draft 'Черновик', posted 'Проведён'
+}
+CLASS HarvestPurpose 'Назначение' {
+    seed 'Семенной', food 'Продовольственный', feed 'Фуражный'
+}
+CLASS HarvestSource 'Источник данных' {
+    scale 'Весовой комплекс', combine 'Комбайн', manual 'Ручной ввод'
+}
+
+// ===================== Годовой производственный план =====================
+CLASS ProdPlan 'Годовой план';
+TABLE prodPlan (ProdPlan);
+ppNumber 'Номер' = DATA ISTRING[20] (ProdPlan) NONULL IN id;
+planYear 'Год планирования' = DATA INTEGER (ProdPlan) NONULL;
+ppStatus 'Статус' = DATA ProdPlanStatus (ProdPlan) NONULL;
+namePpStatus 'Статус' (ProdPlan p) = staticCaption(ppStatus(p));
+ppVersion 'Версия' = DATA INTEGER (ProdPlan) NONULL;
+ppAuthor 'Автор' = DATA CustomUser (ProdPlan);
+namePpAuthor 'Автор' (ProdPlan p) = OVERRIDE nameKuUser(ppAuthor(p)), '';
+ppCreatedAt 'Создан' = DATA DATETIME (ProdPlan);
+ppApprovedAt 'Утверждён' = DATA DATETIME (ProdPlan);
+ppApprovedBy 'Утвердивший' = DATA CustomUser (ProdPlan);
+approvalNote 'Комментарий к утверждению' = DATA TEXT (ProdPlan);
+rotationPlan 'План севооборота' = DATA RotationPlan (ProdPlan) NONULL;
+nameRotationPlan 'Долгосрочный план' (ProdPlan p) = OVERRIDE number(rotationPlan(p)), '';
+ppOrganization 'Организация' = DATA Organization (ProdPlan) NONULL;
+WHEN SET(ProdPlan p IS ProdPlan) DO {
+    ppStatus(p) <- ProdPlanStatus.draft;
+    ppVersion(p) <- 1;
+    ppCreatedAt(p) <- currentDateTime();
+}
+CONSTRAINT ProdPlan p IS ProdPlan AND planYear(p) < 2027 CHECKED BY planYear MESSAGE 'Год планирования — не раньше 2027';
+// SET(): проверять только при создании/смене связи — иначе архивирование старого
+// севооборота при утверждении нового отменяло APPLY (существующие планы «ломались»)
+CONSTRAINT ProdPlan p IS ProdPlan AND SET(rotationPlan(p)) AND planStatus(rotationPlan(p)) != RotationPlanStatus.approved
+    CHECKED BY rotationPlan MESSAGE 'Годовой план строится только по утверждённому плану севооборота';
+
+// строка плана: поле + культура + техкарта
+CLASS ProdPlanItem 'Назначение';
+TABLE prodPlanItem (ProdPlanItem);
+ppPlan 'План' = DATA ProdPlan (ProdPlanItem) AUTOSET;
+ppField 'Поле' = DATA Field (ProdPlanItem) NONULL;
+namePpField 'Поле' (ProdPlanItem i) = name(ppField(i));
+ppArea 'Площадь, га' (ProdPlanItem i) = areaHa(ppField(i));
+ppCrop 'Культура' = DATA Crop (ProdPlanItem) NONULL;
+namePpCrop 'Культура' (ProdPlanItem i) = OVERRIDE nameCrop(ppCrop(i)), '';
+// techCard без NONULL (ФТ1.3.2/1.3.3): план создаётся со строками без карт,
+// карты назначаются затем массово; утверждение плана блокируется, пока есть строки без карты
+techCard 'Техкарта' = DATA TechCard (ProdPlanItem);
+nameTechCard 'Техкарта' (ProdPlanItem i) = OVERRIDE tcName(techCard(i)), '';
+tcVersionItem 'Версия ТК' (ProdPlanItem i) = OVERRIDE tcVersion(techCard(i)), 0;
+deviationNote 'Отклонения' = DATA TEXT (ProdPlanItem);
+// КФ-Г6: плановая урожайность строки (ц/га) — умолчание из культуры при создании,
+// ручная корректировка допускается; канонический источник для акта урожая
+ppPlanYield 'Плановая урожайность, ц/га' = DATA NUMERIC[10,2] (ProdPlanItem);
+ppVolume 'Объём, т' (ProdPlanItem i) = ppPlanYield(i) / 10.0 * ppArea(i);
+WHEN SET(ProdPlanItem i IS ProdPlanItem) AND NOT CHANGED(ppPlanYield(i)) DO
+    ppPlanYield(i) <- targetYield(ppCrop(i));
+itemByPlanField = GROUP AGGR ProdPlanItem i BY ppPlan(i), ppField(i);
+CONSTRAINT ProdPlanItem i IS ProdPlanItem AND cardStatus(techCard(i)) != TechCardStatus.approved
+    CHECKED BY techCard MESSAGE 'Техкарта должна быть утверждена';
+CONSTRAINT ProdPlanItem i IS ProdPlanItem AND tcCrop(techCard(i)) != ppCrop(i)
+    CHECKED BY techCard MESSAGE 'Техкарта относится к другой культуре';
+
+// сводки
+itemsNoCard 'Без техкарты' (ProdPlan p) = GROUP SUM 1 IF ppPlan(ProdPlanItem i) = p AND NOT techCard(i);
+areaByPlan 'Площадь плана, га' (ProdPlan p) = GROUP SUM ppArea(ProdPlanItem i) IF ppPlan(i) = p;
+
+// ===================== Действия годового плана =====================
+newProdPlan 'Создать годовой план' (Organization org, INTEGER yr) {
+    LOCAL rp = RotationPlan ();
+    rp() <- GROUP MAX RotationPlan r IF organization(r) = org AND planStatus(r) = RotationPlanStatus.approved;
+    IF NOT rp() THEN MESSAGE 'Нет утверждённого плана севооборота';
+    ELSE {
+        LOCAL npp = ProdPlan ();
+        NEW p = ProdPlan {
+            ppNumber(p) <- 'ГП-' + ('' + yr) + '-1';
+            planYear(p) <- yr;
+            rotationPlan(p) <- rp();
+            ppOrganization(p) <- org;
+            npp() <- p;
+        }
+        // автозаполнение: культура из строки ротации на год, техкарта по культуре
+        FOR RotationPlanItem ri IS RotationPlanItem AND plan(ri) = rp() DO {
+            LOCAL c = Crop ();
+            c() <- cropYear(ri, yr - startYear(rp()) + 1);
+            IF c() THEN
+                NEW i = ProdPlanItem {
+                    ppPlan(i) <- npp();   // объект новой сессии, а не GROUP MAX (мог найти старый план)
+                    ppField(i) <- field(ri);
+                    ppCrop(i) <- c();
+                    techCard(i) <- GROUP MAX TechCard tc IF tcCrop(tc) = c() AND cardStatus(tc) = TechCardStatus.approved AND tcOrganization(tc) = org;
+                }
+        }
+        APPLY;
+        IF canceled() THEN MESSAGE applyMessage();
+    }
+}
+
+assignTechCardsBulk 'Массово назначить техкарты' (ProdPlan p) {
+    FOR ProdPlanItem i IS ProdPlanItem AND ppPlan(i) = p AND NOT techCard(i) DO
+        techCard(i) <- GROUP MAX TechCard tc IF tcCrop(tc) = ppCrop(i) AND cardStatus(tc) = TechCardStatus.approved;
+    APPLY;
+}
+
+approveProdPlan 'Утвердить план' (ProdPlan p) {
+    IF itemsNoCard(p) > 0 THEN
+        MESSAGE 'Нельзя утвердить: назначений без техкарты — ' + ('' + itemsNoCard(p)) + '. Запустите массовое назначение.';
+    ELSE {
+        ppStatus(p) <- ProdPlanStatus.approvedG;
+        ppApprovedAt(p) <- currentDateTime();
+        IF currentUser() THEN ppApprovedBy(p) <- currentUser();
+        kuPublish(KuEventKind.prodPlanApproved, 'ProdPlan', ppNumber(p), 'Год: ' + (OVERRIDE ('' + planYear(p)), ''));
+        APPLY;
+    }
+}
+
+// ===================== Акт учёта урожая =====================
+CLASS HarvestAct 'Акт урожая';
+TABLE harvestAct (HarvestAct);
+haNumber 'Номер' = DATA ISTRING[20] (HarvestAct) NONULL IN id;
+haCreatedAt 'Создан' = DATA DATETIME (HarvestAct);
+haPostedAt 'Проведён' = DATA DATETIME (HarvestAct);
+haStatus 'Статус' = DATA HarvestActStatus (HarvestAct) NONULL;
+nameHaStatus 'Статус' (HarvestAct a) = staticCaption(haStatus(a));
+haAuthor 'Автор' = DATA CustomUser (HarvestAct);
+haPostedBy 'Провёл' = DATA CustomUser (HarvestAct);
+haNote 'Комментарий' = DATA TEXT (HarvestAct);
+prodPlan 'Годовой план' = DATA ProdPlan (HarvestAct) NONULL;
+haSeq 'Счётчик актов' = DATA INTEGER ();
+WHEN SET(HarvestAct a IS HarvestAct) DO {
+    haStatus(a) <- HarvestActStatus.draft;
+    haCreatedAt(a) <- currentDateTime();
+    haSeq() <- (OVERRIDE haSeq(), 0) + 1;
+    // КФ-У3: номер — от года плана (не константа 2027)
+    haNumber(a) <- 'АУ-' + (OVERRIDE ('' + planYear(prodPlan(a))), '') + '-' + ('' + haSeq());
+}
+
+CLASS HarvestActItem 'Факт акта';
+TABLE harvestActItem (HarvestActItem);
+act 'Акт' = DATA HarvestAct (HarvestActItem) AUTOSET;
+hiField 'Поле' = DATA Field (HarvestActItem) NONULL;
+nameHiField 'Поле' (HarvestActItem h) = name(hiField(h));
+hiCrop 'Культура' = DATA Crop (HarvestActItem) NONULL;
+nameHiCrop 'Культура' (HarvestActItem h) = OVERRIDE nameCrop(hiCrop(h)), '';
+grossWeight 'Валовой вес, т' = DATA NUMERIC[12,3] (HarvestActItem) NONULL;
+moisture 'Влажность, %' = DATA NUMERIC[5,2] (HarvestActItem) NONULL;
+impurity 'Сорность, %' = DATA NUMERIC[5,2] (HarvestActItem) NONULL;
+// КФ-У2 (ФТ1.6.2): базисные кондиции зачётного веса — настраиваемые
+// константы (по образцу kuStressThreshold); дефолты 14/2 сохраняют эталоны
+kuBaseMoisture 'Базисная влажность, %' = DATA NUMERIC[5,2] ();
+kuBaseImpurity 'Базисная сорность, %' = DATA NUMERIC[5,2] ();
+baseMoistureV () = OVERRIDE kuBaseMoisture(), 14.0;
+baseImpurityV () = OVERRIDE kuBaseImpurity(), 2.0;
+netWeight 'Зачётный вес, т' (HarvestActItem h) =
+    grossWeight(h) * (100.0 - moisture(h) - impurity(h))
+    / (100.0 - baseMoistureV() - baseImpurityV());
+hiArea 'Площадь, га' (HarvestActItem h) = areaHa(hiField(h));
+factYieldT 'Факт, т/га' (HarvestActItem h) = netWeight(h) / hiArea(h);
+// КФ-Г6/У4: план — из строки годового плана (по плану акта + полю), затем
+// поле / культура
+planYieldT 'План, т/га' (HarvestActItem h) =
+    (OVERRIDE ppPlanYield(itemByPlanField(prodPlan(act(h)), hiField(h))),
+              planYield(hiField(h)), targetYield(hiCrop(h)) / 10.0);
+devAbs 'Отклонение, т/га' (HarvestActItem h) = factYieldT(h) - planYieldT(h);
+devPct 'Отклонение, %' (HarvestActItem h) = IF planYieldT(h) > 0 THEN devAbs(h) / planYieldT(h) * 100.0;
+// КФ-У5 (спека ФТ1.6.4): класс/сорт — этап 2 ссылка на справочник «Сорта и гибриды»
+gradeCode 'Класс/сорт' = DATA ISTRING[24] (HarvestActItem) NONULL;
+purpose 'Назначение' = DATA HarvestPurpose (HarvestActItem) NONULL;
+namePurpose (HarvestActItem h) = staticCaption(purpose(h));
+floorActNo 'Номер акта на току' = DATA ISTRING[30] (HarvestActItem) NONULL;
+dataSource 'Источник данных' = DATA HarvestSource (HarvestActItem) NONULL;
+nameDataSource (HarvestActItem h) = staticCaption(dataSource(h));
+// КФ-И3 (ОАФ А.1.3.2): причина отклонения факта от плана севооборота
+// (не путать с deviationNote строки ГП — технология); попадает в fsReason
+deviationReason 'Причина отклонения (севооборот)' = DATA ISTRING[200] (HarvestActItem);
+// C1.2: автозаполнение при факт≠план (подсказка, эксперт правит)
+WHEN SET (HarvestActItem h IS HarvestActItem) AND NOT CHANGED(deviationReason(h))
+    AND hiCrop(h) IS Crop
+    AND hiCrop(h) != fsPlanCrop(seasonOf(hiField(h), extractYear((OVERRIDE haPostedAt(act(h)), haCreatedAt(act(h))))))
+DO deviationReason(h) <- 'Отклонение от плана севооборота: факт ' + (OVERRIDE nameCrop(hiCrop(h)), '—')
+    + ' вместо ' + (OVERRIDE nameFsPlanCrop(seasonOf(hiField(h), extractYear((OVERRIDE haPostedAt(act(h)), haCreatedAt(act(h)))))), '—');
+CONSTRAINT HarvestActItem h IS HarvestActItem AND moisture(h) + impurity(h) >= 50 CHECKED BY moisture MESSAGE 'Влажность+сорность — меньше 50%';
+CONSTRAINT HarvestActItem h IS HarvestActItem AND grossWeight(h) <= 0 CHECKED BY grossWeight MESSAGE 'Валовой вес должен быть положительным';
+// КФ-У1 (спека-версионирование): один черновик на комбинацию поле+культура
+// (в рамках черновиков планов поля; OVERRIDE>0 — защита 3VL)
+CONSTRAINT HarvestActItem h IS HarvestActItem AND haStatus(act(h)) = HarvestActStatus.draft
+    AND (OVERRIDE (GROUP SUM 1 IF HarvestActItem h2 IS HarvestActItem AND h2 != h
+            AND hiField(h2) = hiField(h) AND hiCrop(h2) = hiCrop(h)
+            AND act(h2) IS HarvestAct AND haStatus(act(h2)) = HarvestActStatus.draft), 0) > 0
+    CHECKED BY hiField, hiCrop MESSAGE 'Черновик акта по этому полю и культуре уже существует';
+
+// ===================== Действия акта =====================
+newHarvestAct 'Создать акт' (ProdPlan p) {
+    NEW a = HarvestAct { prodPlan(a) <- p; }
+    APPLY;
+}
+
+// КФ-1: единая точка обновления факта урожая (проведение акта; повторный
+// вызов идемпотентен — те же значения)
+applyHarvestFact (HarvestAct a) {
+    FOR HarvestActItem h IS HarvestActItem AND act(h) = a DO {
+        factYield(hiField(h)) <- factYieldT(h) * 10.0;   // т/га → ц/га
+        lastCrop(hiField(h)) <- hiCrop(h);
+        lastSowDate(hiField(h)) <- OVERRIDE lastSowDate(hiField(h)), currentDate();
+    }
+}
+postHarvestAct 'Провести акт' (HarvestAct a) {
+    // КФ-У1 (ФТ1.6.3): повторное проведение запрещено (пробел этап-03 §15)
+    IF haStatus(a) = HarvestActStatus.posted THEN
+        MESSAGE 'Акт уже проведён — создание исправления этапом 2 не предусмотрено';
+    ELSE {
+        haStatus(a) <- HarvestActStatus.posted;
+        haPostedAt(a) <- currentDateTime();
+        IF currentUser() THEN haPostedBy(a) <- currentUser();
+        applyHarvestFact(a);
+        // КФ-И1: история поля — факты сезона года проведения
+        FOR HarvestActItem h IS HarvestActItem AND act(h) = a DO
+            rebuildFieldHistory(hiField(h));
+        kuPublish(KuEventKind.harvestPosted, 'HarvestAct', haNumber(a), 'Строк в акте: ' + (OVERRIDE ('' + (GROUP SUM 1 IF act(HarvestActItem h) = a)), '0'));
+        APPLY;
+    }
+}
+
+// ===================== Формы =====================
+
+
+// кнопки Excel-выгрузки (реализации — после объявления форм)
+nextStepBudget '→ Рассчитать бюджет' (ProdPlan p) ABSTRACT;
+exportProdPlansXls 'Выгрузить в Excel' () ABSTRACT;
+exportHarvestXls 'Выгрузить в Excel' () ABSTRACT;
+FORM prodPlans 'Годовые планы'
+    OBJECTS p = ProdPlan
+    PROPERTIES (p) READONLY ppNumber, planYear, namePpStatus, ppVersion, nameRotationPlan, areaByPlan, itemsNoCard, ppApprovedAt
+    PROPERTIES (p) NEWSESSION NEW, EDIT, DELETE, assignTechCardsBulk, approveProdPlan
+;
+
+// П.16: имена вместо числовых ИД + пикеры; карточка компактнее
+namePpOrganization 'Организация' (ProdPlan p) = OVERRIDE name(ppOrganization(p)), '';
+planYearShow 'Год планирования' (ProdPlan p) = '' + planYear(p);
+editPlanYearAct 'Изменить год…' (ProdPlan p) {
+    INPUT y = INTEGER DO planYear(p) <- y;
+}
+namePpRotation 'План севооборота' (ProdPlan p) = OVERRIDE number(rotationPlan(p)), '';
+FORM pickRotationPlan 'Выбор плана севооборота'
+    OBJECTS rp = RotationPlan
+    PROPERTIES (rp) READONLY number, startYear, namePlanStatus
+    ORDERS number(rp)
+;
+setPpOrganizationAct 'Выбрать организацию' (ProdPlan p) {
+    DIALOG pickOrganization OBJECTS o = ppOrganization(p) INPUT o NULL DO ppOrganization(p) <- o;
+}
+setPpRotationAct 'Выбрать план севооборота' (ProdPlan p) {
+    DIALOG pickRotationPlan OBJECTS rp = rotationPlan(p) INPUT rp NULL DO rotationPlan(p) <- rp;
+}
+FORM prodPlan 'Годовой план'
+    OBJECTS p = ProdPlan PANEL
+    PROPERTIES (p) ppNumber
+    PROPERTIES (p) READONLY planYearShow
+    PROPERTIES (p) editPlanYearAct
+    PROPERTIES (p) READONLY namePpStatus
+    PROPERTIES (p) READONLY namePpOrganization
+    PROPERTIES (p) setPpOrganizationAct SHOWIF NOT ppOrganization(p)
+    PROPERTIES (p) READONLY namePpRotation
+    PROPERTIES (p) setPpRotationAct SHOWIF NOT rotationPlan(p)
+    PROPERTIES (p) READONLY ppVersion, namePpAuthor, ppCreatedAt, ppApprovedAt, areaByPlan, itemsNoCard
+    PROPERTIES (p) assignTechCardsBulk, approveProdPlan, newHarvestAct
+
+    OBJECTS i = ProdPlanItem
+    PROPERTIES (i) NEWSESSION NEW, EDIT, DELETE
+    PROPERTIES (i) namePpField, ppArea, ppCrop, techCard, ppPlanYield, deviationNote
+    PROPERTIES (i) READONLY tcVersionItem, ppVolume
+    FILTERS ppPlan(i) = p
+    ORDERS namePpField(i)
+
+    EDIT ProdPlan OBJECT p
+;
+DESIGN prodPlan {
+    NEW head {
+        caption = '';
+        NEW row1 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(ppNumber(p));
+            MOVE PROPERTY(planYearShow(p));
+            MOVE PROPERTY(editPlanYearAct(p));
+            MOVE PROPERTY(namePpStatus(p));
+            MOVE PROPERTY(ppVersion(p));
+        }
+        NEW row2 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(namePpOrganization(p));
+            MOVE PROPERTY(setPpOrganizationAct(p));
+            MOVE PROPERTY(namePpRotation(p));
+            MOVE PROPERTY(setPpRotationAct(p));
+        }
+        NEW row3 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(namePpAuthor(p));
+            MOVE PROPERTY(ppCreatedAt(p));
+            MOVE PROPERTY(ppApprovedAt(p));
+            MOVE PROPERTY(areaByPlan(p));
+            MOVE PROPERTY(itemsNoCard(p));
+        }
+        NEW rowBtns {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(assignTechCardsBulk(p));
+            MOVE PROPERTY(approveProdPlan(p));
+            MOVE PROPERTY(newHarvestAct(p));
+        }
+}
+}
+
+
+FORM harvestActs 'Акты урожая'
+    OBJECTS a = HarvestAct
+    PROPERTIES (a) READONLY haNumber, nameHaStatus, prodPlan, haCreatedAt, haPostedAt
+    PROPERTIES (a) NEWSESSION NEW, EDIT, DELETE, postHarvestAct
+    PROPERTIES () exportHarvestXls
+;
+
+FORM harvestAct 'Акт учёта урожая'
+    OBJECTS a = HarvestAct PANEL
+    PROPERTIES (a) prodPlan, haNote
+    PROPERTIES (a) READONLY haNumber, nameHaStatus, haCreatedAt, haPostedAt, haAuthor, haPostedBy
+    PROPERTIES (a) postHarvestAct SHOWIF haStatus(a) = HarvestActStatus.draft
+
+    OBJECTS h = HarvestActItem
+    PROPERTIES (h) NEWSESSION NEW, EDIT, DELETE
+    // КФ-У1: проведённый акт иммутабелен (READONLYIF posted); У5: назначение/
+    // источник — имена вместо числовых id (enum) — READONLY
+    PROPERTIES (h) hiField, hiCrop, grossWeight, moisture, impurity, gradeCode, floorActNo
+        READONLYIF haStatus(act(h)) = HarvestActStatus.posted
+    PROPERTIES (h) READONLY namePurpose, nameDataSource
+    PROPERTIES (h) deviationReason SHOWIF hiCrop(h) AND hiCrop(h) != fsPlanCrop(seasonOf(hiField(h), extractYear((OVERRIDE haPostedAt(act(h)), haCreatedAt(act(h))))))
+    PROPERTIES (h) READONLY netWeight, factYieldT, planYieldT, devAbs, devPct
+    FILTERS act(h) = a
+
+    EDIT HarvestAct OBJECT a
+;
+
+// ===================== Excel-выгрузка =====================
+exportProdPlansXls () + {
+    PRINT prodPlans XLSX SHEET 'Годовые планы' TO exportFile;
+    open(exportFile());
+}
+
+exportHarvestXls () + {
+    PRINT harvestActs XLSX SHEET 'Акты урожая' TO exportFile;
+    open(exportFile());
+}
+
+nextStepBudget (ProdPlan p) + {
+    IF ppStatus(p) = ProdPlanStatus.approvedG THEN
+        MESSAGE 'План утверждён.\nСледующий шаг: рассчитать бюджет (раздел «Бюджеты» → «БДР»).';
+    ELSE
+        MESSAGE 'Сначала утвердите годовой план';
+}
+
+// ===================== История поля: наполнение (КФ-И1) =====================
+// Реализация хука KuLand (здесь видно всё: севообороты, строки ГП, акты).
+// Идемпотентно: «найти-или-создать» строку (поле, год), значения пересчиты-
+// ваются; append-only — ничего не удаляется; архив плана вклад не отменяет
+
+// последний утверждавшийся план поля, покрывающий год (позднее утверждение
+// выигрывает: GROUP LAST ORDER approvedAt; не-draft = approved + archived)
+bestPlanFor (Field f, INTEGER yr) = GROUP LAST plan(RotationPlanItem i)
+    ORDER approvedAt(plan(i)), plan(i)
+    IF field(i) = f AND planStatus(plan(i)) != RotationPlanStatus.draft
+        AND startYear(plan(i)) <= yr AND yr <= startYear(plan(i)) + horizonYears(plan(i)) - 1;
+planCropOf (Field f, INTEGER yr) = GROUP MAX cropYear(RotationPlanItem i, INTEGER yNo)
+    IF field(i) = f AND plan(i) = bestPlanFor(f, yr) AND startYear(plan(i)) + yNo - 1 = yr;
+// план-урожайность — из строки утверждённого ГП года (КФ-Г6)
+ppOfYear (Field f, INTEGER yr) = GROUP MAX ProdPlan p
+    IF planYear(p) = yr AND ppOrganization(p) = organization(f) AND ppStatus(p) = ProdPlanStatus.approvedG;
+planYieldOf (Field f, INTEGER yr) = GROUP MAX ppPlanYield(ProdPlanItem i)
+    IF ppField(i) = f AND ppPlan(i) = ppOfYear(f, yr);
+// год сезона акта — год ПЛАНА (сезон урожая), фолбэк — год даты проведения
+// (сид проводит акты текущей датой: без этого факт 2027 попадал в 2026)
+seasonYearOf (HarvestAct h) = (OVERRIDE planYear(prodPlan(h)), extractYear(haPostedAt(h)));
+// последний проведённый акт-итем поля за сезон (мульти-акты — последний)
+factItemOf (Field f, INTEGER yr) = GROUP LAST HarvestActItem h
+    ORDER haPostedAt(act(h)), h
+    IF hiField(h) = f AND haStatus(act(h)) = HarvestActStatus.posted AND seasonYearOf(act(h)) = yr;
+
+// год lastCrop-строки (NULL — не создавать): без фактов → прошлый сезон;
+// расхождение с самым ранним фактом → год перед ним
+firstFactYear (Field f) = GROUP MIN fsYear(FieldSeason s) IF fsField(s) = f AND fsFactCrop(s);
+lastCropSeason (Field f) =
+    IF NOT (GROUP MAX 1 IF fsFactCrop(FieldSeason s) AND fsField(s) = f) AND lastCrop(f) THEN extractYear(currentDate()) - 1
+    ELSE IF firstFactYear(f) AND lastCrop(f)
+        AND fsFactCrop(seasonOf(f, firstFactYear(f))) != lastCrop(f) THEN firstFactYear(f) - 1;
+buildFieldSeason (Field f, INTEGER yr) {
+    IF NOT (GROUP MAX FieldSeason s IF fsField(s) = f AND fsYear(s) = yr) THEN
+        NEW s = FieldSeason { fsField(s) <- f; fsYear(s) <- yr; }
+    APPLY;
+    FOR FieldSeason s IS FieldSeason AND fsField(s) = f AND fsYear(s) = yr DO {
+        fsPlanCrop(s) <- planCropOf(f, yr);
+        fsPlanYieldC(s) <- planYieldOf(f, yr);
+        fsFactCrop(s) <- hiCrop(factItemOf(f, yr));
+        fsFactYieldC(s) <- factYieldT(factItemOf(f, yr)) * 10.0;   // т/га → ц/га
+        fsReason(s) <- deviationReason(factItemOf(f, yr));
+        // lastCrop-строка: заполнение фактом lastCrop (год задан хуком)
+        IF NOT fsFactCrop(s) AND lastCrop(f) AND yr = (OVERRIDE lastCropSeason(f), 0) THEN
+            fsFactCrop(s) <- lastCrop(f);
+        fsSrc(s) <- IF fsPlanCrop(s) AND fsFactCrop(s) THEN 'план+факт'
+            ELSE IF fsPlanCrop(s) THEN 'план' ELSE 'факт';
+    }
+    APPLY;
+}
+refreshFieldHistory (Field f) + {
+    // годы из клеток утверждавшихся планов поля (пустые клетки не дают культуры)
+    FOR cropYear(RotationPlanItem i, INTEGER yNo) AND field(i) = f
+        AND planStatus(plan(i)) != RotationPlanStatus.draft
+    DO buildFieldSeason(f, startYear(plan(i)) + yNo - 1);
+    // сезоны проведённых актов (год — от плана, КФ-И1/эталоны: факт 2027)
+    FOR HarvestActItem h IS HarvestActItem AND hiField(h) = f AND haStatus(act(h)) = HarvestActStatus.posted
+    DO buildFieldSeason(f, seasonYearOf(act(h)));
+    // lastCrop-строка: фактов нет вовсе → прошлый календарный сезон; иначе
+    // если lastCrop ≠ культуре самого раннего факта → сезон ПЕРЕД ним
+    // (KH-004: ранний факт 2027-кукуруза, lastCrop томат → 2026-томат)
+    IF lastCropSeason(f) THEN
+        buildFieldSeason(f, lastCropSeason(f));
+}
+
+// ===================== Сид =====================
+kuOrgPp () = GROUP MAX Organization o IF name(o) = 'Омский АНЦ';
+baseRotPlan () = GROUP MAX RotationPlan r IF note(r) = 'Базовый 2027';
+fallowCrop () = GROUP MAX Crop c IF code(c) = 'ПАР-001';
+
+prodPlanSeed () {
+    // план
+    IF NOT (GROUP MAX ProdPlan p) AND baseRotPlan() THEN {
+        NEW p = ProdPlan {
+            ppNumber(p) <- 'ГП-2027-1';
+            planYear(p) <- 2027;
+            rotationPlan(p) <- baseRotPlan();
+            ppOrganization(p) <- kuOrgPp();
+        }
+        APPLY;
+    }
+    // строки плана (lookup'ами — LOCAL после APPLY не живёт)
+    IF NOT (GROUP MAX ProdPlanItem i) AND baseRotPlan() THEN {
+        FOR RotationPlanItem ri IS RotationPlanItem AND plan(ri) = baseRotPlan() DO {
+            LOCAL c = Crop ();
+            c() <- cropYear(ri, 2027 - startYear(plan(ri)) + 1);
+            IF c() AND code(c()) != 'ПАР-001' THEN
+                NEW i = ProdPlanItem {
+                    ppPlan(i) <- GROUP MAX ProdPlan p IF ppNumber(p) = 'ГП-2027-1';
+                    ppField(i) <- field(ri);
+                    ppCrop(i) <- c();
+                    techCard(i) <- GROUP MAX TechCard tc IF tcCrop(tc) = c() AND cardStatus(tc) = TechCardStatus.approved;
+                }
+        }
+        APPLY;
+    }
+    // статус годового плана — дозаправкой (WHEN SET даёт draft)
+    FOR ProdPlan p IS ProdPlan AND ppNumber(p) = 'ГП-2027-1' AND ppStatus(p) != ProdPlanStatus.approvedG DO {
+        ppStatus(p) <- ProdPlanStatus.approvedG;
+        ppApprovedAt(p) <- currentDateTime();
+    }
+    APPLY;
+    // акт урожая
+    IF NOT (GROUP MAX HarvestAct a) THEN {
+        IF (GROUP MAX ProdPlan p IF ppNumber(p) = 'ГП-2027-1') THEN
+            NEW a = HarvestAct { prodPlan(a) <- GROUP MAX ProdPlan p IF ppNumber(p) = 'ГП-2027-1'; }
+        APPLY;
+    }
+    IF NOT (GROUP MAX HarvestActItem h) THEN {
+        FOR Field f IS Field AND code(f) = 'KH-001' DO NEW h = HarvestActItem {
+            act(h) <- GROUP MAX HarvestAct a IF ppNumber(prodPlan(a)) = 'ГП-2027-1';
+            hiField(h) <- f;
+            hiCrop(h) <- currentCrop(f);
+            grossWeight(h) <- 510.0;
+            moisture(h) <- 14.0;
+            impurity(h) <- 2.0;
+            gradeCode(h) <- '3 кл.';
+            purpose(h) <- HarvestPurpose.food;
+            floorActNo(h) <- 'ТОК-117';
+            dataSource(h) <- HarvestSource.scale;
+        }
+        FOR Field f IS Field AND code(f) = 'KH-003' DO NEW h = HarvestActItem {
+            act(h) <- GROUP MAX HarvestAct a IF ppNumber(prodPlan(a)) = 'ГП-2027-1';
+            hiField(h) <- f;
+            hiCrop(h) <- currentCrop(f);
+            grossWeight(h) <- 620.0;
+            moisture(h) <- 13.0;
+            impurity(h) <- 1.5;
+            gradeCode(h) <- '3 кл.';
+            purpose(h) <- HarvestPurpose.food;
+            floorActNo(h) <- 'ТОК-118';
+            dataSource(h) <- HarvestSource.combine;
+        }
+        APPLY;
+        // провести акт через общий код (КФ-У6: lastCrop/lastSowDate/haPostedBy
+        // заполняются как при проведении через UI)
+        FOR HarvestAct a IS HarvestAct
+            AND ppNumber(prodPlan(a)) = 'ГП-2027-1' AND haStatus(a) != HarvestActStatus.posted
+        DO {
+            haStatus(a) <- HarvestActStatus.posted;
+            haPostedAt(a) <- currentDateTime();
+            applyHarvestFact(a);
+        }
+        APPLY;
+    }
+}

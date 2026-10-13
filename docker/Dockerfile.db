@@ -1,0 +1,44 @@
+FROM registry.altlinux.org/p11/base
+
+RUN apt-get update && apt-get install -y \
+    postgresql16 \
+    postgresql16-postgis \
+    && rm -rf /var/cache/apt/archives/*.rpm
+
+USER postgres
+# Кластер сразу в UTF-8 с русской локалью: дефолтный initdb даёт SQL_ASCII,
+# на котором ломается кириллица в запросах (invalid byte sequence UTF8)
+RUN initdb -D /var/lib/pgsql/data -E UTF8 --locale=ru_RU.utf8
+
+RUN echo "host all all 0.0.0.0/0 md5" >> /var/lib/pgsql/data/pg_hba.conf
+RUN echo "listen_addresses='*'" >> /var/lib/pgsql/data/postgresql.conf
+# WAL-архив (ФТ8.4 / v2.0: RPO 1 час): wal_level=replica + archive_command
+# в volume /var/lib/pgsql/wal (внутри mite_pgdata); восстановление на точку —
+# см. docs/08-operations.md §4а
+RUN echo "wal_level=replica" >> /var/lib/pgsql/data/postgresql.conf
+RUN echo "archive_mode=on" >> /var/lib/pgsql/data/postgresql.conf
+RUN echo "archive_command='test ! -f /var/lib/pgsql/wal/%f && cp %p /var/lib/pgsql/wal/%f'" >> /var/lib/pgsql/data/postgresql.conf
+RUN mkdir -p /var/lib/pgsql/wal
+
+USER root
+
+# Entrypoint без su: у postgres shell /sbin/nologin, "su - postgres -c"
+# падает с "exec failed". Скрипт целиком выполняется от USER postgres.
+RUN cat <<'EOF' > /entrypoint.sh
+#!/bin/bash
+# После жёсткой перезагрузки ВМ в /tmp остаются lock-файлы сокета, и pg_ctl
+# отказывается стартовать («another server might be running») — чистим.
+rm -f /tmp/.s.PGSQL.5432.lock /tmp/.s.PGSQL.5432
+pg_ctl -D /var/lib/pgsql/data -l /var/lib/pgsql/logfile start
+sleep 3
+psql -c "ALTER USER postgres PASSWORD '11111';"
+psql -c "CREATE DATABASE iot;"
+psql -d iot -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+tail -f /dev/null
+EOF
+
+RUN chmod +x /entrypoint.sh
+
+USER postgres
+EXPOSE 5432
+CMD ["/entrypoint.sh"]

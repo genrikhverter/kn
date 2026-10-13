@@ -1,0 +1,178 @@
+MODULE KuKnpApi;
+
+// Код Урожая: REST-ручки для интеграции с платформой KNP (АО «КНП»).
+// Контракт выровнен под шлюз KNP /api/v1/<слот>/* — слоты economics
+// (knp_economics — пустышка в KNP), simulation (knp_ai_simulation —
+// пустышка), yield (NPK-баланс), ku (события, карта — общий слот).
+// Вызывается мостом knp_bridge (mite_dev/knp_bridge/) через /exec.
+// JSON собирает платформа (EXPORT JSON FROM) — фигурные литералы не используются.
+REQUIRE KuBudget, KuYield, KuSimulation, KuLand, KuCrop;
+
+NAMESPACE Ku;
+
+// ===================== Слот economics: БДР =====================
+apiKnpBdr 'API KNP: БДР за год' (INTEGER yr) {
+    EXPORT JSON FROM
+        plan = nameBplProdPlan(BudgetPL b),
+        scenario = nameBplScenario(b),
+        status = nameBplStatus(b),
+        income = incomeTotal(b),
+        expense = expenseTotal(b),
+        margin = margin(b)
+    WHERE planYear(bplProdPlan(b)) = yr;
+    RETURN JSONFILE(exportFile());
+}
+
+apiKnpBdrItems 'API KNP: строки БДР' (ISTRING[20] planNumber) {
+    EXPORT JSON FROM
+        month = bplMonth(BudgetPLItem it),
+        kind = bplItemKind(it),
+        item = nameCostItem(it),
+        crop = name(bplCrop(it)),
+        amount = bplAmount(it)
+    WHERE ppNumber(bplProdPlan(budgetPL(it))) = planNumber;
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== Слот economics: БДДС =====================
+apiKnpBdds 'API KNP: БДДС за год' (INTEGER yr) {
+    EXPORT JSON FROM
+        plan = nameBcfBudgetPL(BudgetCF f),
+        status = nameBcfStatus(f),
+        month = bcfMonth(BudgetCFItem it),
+        move = nameMoveKind(it),
+        amount = bcfAmount(it),
+        source = bcfSource(it),
+        term = nameBcfTerm(it)
+    WHERE planYear(bplProdPlan(bcfBudgetPL(f))) = yr AND budgetCF(it) = f;
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== Слот economics: сценарии цен =====================
+apiKnpPrices 'API KNP: сценарии цен' () {
+    EXPORT JSON FROM
+        scenario = psName(PriceScenario s),
+        status = namePsStatus(s),
+        version = psVersion(s),
+        validFrom = psValidFrom(s),
+        validTo = psValidTo(s);
+    RETURN JSONFILE(exportFile());
+}
+
+apiKnpPriceItems 'API KNP: цены сценария' (ISTRING[100] scenarioName) {
+    EXPORT JSON FROM
+        nomenclature = namePsiNom(PriceScenarioItem it),
+        price = psiPrice(it)
+    WHERE psName(scenario(it)) = scenarioName;
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== Слот economics: витрины P&L =====================
+apiKnpNpk 'API KNP: баланс NPK поля' (ISTRING[16] fieldCode) {
+    EXPORT JSON FROM
+        element = nameNbElement(NutrientBalance b),
+        removal = removalPerTon(b),
+        soilReserve = soilReserve(b),
+        requiredDose = requiredDoseAi(b),
+        carrier = nomName(nbCarrier(b)),
+        costPerHa = fertCost(b),
+        targetYield = targetYieldPlan(nbPlan(b)),
+        planStatus = nameYpStatus(nbPlan(b))
+    WHERE ypField(nbPlan(b)) = fieldByCode(fieldCode)
+        AND ypVersion(nbPlan(b)) = (GROUP MAX ypVersion(ComplexPlan c) IF ypField(c) = fieldByCode(fieldCode));
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== Слот ku: события и карта =====================
+apiKnpEvents 'API KNP: бизнес-события' () {
+    EXPORT JSON FROM
+        kind = nameEventKind(KuEvent e),
+        at = eventAt(e),
+        user = eventUser(e),
+        objectKind = eventObjectKind(e),
+        objectId = eventObjectId(e),
+        payload = eventPayload(e);
+    RETURN JSONFILE(exportFile());
+}
+
+// КФ-ГК4: публичный GeoJSON полей с контурами (витрины/внешние потребители;
+// раньше — только через мост KNP); фильтр организации — как у карты
+apiMapGeoJson 'API: поля (GeoJSON)' () {
+    EXPORT JSON FROM
+        code = code(Field f),
+        name = name(f),
+        areaHa = areaHa(f),
+        crop = name(currentCrop(f)),
+        boundary = boundaryGeoJson(f)
+    WHERE boundaryGeoJson(f) AND kuMapOrgOk(f);
+    RETURN JSONFILE(exportFile());
+}
+
+apiKnpMapFields 'API KNP: поля для карты' () {
+    EXPORT JSON FROM
+        code = code(Field f),
+        name = name(f),
+        areaHa = areaHa(f),
+        crop = name(currentCrop(f)),
+        boundary = boundaryGeoJson(f),
+        lat = centerLat(f),
+        lon = centerLon(f);
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== Слот ku: переработка остатков (сервис KNP recycling) =====================
+// Расчёт экономики переработки соломы — внешний калькулятор knp_recycling
+// (быстрый API, конвертер в мосте). Сырьё: солома ≈ факт урожая по массе
+// (справочное соотношение для зерновых 1:1; для незерновых — уточнить).
+kuRecyclingBridgeUrl () = 'http://192.168.189.129:8090'; // мост на host-сети ВМ
+
+CLASS RecyclingCalc 'Расчёт переработки';
+TABLE recyclingCalc (RecyclingCalc);
+rcAt 'Время' = DATA DATETIME (RecyclingCalc) NONULL;
+rcKind 'Способ' = DATA ISTRING[20] (RecyclingCalc) NONULL;
+rcField 'Поле' = DATA Field (RecyclingCalc);
+nameRcField 'Поле' (RecyclingCalc r) = OVERRIDE name(rcField(r)), '';
+rcMassT 'Сырьё (солома), т' = DATA NUMERIC[12,2] (RecyclingCalc) NONULL;
+rcRevenue 'Выручка, ₽' = DATA NUMERIC[16,2] (RecyclingCalc);
+rcOpex 'Операционные затраты, ₽' = DATA NUMERIC[16,2] (RecyclingCalc);
+rcNetProfit 'Чистая прибыль, ₽' = DATA NUMERIC[16,2] (RecyclingCalc);
+rcRoi 'ROI, %' = DATA NUMERIC[10,2] (RecyclingCalc);
+rcCo2 'CO2 предотвращено, кг' = DATA NUMERIC[14,2] (RecyclingCalc);
+rcJson 'Ответ калькулятора (JSON)' = DATA TEXT (RecyclingCalc);
+WHEN SET (RecyclingCalc r IS RecyclingCalc) DO rcAt(r) <- currentDateTime();
+
+FORM recyclingCalcs 'Переработка остатков (KNP)'
+    OBJECTS r = RecyclingCalc
+    PROPERTIES (r) READONLY rcAt, rcKind, nameRcField, rcMassT, rcRevenue, rcOpex, rcNetProfit, rcRoi, rcCo2
+
+;
+
+// ===================== Слот ku: версии участков и журнал (hash-chain) =====================
+apiKnpPlotVersions 'API KNP: версии участка' (ISTRING[60] plotName) {
+    EXPORT JSON FROM
+        at = lpvAt(LandPlotVersion v),
+        user = lpvUser(v),
+        areaSqm = lpvAreaSqm(v),
+        status = lpvStatus(v),
+        cadastral = lpvCadastral(v),
+        reason = lpvReason(v),
+        snapshot = lpvSnapshot(v)
+    WHERE name(lpvPlot(v)) = plotName;
+    RETURN JSONFILE(exportFile());
+}
+
+apiKnpAudit 'API KNP: журнал изменений (hash-chain)' () {
+    EXPORT JSON FROM
+        seq = alSeq(KuAuditLog a),
+        at = alAt(a),
+        user = alUser(a),
+        entity = alEntity(a),
+        object = alObject(a),
+        field = alProperty(a),
+        oldValue = alOld(a),
+        newValue = alNew(a),
+        prevHash = alPrevHash(a),
+        hash = alHash(a);
+    RETURN JSONFILE(exportFile());
+}
+

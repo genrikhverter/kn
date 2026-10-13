@@ -1,0 +1,293 @@
+MODULE StoreTaskMite;
+
+// ExternalApp — запуск внешних приложений с главного экрана телефона (#36840).
+// Модуль намеренно не входит в StoreTaskLib: хост, которому он нужен, подключает его
+// сам — этой строкой. Хост без неё не несёт ни таблицы, ни формы, ни ручки.
+REQUIRE StoreTaskLib, ExternalApp, Authentication, SystemEvents,
+        Device, Location, OrgDevice, OrgUser, ManagementReport;
+
+NAMESPACE StoreTask;
+
+// Хост-пакет mite для подсистемы задач (тикет 31): исполнитель, мост точек
+// размещения (объект проверки — точка, тикет 36775), права по организациям
+// и сид шаблона аварии.
+
+// ===== 31.3 Исполнитель: сотрудник (Employee из management/ManagementReport) =====
+// Единый справочник людей: те же сотрудники, что в актах обработки инцидентов
+// (responsible/approver/registrant у ManagerLog), назначаются на задачи. Для входа
+// с мобильного сотрудник связывается с учётной записью; сотрудник без учётки —
+// валидный исполнитель (виден в истории и актах, но не логинится).
+EXTEND CLASS Employee : TaskPerformer;
+
+user 'Учётная запись' = DATA CustomUser (Employee);
+employee = GROUP AGGR Employee e BY user(e);
+loginUser 'Логин' (Employee e) = login(user(e));
+
+organization 'Организация' = DATA Organization (Employee);
+nameOrganization 'Организация' (Employee e) = name(organization(e));
+dismissed 'В архиве' = DATA BOOLEAN (Employee);
+
+id (Employee e) += ISTRING[100](OVERRIDE login(user(e)), 'emp-' + LONG(e));
+StoreTask.name (Employee e) += ISTRING[100](ManagementReport.name(e));
+archived (Employee e) += dismissed(e);
+in (Employee p, User u) += p = employee(u AS CustomUser);
+
+performer (CustomUser u) += employee(u);
+
+// ===== Канал 'employee' (#36841): «сотрудники этого магазина» =====
+// Штатное расписание mite — организация: сотрудники организации точки и есть её штат.
+// Поверх — роли на объекте (ядро, ObjectRole): ответственным может стоять и
+// подразделение (TaskUnit) — тогда сотрудниками объекта становится его состав,
+// с вложенными отделами (hasIn — транзитивно). Фильтр — подсказка для поиска, не
+// запрет (дизайн строк, раздел 12.5): не нашли здесь — apiRowSubjects отдаёт весь
+// канал или ищет по all=1.
+staffRole (Employee e, CheckObject o) =
+    GROUP SUM 1 IF hasIn(person(o, ObjectRole r), user(e)) AND active(r);
+available (Employee e, CheckObject o) +=
+    TRUE IF organization(e) = organization(o AS Location) OR staffRole(e, o);
+// в архиве = выбыл из справочника (retired уже реализован ядром поверх archived —
+// см. RefPerformer: dismissed сюда доезжает через archived(Employee))
+
+// справочник сотрудников (у mite-овского Employee своей формы не было)
+changeUser (Employee e) {
+    DIALOG customUsersDialog OBJECTS u = user(e) INPUT NULL DO user(e) <- u;
+}
+
+FORM employees 'Сотрудники'
+    OBJECTS e = Employee
+    PROPERTIES(e) name, position, nameOrganization, loginUser ON CHANGE changeUser(e), dismissed
+    PROPERTIES(e) NEW, DELETE
+
+    FILTERGROUP active
+        FILTER 'Действующие' NOT dismissed(e) DEFAULT
+;
+
+NAVIGATOR {
+    data {
+        NEW employees AFTER organizationUsers;
+    }
+}
+
+// ===== 31.2 Мост точек: точка размещения — объект проверки (тикет 36775) =====
+// Объект проверки — место, куда человек приезжает, а не датчик, который там висит.
+// Пока объектом был прибор, на одной точке было столько объектов, сколько датчиков,
+// а гео-гейт по построению выбирает один — задачи соседних датчиков той же точки
+// были не видны в принципе (три прибора «Соседей» в Уручье, задача на витрине
+// пропадала из списка).
+EXTEND CLASS Location : CheckObject;
+
+// Location.name/address — явно: голый name(l) в этом неймспейсе означает
+// StoreTask.name(CheckObject), потому что Location теперь наследник CheckObject,
+// а текущий неймспейс при разборе имени идёт первым (та же гоча, что была у моста
+// приборов с Device.id).
+StoreTask.name (Location l) += ISTRING[150](Location.name(l));
+address (Location l) += ISTRING[250](Location.address(l));
+
+// Код точки — тот же ключ, что в справочнике: по нему приложение адресует объект
+// (objectId в apiTasks) и фильтрует задачи «точки, на которой я стою».
+StoreTask.id (Location l) += ISTRING[30](Location.code(l));
+
+// Координаты: свои, иначе — последнего отчитавшегося прибора точки. Fallback
+// держит машины MachineBot живыми объектами проверки: собственных координат у
+// машины нет, её возит GPS из телеметрии прибора (Location.latitude(Device) —
+// OVERRIDE замера и точки размещения).
+lastReportedDevice (Location l) = GROUP LAST Device d ORDER dateTime(lastMeasurement(d)), d WHERE location(d) = l;
+StoreTask.latitude (Location l) += DOUBLE(OVERRIDE Location.latitude(l), Location.latitude(lastReportedDevice(l)));
+StoreTask.longitude (Location l) += DOUBLE(OVERRIDE Location.longitude(l), Location.longitude(lastReportedDevice(l)));
+
+// Задача продолжает указывать на конкретное оборудование: прибор — отдельным
+// свойством, а не объектом проверки.
+device 'Прибор' = DATA Device (Task);
+idDevice 'Прибор' (Task t) = STRING(Device.id(device(t)));
+
+// Единица оборудования прибора («Уручье · горка молочная»). Реализация — в Scheme,
+// где живёт EquipmentUnit: сюда Scheme не подтянуть, Scheme -> Mite -> StoreTaskMite
+// замкнулись бы в цикл REQUIRE.
+unitName 'Оборудование' = ABSTRACT ISTRING[80] (Device);
+nameUnit 'Оборудование' (Task t) = unitName(device(t));
+
+EXTEND FORM tasks
+    PROPERTIES(t) READONLY idDevice, nameUnit
+;
+EXTEND FORM task
+    PROPERTIES(t) READONLY idDevice, nameUnit
+;
+DESIGN task {
+    params {
+        MOVE PROPERTY(idDevice(t));
+        MOVE PROPERTY(nameUnit(t));
+    }
+}
+
+// ===== Права: организация задачи выводится из её точки, не хранится.
+// Орг-пользователь видит и назначает только в рамках своей организации;
+// пользователи без организации (глобальные) не ограничены.
+EXTEND FORM tasks
+    FILTERS NOT organization(checkObject(t) AS Location) != organization(currentUser())
+;
+EXTEND FORM checkObjects
+    FILTERS NOT organization(o AS Location) != organization(currentUser())
+;
+EXTEND FORM taskPerformers
+    FILTERS NOT organization(p AS Employee) != organization(currentUser())
+;
+
+CONSTRAINT organization(assignedTo(Task t) AS Employee) != organization(checkObject(t) AS Location)
+    CHECKED BY assignedTo[Task]
+    MESSAGE 'Исполнитель и объект задачи принадлежат разным организациям';
+
+// Орг-роли mite (fillDefaultAccess) запрещают весь навигатор через forbid System.root —
+// дерево у орг-пользователя пустое, и веб-клиент падает на нём (NPE на null root).
+// Разрешаем орг-ролям ветку задач: исполнитель видит «Управление персоналом», дерево непустое.
+// Ближайший permit перебивает унаследованный от корня forbid; ручные настройки не трогаем.
+permitStoreTaskFolder (UserRole r) {
+    IF r IS UserRole AND NOT dataPermission(r, navigatorElementCanonicalName('StoreTask.storeTask')) THEN
+        dataPermission(r, navigatorElementCanonicalName('StoreTask.storeTask')) <- Permission.permit;
+}
+
+onStarted() + {
+    permitStoreTaskFolder(userRoleSID('orgadmin'));
+    permitStoreTaskFolder(userRoleSID('orguser'));
+}
+
+// ===== 31.4 Сид шаблона «Авария: отклонение температуры» (идемпотентный) =====
+emergencyTemplateName () = ISTRING[150]('Авария: отклонение температуры');
+emergencyTemplate () = templateByName(emergencyTemplateName());
+
+ensureEmergencyTemplate () {
+    NEWSESSION {
+        IF NOT taskType('form') THEN NEW tt = TaskType { name(tt) <- 'Процедура'; id(tt) <- 'form'; }
+        APPLY;
+    }
+    NEWSESSION {
+        IF NOT optionSetByName('Причины отклонения температуры') THEN NEW os = OptionSet {
+            name(os) <- 'Причины отклонения температуры';
+            NEW o = Option { optionSet(o) <- os; code(o) <- 'door_open'; name(o) <- 'Открыта дверь/крышка'; }
+            NEW o = Option { optionSet(o) <- os; code(o) <- 'equipment'; name(o) <- 'Сбой холодильного оборудования'; }
+            NEW o = Option { optionSet(o) <- os; code(o) <- 'power'; name(o) <- 'Отключение электропитания'; }
+            NEW o = Option { optionSet(o) <- os; code(o) <- 'sensor'; name(o) <- 'Неисправность датчика'; }
+            NEW o = Option { optionSet(o) <- os; code(o) <- 'loading'; name(o) <- 'Загрузка/выгрузка товара'; }
+            NEW o = Option { optionSet(o) <- os; code(o) <- 'other'; name(o) <- 'Другое'; }
+        }
+        APPLY;
+    }
+    NEWSESSION {
+        IF NOT emergencyTemplate() THEN NEW tpl = Template {
+            name(tpl) <- emergencyTemplateName();
+            note(tpl) <- 'Выезд по инциденту телеметрии MITE';
+            resolutionRequired(tpl) <- TRUE;
+            NEW s = Section { template(s) <- tpl; name(s) <- 'Прибор';
+                NEW f = Field { section(f) <- s; code(f) <- 'qr'; name(f) <- 'QR-код прибора'; type(f) <- FieldType.scan; required(f) <- TRUE; }
+            }
+            NEW s = Section { template(s) <- tpl; name(s) <- 'Температура';
+                NEW f = Field { section(f) <- s; code(f) <- 'temp_mite'; name(f) <- 'Температура по MITE'; type(f) <- FieldType.number; unit(f) <- '°C'; }
+                NEW f = Field { section(f) <- s; code(f) <- 'temp_local'; name(f) <- 'Температура на месте'; type(f) <- FieldType.number; unit(f) <- '°C';
+                                minNorm(f) <- 2.0; maxNorm(f) <- 8.0; required(f) <- TRUE; requirePhoto(f) <- TRUE; hint(f) <- 'Норма 2–8 °C; при отклонении — фото'; }
+            }
+            NEW s = Section { template(s) <- tpl; name(s) <- 'Причина и действия';
+                NEW f = Field { section(f) <- s; code(f) <- 'cause'; name(f) <- 'Причина отклонения'; type(f) <- FieldType.choice;
+                                optionSet(f) <- optionSetByName('Причины отклонения температуры'); required(f) <- TRUE; }
+                NEW f = Field { section(f) <- s; code(f) <- 'fixed_on_site'; name(f) <- 'Устранено на месте'; type(f) <- FieldType.boolean; required(f) <- TRUE; }
+                NEW f = Field { section(f) <- s; code(f) <- 'photo_device'; name(f) <- 'Фото прибора'; type(f) <- FieldType.photo; required(f) <- TRUE; }
+                NEW f = Field { section(f) <- s; code(f) <- 'writeoff_kg'; name(f) <- 'Списание, кг'; type(f) <- FieldType.number; unit(f) <- 'кг'; }
+            }
+            NEW s = Section { template(s) <- tpl; name(s) <- 'Итог';
+                NEW f = Field { section(f) <- s; code(f) <- 'comment'; name(f) <- 'Комментарий'; type(f) <- FieldType.longtext; }
+            }
+        }
+        APPLY;
+    }
+}
+
+onStarted() + { ensureEmergencyTemplate(); }
+
+// ===== 31.5 Правило «инцидент → задача» =====
+// Инцидент — ManagerLog со взведённым isOn (сработало условие управления). По нему
+// создаётся задача «Процедура» по шаблону аварии на прибор инцидента. Гейт тот же,
+// что у уведомлений: active = «Условие уведомления» + доменное подавление
+// (MachineBot «вне рейса»); пока уведомления подавлены — задачи нет.
+
+task 'Задача' = DATA Task (ManagerLog);
+incidentManager (Task t) = GROUP MAX manager(ManagerLog l) IF task(l) = t;
+// одна открытая задача на управление: повторные срабатывания цепляются к ней, дубли не создаются
+openIncidentTask (ControllerManager m) = GROUP LAST Task t ORDER t WHERE opened(t) AND incidentManager(t) = m;
+
+// прибор инцидента: устройство, на которое заведено управление по шаблону, иначе — датчик из условий
+incidentDevice (ControllerManager m) = OVERRIDE ControllerManagement.templateDevice(m),
+    (GROUP MAX Device d IF usedValue(m, d));
+incidentMeasurementType (ControllerManager m) = GROUP MAX MeasurementType mt IF used(m, incidentDevice(m), mt);
+
+// телеметрия на момент срабатывания: в задачу пишется снимок — текущее значение уйдёт,
+// а исполнитель должен видеть то, из-за чего случился выезд
+incidentValue (ControllerManager m) = lastValue(incidentDevice(m), incidentMeasurementType(m));
+incidentMin (ControllerManager m) = minValue(m, incidentDevice(m), incidentMeasurementType(m));
+incidentMax (ControllerManager m) = maxValue(m, incidentDevice(m), incidentMeasurementType(m));
+
+incidentValue 'Значение по MITE' = DATA DOUBLE (Task);
+incidentMin 'Порог, от' = DATA DOUBLE (Task);
+incidentMax 'Порог, до' = DATA DOUBLE (Task);
+
+priorityByDeviation (DeviationStatus s) = OVERRIDE
+    (taskPriority('urgent') IF s = DeviationStatus.critical),
+    (taskPriority('high') IF s = DeviationStatus.significant),
+    (taskPriority('low') IF s = DeviationStatus.insignificant);
+
+WHEN SET(ManagerLog l IS ManagerLog) AND isOn(l)
+        AND ControllerManagement.active(manager(l))
+        AND incidentDevice(manager(l)) DO {
+    IF openIncidentTask(manager(l)) THEN
+        task(l) <- openIncidentTask(manager(l));
+    ELSE
+        NEW t = Task {
+            type(t) <- formTaskType();
+            template(t) <- emergencyTemplate();
+            // имя — с единицей оборудования: «Авария: отклонение температуры —
+            // Притыцкого · ларь заморозки»; без юнита CONCAT оставит голое имя шаблона
+            name(t) <- (CONCAT ' — ', emergencyTemplateName(), unitName(incidentDevice(manager(l))));
+            checkObject(t) <- location(incidentDevice(manager(l)));
+            device(t) <- incidentDevice(manager(l));
+            priority(t) <- OVERRIDE priorityByDeviation(deviationStatus(l)), taskPriority('normal');
+            incidentValue(t) <- incidentValue(manager(l));
+            incidentMin(t) <- incidentMin(manager(l));
+            incidentMax(t) <- incidentMax(manager(l));
+            description(t) <- (CONCAT '\n',
+                'Инцидент MITE: ' + (CONCAT ', ', nameManager(l), toChar(dateTime(l), 'DD.MM.YYYY HH24:MI')),
+                (CONCAT ' ', name(incidentMeasurementType(manager(l))) + ':',
+                    STRING(incidentValue(manager(l))),
+                    '(порог ' + STRING(incidentMin(manager(l))) + ' – ' + STRING(incidentMax(manager(l))) + ')'));
+            task(l) <- t;
+        }
+}
+
+// оператор проставил статус отклонения — приоритет ещё открытой задачи следует за ним
+WHEN SETCHANGED(deviationStatus(ManagerLog l)) AND opened(task(l)) DO
+    priority(task(l)) <- OVERRIDE priorityByDeviation(deviationStatus(l)), taskPriority('normal');
+
+// исполнитель начал выезд — поле «Температура по MITE» предзаполняется снимком телеметрии
+WHEN SET(Filling f IS Filling) AND incidentValue(task(f)) DO
+    numberValue(f, field(template(f), 'temp_mite')) <- NUMERIC[14,4](incidentValue(task(f)));
+
+// ===== 31.6 Обратный ход: завершение выезда закрывает инцидент =====
+fixedOnSite (Filling f) = boolValue(f, field(template(f), 'fixed_on_site'));
+actionsText (Filling f) = (CONCAT '\n',
+    ('Устранено на месте: ' + (IF fixedOnSite(f) == TTRUE THEN 'да' ELSE 'нет')) IF fixedOnSite(f),
+    'Списание: ' + STRING(numberValue(f, field(template(f), 'writeoff_kg'))) + ' кг',
+    textValue(f, field(template(f), 'comment')));
+
+onFinish(Filling f) + {
+    FOR task(ManagerLog l) = task(f) DO {
+        proceeded(l) <- TRUE;
+        actionsDone(l) <- actionsText(f);
+        decision(l) <- caption(resolution(f));
+    }
+}
+
+// ===== 31.7 Задача в форме обработки инцидентов =====
+idTask 'Задача' (ManagerLog l) = id(task(l));
+nameStatusTask 'Статус задачи' (ManagerLog l) = nameStatus(task(l));
+showTask 'Открыть задачу' (ManagerLog l) { SHOW task OBJECTS t = task(l) DOCKED MANAGESESSION; }
+
+EXTEND FORM managerLogs
+    PROPERTIES (ml) READONLY idTask, nameStatusTask
+    PROPERTIES (ml) showTask TOOLBAR SHOWIF task(ml)
+;

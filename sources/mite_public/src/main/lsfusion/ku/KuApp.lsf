@@ -1,0 +1,357 @@
+MODULE KuApp;
+
+// Зонтик «Код Урожая»: единая точка сборки Ku-модулей.
+// Схема подключения — docs/06-generation-guide.md §2; по мере готовности
+// сюда добавляются REQUIRE (KuRotation, KuTechCard, ... — волны 2–5).
+REQUIRE Mite, KuCrop, KuLand, KuRotation, KuTechCard, KuProdPlan, KuBudget, KuYield, KuSimulation, KuAnalytics, KuEtl, KuIntegration, KuKnpApi, KuKnpApiEtl, KuKnp, KuHerd, KuFleet;
+
+NAMESPACE Ku;
+
+// Гвард демо-данных: весь build — прототип-стенд, умолчание TRUE
+// (выключается явным сбросом свойства). Аналог Mite.standMode из Agro-кейса,
+// который в исходниках не определён и на сборку не опираемся.
+kuStandMode 'Демо-стенд КУ' = DATA BOOLEAN ();
+standModeKu () = OVERRIDE kuStandMode(), TRUE;
+
+
+// ===================== Роли «Код Урожая» (UI-604, ролевая модель спецификации v2.0) =====================
+// 9 прикладных ролей покрывают 12 ролей модели v2.0: юрист совмещается со
+// специалистом по земле, учётчик урожая — с планировщиком, администратор —
+// системная роль LSfusion.
+isKuAgronomist 'Агроном (КУ)' = DATA BOOLEAN (UserRole);
+isKuLandSpec 'Специалист по земле (КУ)' = DATA BOOLEAN (UserRole);
+isKuPlanner 'Планировщик (КУ)' = DATA BOOLEAN (UserRole);
+isKuModeler 'Агромоделирование (КУ)' = DATA BOOLEAN (UserRole);
+isKuEconomist 'Экономист (КУ)' = DATA BOOLEAN (UserRole);
+isKuAccountant 'Бухгалтер по аренде (КУ)' = DATA BOOLEAN (UserRole);
+isKuDispatcher 'Диспетчер (КУ)' = DATA BOOLEAN (UserRole);
+isKuDataEngineer 'Инженер данных (КУ)' = DATA BOOLEAN (UserRole);
+isKuDirector 'Руководитель (КУ)' = DATA BOOLEAN (UserRole);
+copy(UserRole to, UserRole fr) + {
+    isKuAgronomist(to) <- isKuAgronomist(fr);
+    isKuLandSpec(to) <- isKuLandSpec(fr);
+    isKuPlanner(to) <- isKuPlanner(fr);
+    isKuModeler(to) <- isKuModeler(fr);
+    isKuEconomist(to) <- isKuEconomist(fr);
+    isKuAccountant(to) <- isKuAccountant(fr);
+    isKuDispatcher(to) <- isKuDispatcher(fr);
+    isKuDataEngineer(to) <- isKuDataEngineer(fr);
+    isKuDirector(to) <- isKuDirector(fr);
+}
+EXTEND FORM securityPolicy PROPERTIES (ur) isKuAgronomist, isKuLandSpec, isKuPlanner, isKuModeler,
+    isKuEconomist, isKuAccountant, isKuDispatcher, isKuDataEngineer, isKuDirector;
+
+userIsKuAgronomist (CustomUser u) = GROUP MAX isKuAgronomist(UserRole r) IF in(u, r);
+userIsKuLandSpec (CustomUser u) = GROUP MAX isKuLandSpec(UserRole r) IF in(u, r);
+userIsKuPlanner (CustomUser u) = GROUP MAX isKuPlanner(UserRole r) IF in(u, r);
+userIsKuModeler (CustomUser u) = GROUP MAX isKuModeler(UserRole r) IF in(u, r);
+userIsKuEconomist (CustomUser u) = GROUP MAX isKuEconomist(UserRole r) IF in(u, r);
+userIsKuAccountant (CustomUser u) = GROUP MAX isKuAccountant(UserRole r) IF in(u, r);
+userIsKuDispatcher (CustomUser u) = GROUP MAX isKuDispatcher(UserRole r) IF in(u, r);
+userIsKuDataEngineer (CustomUser u) = GROUP MAX isKuDataEngineer(UserRole r) IF in(u, r);
+userIsKuDirector (CustomUser u) = GROUP MAX isKuDirector(UserRole r) IF in(u, r);
+kuRoleCount (CustomUser u) = GROUP SUM 1 IF in(u, UserRole r)
+    AND (isKuAgronomist(r) OR isKuLandSpec(r) OR isKuPlanner(r) OR isKuModeler(r)
+        OR isKuEconomist(r) OR isKuAccountant(r) OR isKuDispatcher(r) OR isKuDataEngineer(r) OR isKuDirector(r));
+// пока пользователю не назначена ни одна роль КУ — видно всё (демо-режим);
+// назначение роли скрывает чужие разделы
+kuRolesAssigned () = (OVERRIDE kuRoleCount(currentUser()), 0) > 0;
+seeKuAllNav () = NOT kuRolesAssigned();
+// Агроному — «Земля» по спецификации v2.0 (агрохиманализ UI-106, агро-сводка UI-105)
+seeKuLandNav () = seeKuAllNav() OR userIsKuLandSpec(currentUser()) OR userIsKuAccountant(currentUser()) OR userIsKuDirector(currentUser()) OR userIsKuAgronomist(currentUser());
+// КП03 (ПМИ): годовой план формирует в т.ч. Экономист
+seeKuPlanNav () = seeKuAllNav() OR userIsKuPlanner(currentUser()) OR userIsKuAgronomist(currentUser()) OR userIsKuEconomist(currentUser()) OR userIsKuDirector(currentUser());
+// КФ-Ж1: животноводство — экономист/руководитель (как «Бюджеты»)
+seeKuHerdNav () = seeKuAllNav() OR userIsKuEconomist(currentUser()) OR userIsKuDirector(currentUser());
+seeKuMoneyNav () = seeKuAllNav() OR userIsKuPlanner(currentUser()) OR userIsKuEconomist(currentUser()) OR userIsKuDirector(currentUser());
+seeKuAgroNav () = seeKuAllNav() OR userIsKuAgronomist(currentUser()) OR userIsKuDispatcher(currentUser());
+// КП05/КП06 (ПМИ): моделирование и сценарии запускает Главный агроном;
+// Руководителю — прогноз урожая (ключевой показатель ролевой модели v2.0)
+seeKuSimNav () = seeKuAllNav() OR userIsKuModeler(currentUser()) OR userIsKuDataEngineer(currentUser()) OR userIsKuAgronomist(currentUser()) OR userIsKuDirector(currentUser());
+
+onWebClientInit() + { onWebClientInit('maptalks.min.js') <- 20; onWebClientInit('kumap.js') <- 21; onWebClientInit('kumap.css') <- 22; }
+// kuhome-дашборд (параллельная доработка): echarts до компонента
+onWebClientInit() + { onWebClientInit('echarts.min.js') <- 30; onWebClientInit('kuhome.js') <- 31; onWebClientInit('kudash.js') <- 32; }
+// чат ИИ-ассистента KNP (раздел «Платформа КНП»)
+onWebClientInit() + { onWebClientInit('kuai.js') <- 40; onWebClientInit('kuportal.js') <- 41; }
+// агродиспетчер 3D (Three.js)
+onWebClientInit() + { onWebClientInit('fleet3d.js') <- 50; }
+
+// Роли КУ создаются через fillDefaultAccess (OrgUser) — он запрещает весь
+// навигатор (forbid System.root). Дерево у такого пользователя ПУСТОЕ, и
+// веб-клиент падает NPE на пустом навигаторе (см. permitStoreTaskFolder в
+// StoreTaskMite.lsf — тот же дефект у орг-ролей). Ближайший permit
+// перебивает унаследованный от корня forbid; ручные настройки не трогаем.
+permitKuFolder (UserRole r) {
+    IF r IS UserRole AND NOT dataPermission(r, navigatorElementCanonicalName('Ku.ku')) THEN
+        dataPermission(r, navigatorElementCanonicalName('Ku.ku')) <- Permission.permit;
+    // вкладка «MITE» рядом с «Код Урожая»: роли КУ должны видеть её и корни
+    // наследия (пустая папка в тулбаре скрывается, дети наследуют permit)
+    IF r IS UserRole AND NOT dataPermission(r, navigatorElementCanonicalName('Ku.miteTab')) THEN
+        dataPermission(r, navigatorElementCanonicalName('Ku.miteTab')) <- Permission.permit;
+    IF r IS UserRole AND NOT dataPermission(r, navigatorElementCanonicalName('Base.monitoring')) THEN
+        dataPermission(r, navigatorElementCanonicalName('Base.monitoring')) <- Permission.permit;
+    IF r IS UserRole AND NOT dataPermission(r, navigatorElementCanonicalName('MasterData.masterData')) THEN
+        dataPermission(r, navigatorElementCanonicalName('MasterData.masterData')) <- Permission.permit;
+    IF r IS UserRole AND NOT dataPermission(r, navigatorElementCanonicalName('StoreTask.storeTask')) THEN
+        dataPermission(r, navigatorElementCanonicalName('StoreTask.storeTask')) <- Permission.permit;
+    // дефолтный элемент роли: иначе fillDefaultAccess открывает MITE-форму
+    // «Расположения» первой (defaultNumber Location.locations = 1)
+    IF r IS UserRole AND NOT defaultNumber(r, navigatorElementCanonicalName('Ku.kuHome')) THEN
+        defaultNumber(r, navigatorElementCanonicalName('Ku.kuHome')) <- 1;
+    // и снимаем MITE-дефолты (4 вкладки «Управление/Датчики/...» при входе):
+    // они выставлены fillDefaultAccess автоматически, не вручную
+    defaultNumber(r, navigatorElementCanonicalName('Location.locations')) <- NULL;
+    defaultNumber(r, navigatorElementCanonicalName('Device.devices')) <- NULL;
+    defaultNumber(r, navigatorElementCanonicalName('Controller.controllers')) <- NULL;
+    defaultNumber(r, navigatorElementCanonicalName('ControllerManagement.controllerManagers')) <- NULL;
+}
+
+onStarted() + {
+    // роли КУ (по образцу logist в Mite.lsf); ролевая модель — спецификация v2.0
+    IF NOT userRoleSID('ku_agronomist') THEN NEW r = UserRole { sid(r) <- 'ku_agronomist'; name(r) <- 'КУ: Агроном'; isOrg(r) <- TRUE; isKuAgronomist(r) <- TRUE; fillDefaultAccess(r); }
+    IF NOT userRoleSID('ku_land') THEN NEW r = UserRole { sid(r) <- 'ku_land'; name(r) <- 'КУ: Специалист по земле'; isOrg(r) <- TRUE; isKuLandSpec(r) <- TRUE; fillDefaultAccess(r); }
+    IF NOT userRoleSID('ku_planner') THEN NEW r = UserRole { sid(r) <- 'ku_planner'; name(r) <- 'КУ: Планировщик'; isOrg(r) <- TRUE; isKuPlanner(r) <- TRUE; fillDefaultAccess(r); }
+    IF NOT userRoleSID('ku_modeler') THEN NEW r = UserRole { sid(r) <- 'ku_modeler'; name(r) <- 'КУ: Агромоделирование'; isOrg(r) <- TRUE; isKuModeler(r) <- TRUE; fillDefaultAccess(r); }
+    IF NOT userRoleSID('ku_economist') THEN NEW r = UserRole { sid(r) <- 'ku_economist'; name(r) <- 'КУ: Экономист'; isOrg(r) <- TRUE; isKuEconomist(r) <- TRUE; fillDefaultAccess(r); }
+    IF NOT userRoleSID('ku_accountant') THEN NEW r = UserRole { sid(r) <- 'ku_accountant'; name(r) <- 'КУ: Бухгалтер по расчётам с арендодателями'; isOrg(r) <- TRUE; isKuAccountant(r) <- TRUE; fillDefaultAccess(r); }
+    IF NOT userRoleSID('ku_dispatcher') THEN NEW r = UserRole { sid(r) <- 'ku_dispatcher'; name(r) <- 'КУ: Диспетчер'; isOrg(r) <- TRUE; isKuDispatcher(r) <- TRUE; fillDefaultAccess(r); }
+    IF NOT userRoleSID('ku_dataengineer') THEN NEW r = UserRole { sid(r) <- 'ku_dataengineer'; name(r) <- 'КУ: Инженер данных'; isOrg(r) <- TRUE; isKuDataEngineer(r) <- TRUE; fillDefaultAccess(r); }
+    IF NOT userRoleSID('ku_director') THEN NEW r = UserRole { sid(r) <- 'ku_director'; name(r) <- 'КУ: Руководитель'; isOrg(r) <- TRUE; isKuDirector(r) <- TRUE; fillDefaultAccess(r); }
+    APPLY;
+    // веб-клиент у ролей КУ без этого падает NPE (пустой навигатор, см. выше)
+    permitKuFolder(userRoleSID('ku_agronomist'));
+    permitKuFolder(userRoleSID('ku_land'));
+    permitKuFolder(userRoleSID('ku_planner'));
+    permitKuFolder(userRoleSID('ku_modeler'));
+    permitKuFolder(userRoleSID('ku_economist'));
+    permitKuFolder(userRoleSID('ku_accountant'));
+    permitKuFolder(userRoleSID('ku_dispatcher'));
+    permitKuFolder(userRoleSID('ku_dataengineer'));
+    permitKuFolder(userRoleSID('ku_director'));
+    // п.1 обзора 12.10(2-я порция): платформа включает у роли admin детальные
+    // тултипы свойств (showDetailedInfo — «Каноническое имя…» при наведении);
+    // на карте они перекрывают компонент и перехватывают клики — отключаем
+    FOR UserRole r IS UserRole AND sid(r) = 'admin' DO showDetailedInfo(r) <- NULL;
+    APPLY;
+    IF standModeKu() THEN {
+        cropSeed();
+        stressTypeCodesSeed();   // КФ-А4: коды/группы типов стресса
+        landSeed();
+        kuSoilSeed();   // типы измерений датчиков почвы (N/P/K) — до генератора телеметрии
+        rotationSeed();
+        unitSeed();   // п.12 UI-обзора: дозаправка базовых единиц ОКЕИ
+        techCardSeed();
+        prodPlanSeed();
+        budgetSeed();
+        marketPriceSeed();   // рыночные ценовые ориентиры (октябрь 2026)
+        yieldSeed();
+        simulationSeed();
+        externalDataSeed();   // внешние данные: метео (нормы/прогноз), NDVI
+        // платформенный дефолт таймаута внешнего HTTP — 30 минут: зависший
+        // wttr.in блокировал onStarted и весь старт сервера (401 на всё);
+        // ограничиваем СЕССИЮ сида 30 секундами (timeoutHttp — DATA LOCAL)
+        timeoutHttp() <- 30000;
+        kuUpdateWeather();      // живой прогноз погоды по точкам (OWM/wttr.in) при старте стенда
+        glossarySeed();
+        etlSeed();
+        martFieldsSeed();
+        varietySeed();
+        herdSeed();   // КФ-Ж: животноводческий контур (идемпотентно)
+        rebuildAllFieldHistory();   // КФ-И1: backfill истории полей (идемпотентно)
+        // КФ-С1 (11.10): бэкфилл NDVI-детекций в реестр — эталон демо-стресса
+        // KH-001 (−28%) переживает переход вычислений на материализованный реестр;
+        // NEWSESSION на итерацию — APPLY внутри refreshNdviDetections (quirks)
+        FOR Field f IS Field DO
+            NEWSESSION refreshNdviDetections(f);
+        prodCropMigrate();   // КФ-8: продукция → ссылка на культуру (идемпотентно)
+        nomGroupMigrate();   // КФ-П2: группы номенклатуры (идемпотентно)
+        endpointSeed();   // профили внешних систем (ФГИС/1С)
+        // дашборд «сегодня»: снапшот строится императивно (SQL-взрыв — см. KuAnalytics)
+        refreshKuHome();
+        refreshKuDash();   // графики аналитики (ECharts, волна 5) — готовы к открытию
+        // демо-материал «банковской» линии (docs/11 Б2): утверждённая ведомость
+        // по договорам с задолженностью + заявки на ДС из неё
+        IF NOT (GROUP MAX PaymentSheet s) AND (GROUP MAX LeaseContract c IF balanceContract(c) > 0) THEN {
+            NEW s = PaymentSheet {
+                sheetOrganization(s) <- GROUP MAX Organization o IF name(o) = 'Омский АНЦ';
+                periodFrom(s) <- 2026_07_01; periodTo(s) <- 2026_09_30;
+            }
+            APPLY;
+            FOR LeaseContract c IS LeaseContract AND balanceContract(c) > 0 DO
+                NEW i = PaymentSheetItem {
+                    sheet(i) <- GROUP MAX PaymentSheet s;
+                    contract(i) <- c;
+                    debtItem(i) <- balanceContract(c);
+                    toPay(i) <- balanceContract(c);
+                }
+            APPLY;
+            // статус — дозаправкой (WHEN SET после NEW-блока возвращает draft)
+            FOR PaymentSheet s IS PaymentSheet DO sheetStatus(s) <- PaymentSheetStatus.approved;
+            APPLY;
+            FOR PaymentSheet s IS PaymentSheet DO createPaymentRequests(s);
+        }
+        // демо-пользователи показа (docs/11-demo-scenarios.md §2/§5): вход под
+        // ролью скрывает чужие разделы; пароль у обоих — demo (эталон:
+        // MiteTestData.lsf). Роли КУ — «организационные» (isOrg), поэтому
+        // пользователь обязан иметь организацию (CONSTRAINT OrgUser.lsf) —
+        // назначаем демо-холдинг из landSeed; блок после сидов не случайно.
+        IF NOT (GROUP MAX CustomUser u IF login(u) = 'demo.agronom') THEN {
+            NEW u = CustomUser {
+                login(u) <- 'demo.agronom';
+                firstName(u) <- 'Анна'; lastName(u) <- 'Агрономова';
+                organization(u) <- GROUP MAX Organization o IF name(o) = 'Омский АНЦ';
+                in(u, userRoleSID('ku_agronomist')) <- TRUE;
+                setSHA256Password(u, 'demo');
+            }
+            NEW u = CustomUser {
+                login(u) <- 'demo.banker';
+                firstName(u) <- 'Борис'; lastName(u) <- 'Банкирский';
+                organization(u) <- GROUP MAX Organization o IF name(o) = 'Омский АНЦ';
+                in(u, userRoleSID('ku_economist')) <- TRUE;
+                in(u, userRoleSID('ku_director')) <- TRUE;
+                setSHA256Password(u, 'demo');
+            }
+            APPLY;
+        }
+    }
+}
+
+// Навигатор «Код Урожая» (docs/04-ui.md §4)
+NAVIGATOR {
+    // Наследие MITE и платформенные НСИ скрыты для чистой демонстрации
+    // «Код Урожая» (включается переключателем на «Панели здоровья»).
+    // SHOWIF оператором редактирования — скрывает элемент во ВСЕХ окнах
+    // (MOVE в скрытую папку оказался недостаточным: дети с собственным
+    // WINDOW toolbar выпадали в боковое дерево навигатора)
+    // Наследие MITE собрано в отдельную вкладку «MITE» рядом с «Код Урожая»
+    // (раньше пряталось переключателем showMiteNav и кнопкой возврата).
+    NEW FOLDER miteTab 'MITE' WINDOW toolbar {
+        MOVE Base.monitoring;
+        MOVE MasterData.masterData;
+        MOVE StoreTask.storeTask;
+    }
+    // Третья вкладка: витрины функций платформы KNP (решение пользователя
+    // 08.10 — «их функции разместить у нас, разделом после MITE»).
+    NEW FOLDER knpTab 'Платформа КНП' WINDOW toolbar {
+        NEW knpPortal;
+        NEW knpAssistant;
+        NEW knpRecycling;
+    }
+    // Топ-папка обязана иметь WINDOW (проверка платформы).
+    NEW FOLDER ku 'Код Урожая' WINDOW toolbar FIRST {
+        NEW kuHome;
+        NEW kuGlossary;
+        NEW FOLDER kuNsi 'НСИ' {
+            NEW FOLDER kuNsiAgro 'Агрономия' {
+                NEW crops;
+                NEW cropRules;
+                NEW varieties;
+                NEW soilTypes;
+                NEW bbchStages;
+                NEW stressIndicators;
+                NEW admissionRegions;
+            }
+            NEW FOLDER kuNsiTech 'Производство' {
+                NEW nomGroups;
+                NEW workTypes;
+                NEW phases;
+                NEW nomenclatures;
+                NEW units;
+                NEW applicationMethods;
+                NEW professions;
+            }
+            NEW contractors;
+        }
+        NEW FOLDER kuLandFolder 'Земля' SHOWIF seeKuLandNav() {
+            NEW kuMap;
+            NEW kuFleet;
+            NEW landPlots;
+            NEW contractPlotMatrix;
+            NEW fields;
+            NEW soilAnalyses;
+            NEW scoutObservations;
+            NEW leaseContracts;
+            NEW leaseNotifications;
+            NEW leaseNotificationLog;
+            NEW paymentSheets;
+            NEW paymentRequests;
+        }
+        NEW FOLDER kuPlanFolder 'Планирование' SHOWIF seeKuPlanNav() {
+            NEW rotationPlans;
+            NEW rotationVersions;   // КФ-С6: дубли устранён
+            NEW techCards;
+            NEW prodPlans;
+            NEW harvestActs;
+        }
+        NEW FOLDER kuMoneyFolder 'Бюджеты' SHOWIF seeKuMoneyNav() {
+            NEW priceScenarios;
+            NEW mtrPlans;
+            NEW budgetPLs;
+            NEW budgetCFs;
+            NEW budgetCompare;
+        }
+        NEW FOLDER kuHerdFolder 'Животноводство' SHOWIF seeKuHerdNav() {
+            NEW herds;
+            NEW herdYields;
+            NEW herdFeedings;
+            NEW herdVetEvents;
+            NEW herdPerfReport;
+            NEW herdHealthReport;
+            NEW herdBudgetReport;
+        }
+        NEW FOLDER kuYieldFolder 'Урожай' SHOWIF seeKuAgroNav() {
+            NEW stressMonitor;
+            NEW complexPlans;
+            NEW stressRegistration;
+            NEW correctionRecommendations;
+            NEW kbRules;
+            NEW calibrationSessions;
+            NEW optimizationSessions;
+        }
+        NEW FOLDER kuAnalyticsFolder 'Аналитика и отчёты' {
+            NEW kuDash;
+            NEW kuFleet3d;
+            NEW harvestProgress;
+            NEW cropPnL;
+            NEW costStructure;
+            NEW fleetPanel;
+            NEW FOLDER kuDwhFolder 'Витрины и отчёты' {
+                NEW dmFieldSeasons;
+                NEW dmCropPnls;
+                NEW dwhFields;
+                NEW areaPlanFactReport;
+                NEW resourceUseReport;
+                NEW reportTemplates;
+            }
+        }
+        NEW FOLDER kuSimFolder 'Симуляция' SHOWIF seeKuSimNav() {
+            NEW simTasks;
+            NEW simResults;
+            NEW weatherLive;
+            NEW seasonDays;
+            NEW scenarioRuns;
+            NEW stressTypes;
+            NEW modelCoeffs;
+        }
+        NEW FOLDER kuDataFolder 'Данные и загрузка' {
+            NEW etlPipelines;
+            NEW importFiles;
+        }
+        NEW FOLDER kuServiceFolder 'Служебное' SHOWIF seeKuSimNav() OR seeKuAllNav() {
+            NEW kuNotifications;
+            NEW kuHealth;
+            NEW kuJobs;
+            NEW kuEvents;
+            NEW kuAuditLog;
+            NEW integrationEndpoints;
+            NEW integrationLog;
+        }
+    }
+}
+
+// кнопка обновления погоды на панели здоровья (ФТ6.5/ФТ7.3);
+// здесь — поскольку форма kuHealth объявлена в KuAnalytics
+EXTEND FORM kuHealth
+    PROPERTIES () kuUpdateWeather
+;

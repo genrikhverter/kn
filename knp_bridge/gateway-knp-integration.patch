@@ -1,0 +1,115 @@
+diff --git a/knp_api-gateway/app/main.py b/knp_api-gateway/app/main.py
+index e1b48c9..4d3637c 100644
+--- a/knp_api-gateway/app/main.py
++++ b/knp_api-gateway/app/main.py
+@@ -4,7 +4,17 @@
+ from fastapi import FastAPI
+ from fastapi.middleware.cors import CORSMiddleware
+ 
+-from app.routes import agronomic, ai, core_mdm, recycling, supply_chain
++from app.routes import (
++    agronomic,
++    ai,
++    core_mdm,
++    lsfusion_economics,
++    lsfusion_ku,
++    lsfusion_simulation,
++    lsfusion_yield,
++    recycling,
++    supply_chain,
++)
+ 
+ 
+ app = FastAPI()
+@@ -22,3 +32,7 @@ app.include_router(agronomic.router)
+ app.include_router(core_mdm.router)
+ app.include_router(supply_chain.router)
+ app.include_router(ai.router)
++app.include_router(lsfusion_economics.router)
++app.include_router(lsfusion_simulation.router)
++app.include_router(lsfusion_yield.router)
++app.include_router(lsfusion_ku.router)
+diff --git a/knp_api-gateway/app/routes/lsfusion_economics.py b/knp_api-gateway/app/routes/lsfusion_economics.py
+new file mode 100644
+index 0000000..e5649b6
+--- /dev/null
++++ b/knp_api-gateway/app/routes/lsfusion_economics.py
+@@ -0,0 +1,15 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++# Патч интеграции: слот economics закрывает LSfusion-прототип «Код Урожая»
++# через мост knp_bridge.
++
++from app.routes._proxy_factory import create_proxy_router
++
++router = create_proxy_router(
++    gateway_prefix="/api/v1/economics",
++    service_name="lsfusion-bridge",
++    service_url_env="LSFUSION_BRIDGE_URL",
++    default_service_url="http://knp-bridge:8090",
++    backend_prefix="/api/v1/economics",
++    tags=["economics"],
++)
+diff --git a/knp_api-gateway/app/routes/lsfusion_simulation.py b/knp_api-gateway/app/routes/lsfusion_simulation.py
+new file mode 100644
+index 0000000..d5afa55
+--- /dev/null
++++ b/knp_api-gateway/app/routes/lsfusion_simulation.py
+@@ -0,0 +1,15 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++# Патч интеграции: слот simulation закрывает LSfusion-прототип «Код Урожая»
++# через мост knp_bridge.
++
++from app.routes._proxy_factory import create_proxy_router
++
++router = create_proxy_router(
++    gateway_prefix="/api/v1/simulation",
++    service_name="lsfusion-bridge",
++    service_url_env="LSFUSION_BRIDGE_URL",
++    default_service_url="http://knp-bridge:8090",
++    backend_prefix="/api/v1/simulation",
++    tags=["simulation"],
++)
+diff --git a/knp_api-gateway/app/routes/lsfusion_yield.py b/knp_api-gateway/app/routes/lsfusion_yield.py
+new file mode 100644
+index 0000000..46e289d
+--- /dev/null
++++ b/knp_api-gateway/app/routes/lsfusion_yield.py
+@@ -0,0 +1,15 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++# Патч интеграции: слот yield закрывает LSfusion-прототип «Код Урожая»
++# через мост knp_bridge.
++
++from app.routes._proxy_factory import create_proxy_router
++
++router = create_proxy_router(
++    gateway_prefix="/api/v1/yield",
++    service_name="lsfusion-bridge",
++    service_url_env="LSFUSION_BRIDGE_URL",
++    default_service_url="http://knp-bridge:8090",
++    backend_prefix="/api/v1/yield",
++    tags=["yield"],
++)
+diff --git a/knp_api-gateway/app/routes/lsfusion_ku.py b/knp_api-gateway/app/routes/lsfusion_ku.py
+new file mode 100644
+index 0000000..0f5effa
+--- /dev/null
++++ b/knp_api-gateway/app/routes/lsfusion_ku.py
+@@ -0,0 +1,15 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++# Патч интеграции: слот ku закрывает LSfusion-прототип «Код Урожая»
++# через мост knp_bridge.
++
++from app.routes._proxy_factory import create_proxy_router
++
++router = create_proxy_router(
++    gateway_prefix="/api/v1/ku",
++    service_name="lsfusion-bridge",
++    service_url_env="LSFUSION_BRIDGE_URL",
++    default_service_url="http://knp-bridge:8090",
++    backend_prefix="/api/v1/ku",
++    tags=["ku"],
++)

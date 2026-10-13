@@ -1,0 +1,679 @@
+MODULE KuBudget;
+
+// Код Урожая: сценарии цен, план потребности МТР, БДР, БДДС.
+// Спецификация: docs/02-data-model.md §6; docs/03-logic-KuBudget.md.
+// ⚠ Все формулы распределения по месяцам — допущения прототипа.
+REQUIRE KuTechCard, KuProdPlan, Authentication;
+
+NAMESPACE Ku;
+
+CLASS PriceScenarioStatus 'Статус сценария' {
+    draft 'Черновик', approved 'Утверждён', archived 'Архивный'
+}
+CLASS DocCalcStatus 'Статус расчёта' {
+    draft 'Черновик', calculated 'Рассчитан', approved 'Утверждён'
+}
+CLASS PaymentTermKind 'Тип оплаты' {
+    prepay 'Предоплата', deferral 'Отсрочка', onFact 'Оплата по факту'
+}
+CLASS CostItemKind 'Тип статьи' {
+    income 'Доход', expense 'Расход'
+}
+
+// ===================== Условия оплаты =====================
+CLASS PaymentTerm 'Условие оплаты';
+TABLE paymentTerm (PaymentTerm);
+ptCode 'Код' = DATA ISTRING[20] (PaymentTerm) NONULL IN id;
+ptName 'Наименование' = DATA ISTRING[255] (PaymentTerm) NONULL;
+ptShortName 'Кратко' = DATA ISTRING[100] (PaymentTerm);
+payKind 'Тип оплаты' = DATA PaymentTermKind (PaymentTerm) NONULL;
+namePayKind 'Тип' (PaymentTerm t) = staticCaption(payKind(t));
+prepayPercent 'Предоплата, %' = DATA NUMERIC[5,2] (PaymentTerm);
+deferralDays 'Отсрочка, дн' = DATA INTEGER (PaymentTerm);
+overdueDays 'Порог просрочки, дн' = DATA INTEGER (PaymentTerm);
+penaltyPercent 'Штраф, %/день' = DATA NUMERIC[5,2] (PaymentTerm);
+ptStatus 'Статус' = DATA ISTRING[20] (PaymentTerm);
+ptByCode = GROUP AGGR PaymentTerm t BY ptCode(t);
+WHEN SET(PaymentTerm t IS PaymentTerm) DO ptStatus(t) <- 'Активен';
+
+// ===================== Статьи затрат =====================
+CLASS CostItem 'Статья затрат';
+TABLE costItem (CostItem);
+ciCode 'Код' = DATA ISTRING[20] (CostItem) NONULL IN id;
+ciName 'Наименование' = DATA ISTRING[255] (CostItem) NONULL;
+ciShortName 'Кратко' = DATA ISTRING[100] (CostItem);
+ciKind 'Тип статьи' = DATA CostItemKind (CostItem) NONULL;
+// КП08: сравнение с предыдущим сезоном (справочные данные сезона −1)
+prevSeasonCost 'Предыдущий сезон, ₽' = DATA NUMERIC[14,2] (CostItem);
+nameCiKind 'Тип' (CostItem ci) = staticCaption(ciKind(ci));
+ciGroup 'Группа' = DATA ISTRING[60] (CostItem) NONULL;
+ciSubGroup 'Подгруппа' = DATA ISTRING[60] (CostItem);
+accountPlan 'План счетов' = DATA ISTRING[20] (CostItem);
+ciStatus 'Статус' = DATA ISTRING[20] (CostItem);
+ciByCode = GROUP AGGR CostItem ci BY ciCode(ci);
+WHEN SET(CostItem ci IS CostItem) DO ciStatus(ci) <- 'Активно';
+// статья по группе номенклатуры (⚠ допущение: соответствие через группу)
+costItemForGroup (NomGroup g) = GROUP MAX CostItem ci IF ciGroup(ci) = ngName(g);   // КФ-П2: объект
+costItemForGroupName (ISTRING[100] g) = GROUP MAX CostItem ci IF ciGroup(ci) = g;
+
+// ===================== Сценарий цен =====================
+CLASS PriceScenario 'Сценарий цен';
+TABLE priceScenario (PriceScenario);
+psName 'Наименование' = DATA ISTRING[255] (PriceScenario) NONULL IN id;
+psValidFrom 'Действует с' = DATA DATE (PriceScenario) NONULL;
+psValidTo 'Действует по' = DATA DATE (PriceScenario) NONULL;
+psStatus 'Статус' = DATA PriceScenarioStatus (PriceScenario) NONULL;
+namePsStatus 'Статус' (PriceScenario s) = staticCaption(psStatus(s));
+psVersion 'Версия' = DATA INTEGER (PriceScenario) NONULL;
+psCreated 'Создан' = DATA DATETIME (PriceScenario);
+psCreatedBy 'Автор' = DATA CustomUser (PriceScenario);
+psApprovedAt 'Утверждён' = DATA DATETIME (PriceScenario);
+psApprovedBy 'Утвердивший' = DATA CustomUser (PriceScenario);
+psBasedOn 'На основе' = DATA PriceScenario (PriceScenario);
+copyFactor 'Коэф. копирования' = DATA NUMERIC[8,4] (PriceScenario);
+WHEN SET(PriceScenario s IS PriceScenario) DO {
+    psStatus(s) <- PriceScenarioStatus.draft;
+    psVersion(s) <- 1;
+    psCreated(s) <- currentDateTime();
+}
+
+CLASS PriceScenarioItem 'Цены по номенклатуре';
+TABLE priceScenarioItem (PriceScenarioItem);
+scenario 'Сценарий' = DATA PriceScenario (PriceScenarioItem) AUTOSET;
+psiNomenclature 'Номенклатура' = DATA Nomenclature (PriceScenarioItem) NONULL;
+namePsiNom 'Номенклатура' (PriceScenarioItem it) = OVERRIDE nomName(psiNomenclature(it)), '';
+psiPrice 'Цена' = DATA NUMERIC[14,2] (PriceScenarioItem) NONULL;
+psiUnit (PriceScenarioItem it) = unit(psiNomenclature(it));
+itemByScenarioNom = GROUP AGGR PriceScenarioItem it BY scenario(it), psiNomenclature(it);
+
+// пикеры: сырые объектные свойства платформа показывает числовым id
+// (pickNomenclature — в KuTechCard, рядом с классом Nomenclature)
+namePsBasedOn 'На основе' (PriceScenario s) = OVERRIDE psName(psBasedOn(s)), '';
+FORM pickPriceScenario 'Выбор сценария цен'
+    OBJECTS sc = PriceScenario
+    PROPERTIES (sc) READONLY psName, psValidFrom, psValidTo, namePsStatus, psVersion
+    ORDERS psName(sc)
+;
+setPsiNomenclatureAct 'Выбрать номенклатуру' (PriceScenarioItem it) {
+    DIALOG pickNomenclature OBJECTS nm = psiNomenclature(it) INPUT nm NULL DO psiNomenclature(it) <- nm;
+}
+CONSTRAINT PriceScenarioItem it IS PriceScenarioItem AND psiPrice(it) <= 0 CHECKED BY psiPrice MESSAGE 'Цена должна быть положительной';
+
+// цена по сценарию (главная точка потребления)
+priceOf (PriceScenario s, Nomenclature n) = GROUP MAX psiPrice(PriceScenarioItem it) IF scenario(it) = s AND psiNomenclature(it) = n;
+namePriceOf 'Цена' (PriceScenario s, Nomenclature n) = OVERRIDE ('' + priceOf(s, n)), '';
+// горячий lookup расчёта бюджетов (priceOf вызывается на каждой строке БДР)
+INDEX scenario(PriceScenarioItem it), psiNomenclature(it);
+
+// ===================== Журнал =====================
+// КФ-Г6(3): прогноз выручки строки годового плана (рек., этап 1) —
+// объём строки × цена продукции культуры по утверждённому сценарию (при наличии)
+kuApprovedScenario () = GROUP MAX PriceScenario s IF psStatus(s) = PriceScenarioStatus.approved;
+ppProduct (ProdPlanItem i) = GROUP MAX Nomenclature n IF nomType(n) = NomType.product AND prodCrop(n) = ppCrop(i);
+ppRevenue 'Прогноз выручки, ₽' (ProdPlanItem i) =
+    ppVolume(i) * priceOf(kuApprovedScenario(), ppProduct(i));
+CLASS ServiceLog 'Журнал операций';
+TABLE serviceLog (ServiceLog);
+operKind 'Операция' = DATA ISTRING[40] (ServiceLog) NONULL;
+logSubject 'Пользователь' = DATA CustomUser (ServiceLog);
+logObjectKind 'Объект' = DATA ISTRING[30] (ServiceLog);
+logObjectId 'ID объекта' = DATA ISTRING[36] (ServiceLog);
+logAt 'Время' = DATA DATETIME (ServiceLog) NONULL;
+logDetails 'Детали' = DATA TEXT (ServiceLog);
+logIsError 'Ошибка' = DATA BOOLEAN (ServiceLog);
+logErrorMessage 'Сообщение об ошибке' = DATA ISTRING[250] (ServiceLog);
+logSeq 'Счётчик журнала' = DATA INTEGER ();
+WHEN SET(ServiceLog l IS ServiceLog) DO {
+    logAt(l) <- currentDateTime();
+    logSeq() <- (OVERRIDE logSeq(), 0) + 1;
+}
+
+// ===================== МТР-план =====================
+CLASS MtrPlan 'План потребности МТР';
+TABLE mtrPlan (MtrPlan);
+mtrProdPlan 'Годовой план' = DATA ProdPlan (MtrPlan) NONULL;
+nameMtrProdPlan 'Годовой план' (MtrPlan m) = OVERRIDE ppNumber(mtrProdPlan(m)), '';
+mtrScenario 'Сценарий цен' = DATA PriceScenario (MtrPlan) NONULL;
+nameMtrScenario 'Сценарий цен' (MtrPlan m) = OVERRIDE psName(mtrScenario(m)), '';
+mtrStatus 'Статус' = DATA DocCalcStatus (MtrPlan) NONULL;
+nameMtrStatus 'Статус' (MtrPlan m) = staticCaption(mtrStatus(m));
+WHEN SET(MtrPlan m IS MtrPlan) DO mtrStatus(m) <- DocCalcStatus.draft;
+
+CLASS MtrPlanItem 'Строка МТР';
+TABLE mtrPlanItem (MtrPlanItem);
+mtrPlan 'План МТР' = DATA MtrPlan (MtrPlanItem) AUTOSET;
+monthNo 'Месяц' = DATA INTEGER (MtrPlanItem) NONULL;
+mtrNomenclature 'Номенклатура' = DATA Nomenclature (MtrPlanItem) NONULL;
+nameMtrNom 'Номенклатура' (MtrPlanItem it) = OVERRIDE nomName(mtrNomenclature(it)), '';
+mtrQty 'Потребность' = DATA NUMERIC[14,3] (MtrPlanItem) NONULL;
+mtrUnit (MtrPlanItem it) = unit(mtrNomenclature(it));
+CONSTRAINT MtrPlanItem it IS MtrPlanItem AND (monthNo(it) < 1 OR monthNo(it) > 12) CHECKED BY monthNo MESSAGE 'Месяц — 1..12';
+
+// ===================== БДР =====================
+CLASS BudgetPL 'БДР';
+TABLE budgetPL (BudgetPL);
+bplProdPlan 'Годовой план' = DATA ProdPlan (BudgetPL) NONULL;
+nameBplProdPlan 'Годовой план' (BudgetPL b) = OVERRIDE ppNumber(bplProdPlan(b)), '';
+bplScenario 'Сценарий цен' = DATA PriceScenario (BudgetPL) NONULL;
+nameBplScenario 'Сценарий цен' (BudgetPL b) = OVERRIDE psName(bplScenario(b)), '';
+bplStatus 'Статус' = DATA DocCalcStatus (BudgetPL) NONULL;
+nameBplStatus 'Статус' (BudgetPL b) = staticCaption(bplStatus(b));
+WHEN SET(BudgetPL b IS BudgetPL) DO bplStatus(b) <- DocCalcStatus.draft;
+
+CLASS BudgetPLItem 'Строка БДР';
+TABLE budgetPLItem (BudgetPLItem);
+budgetPL 'БДР' = DATA BudgetPL (BudgetPLItem) AUTOSET;
+costItem 'Статья' = DATA CostItem (BudgetPLItem) NONULL;
+nameCostItem 'Статья' (BudgetPLItem it) = OVERRIDE ciName(costItem(it)), '';
+bplItemKind 'Тип' (BudgetPLItem it) = staticCaption(ciKind(costItem(it)));
+bplMonth 'Месяц' = DATA INTEGER (BudgetPLItem) NONULL;
+bplAmount 'Сумма' = DATA NUMERIC[16,2] (BudgetPLItem) NONULL;
+bplCrop 'Культура' = DATA Crop (BudgetPLItem);
+
+incomeTotal 'Доходы' (BudgetPL b) = GROUP SUM bplAmount(BudgetPLItem it) IF budgetPL(it) = b AND ciKind(costItem(it)) = CostItemKind.income;
+expenseTotal 'Расходы' (BudgetPL b) = GROUP SUM bplAmount(BudgetPLItem it) IF budgetPL(it) = b AND ciKind(costItem(it)) = CostItemKind.expense;
+margin 'Маржа' (BudgetPL b) = (OVERRIDE incomeTotal(b), 0.0) - (OVERRIDE expenseTotal(b), 0.0);
+
+// ===================== БДДС =====================
+CLASS BudgetCF 'БДДС';
+TABLE budgetCF (BudgetCF);
+bcfBudgetPL 'БДР' = DATA BudgetPL (BudgetCF) NONULL;
+nameBcfBudgetPL 'БДР (план/сценарий)' (BudgetCF f) = OVERRIDE ppNumber(bplProdPlan(bcfBudgetPL(f))), '';
+bcfStatus 'Статус' = DATA DocCalcStatus (BudgetCF) NONULL;
+nameBcfStatus 'Статус' (BudgetCF f) = staticCaption(bcfStatus(f));
+WHEN SET(BudgetCF f IS BudgetCF) DO bcfStatus(f) <- DocCalcStatus.draft;
+
+CLASS MoveKind 'Движение' { income 'Поступление', payment 'Выплата' }
+CLASS BudgetCFItem 'Строка БДДС';
+TABLE budgetCFItem (BudgetCFItem);
+budgetCF 'БДДС' = DATA BudgetCF (BudgetCFItem) AUTOSET;
+moveKind 'Движение' = DATA MoveKind (BudgetCFItem) NONULL;
+nameMoveKind (BudgetCFItem it) = staticCaption(moveKind(it));
+bcfMonth 'Месяц' = DATA INTEGER (BudgetCFItem) NONULL;
+bcfAmount 'Сумма' = DATA NUMERIC[16,2] (BudgetCFItem) NONULL;
+bcfSource 'Источник/получатель' = DATA ISTRING[100] (BudgetCFItem) NONULL;
+bcfPaymentTerm 'Условие оплаты' = DATA PaymentTerm (BudgetCFItem) NONULL;
+nameBcfTerm 'Условие' (BudgetCFItem it) = OVERRIDE ptName(bcfPaymentTerm(it)), '';
+
+// ===================== Действия =====================
+approvePriceScenario 'Утвердить' (PriceScenario s) {
+    psStatus(s) <- PriceScenarioStatus.approved;
+    psApprovedAt(s) <- currentDateTime();
+    IF currentUser() THEN psApprovedBy(s) <- currentUser();
+    FOR PriceScenario old IS PriceScenario AND old != s AND psBasedOn(old) = psBasedOn(s) AND old != psBasedOn(s)
+        AND psStatus(old) = PriceScenarioStatus.approved AND psName(old) = psName(s) DO
+        psStatus(old) <- PriceScenarioStatus.archived;
+    NEW l = ServiceLog { operKind(l) <- 'Утверждение сценария цен'; logObjectKind(l) <- 'PriceScenario'; logObjectId(l) <- psName(s); }
+    kuPublish(KuEventKind.scenarioApproved, 'PriceScenario', psName(s), 'Сценарий утверждён и доступен для расчёта бюджетов');
+    APPLY;
+}
+
+copyPriceScenario 'Копия с коэффициентом' (PriceScenario src) {
+    INPUT factor = NUMERIC[8,4] DO {
+        // валидация: цена×(<=0) нарушала CONSTRAINT и тихо отменяла APPLY
+        IF NOT factor OR factor <= 0 THEN
+            MESSAGE 'Коэффициент копирования должен быть положительным числом.';
+        ELSE {
+            NEW s = PriceScenario {
+            psName(s) <- psName(src) + ' (копия)';
+            psValidFrom(s) <- psValidFrom(src);
+            psValidTo(s) <- psValidTo(src);
+            psBasedOn(s) <- src;
+            psVersion(s) <- psVersion(src) + 1;
+            copyFactor(s) <- factor;
+        }
+        APPLY;
+        // цены копируем lookup'ом (после APPLY)
+        FOR PriceScenarioItem it IS PriceScenarioItem AND scenario(it) = src DO
+            NEW ni = PriceScenarioItem {
+                scenario(ni) <- GROUP MAX PriceScenario s IF psBasedOn(s) = src AND psVersion(s) = psVersion(src) + 1;
+                psiNomenclature(ni) <- psiNomenclature(it);
+                psiPrice(ni) <- psiPrice(it) * (OVERRIDE factor, 1.0);
+            }
+        APPLY;
+        }
+    }
+}
+
+// ФТ1.5.1: расчёт МТР из техкарт годового плана
+// ⚠ месяц: по дате операции, при отсутствии — 5 (май)
+calculateMtrPlan 'Рассчитать МТР' (MtrPlan m) {
+    FOR MtrPlanItem it IS MtrPlanItem AND mtrPlan(it) = m DO DELETE it;
+    APPLY;
+    FOR ProdPlanItem pi IS ProdPlanItem AND ppPlan(pi) = mtrProdPlan(m) DO
+        FOR TechOperation o IS TechOperation AND card(o) = techCard(pi) DO {
+            LOCAL mn = INTEGER ();
+            mn() <- 5;   // ⚠ допущение: месяц операции — май (даты операций в прототипе не заполнены)
+            FOR OperationMaterial mm IS OperationMaterial AND operation(mm) = o DO
+                NEW it = MtrPlanItem {
+                    mtrPlan(it) <- m;
+                    monthNo(it) <- mn();
+                    mtrNomenclature(it) <- nomenclature(mm);
+                    mtrQty(it) <- matRate(mm) * ppArea(pi);
+                }
+            FOR OperationFuel ff IS OperationFuel AND operation(ff) = o DO
+                NEW it = MtrPlanItem {
+                    mtrPlan(it) <- m;
+                    monthNo(it) <- mn();
+                    mtrNomenclature(it) <- fuelNomenclature(ff);
+                    mtrQty(it) <- fuelRate(ff) * ppArea(pi);
+                }
+        }
+    mtrStatus(m) <- DocCalcStatus.calculated;
+    APPLY;
+}
+
+
+approveMtrPlan 'Утвердить МТР' (MtrPlan m) {
+    mtrStatus(m) <- DocCalcStatus.approved;
+    // КФ-Д3: событие «Бюджет утверждён»
+    kuPublish(KuEventKind.budgetApproved, 'MtrPlan', nameMtrProdPlan(m),
+        'МТР; план: ' + nameMtrProdPlan(m) + '; сценарий: ' + nameMtrScenario(m)
+        + '; позиций: ' + (OVERRIDE ('' + (GROUP SUM 1 IF mtrPlan(MtrPlanItem it) = m)), '0'));
+    APPLY;
+}
+
+// ФТ1.5.1: расчёт БДР. ⚠ упрощения: ФОТ = timeRate × 500 руб/ч × площадь;
+// доход = целевая урожайность культуры / 10 × площадь × цена продукции
+// (продукция подбирается по группе = названию культуры), месяц дохода — 8.
+calculateBudgetPL 'Рассчитать БДР' (BudgetPL b) {
+    FOR BudgetPLItem it IS BudgetPLItem AND budgetPL(it) = b DO DELETE it;
+    APPLY;
+    FOR ProdPlanItem pi IS ProdPlanItem AND ppPlan(pi) = bplProdPlan(b) DO
+        FOR TechOperation o IS TechOperation AND card(o) = techCard(pi) DO {
+            LOCAL mn = INTEGER ();
+            mn() <- 5;   // ⚠ допущение: месяц операции — май (даты операций в прототипе не заполнены)
+            FOR OperationMaterial mm IS OperationMaterial AND operation(mm) = o DO
+                NEW it = BudgetPLItem {
+                    budgetPL(it) <- b;
+                    costItem(it) <- OVERRIDE costItemForGroup(nomGroupRef(nomenclature(mm))), ciByCode('EXP-099');   // КФ-П2
+                    bplMonth(it) <- mn();
+                    // OVERRIDE цены: NULL (нет цены в сценарии) обнулял произведение
+                    // и тихо отменял весь расчёт нарушением NONULL bplAmount
+                    bplAmount(it) <- matRate(mm) * ppArea(pi) * (OVERRIDE priceOf(bplScenario(b), nomenclature(mm)), 0.0);
+                }
+            FOR OperationFuel ff IS OperationFuel AND operation(ff) = o DO
+                NEW it = BudgetPLItem {
+                    budgetPL(it) <- b;
+                    costItem(it) <- OVERRIDE costItemForGroupName('Топливо'), ciByCode('EXP-099');
+                    bplMonth(it) <- mn();
+                    bplAmount(it) <- fuelRate(ff) * ppArea(pi) * (OVERRIDE priceOf(bplScenario(b), fuelNomenclature(ff)), 0.0);
+                }
+            FOR OperationLabor ll IS OperationLabor AND operation(ll) = o DO
+                NEW it = BudgetPLItem {
+                    budgetPL(it) <- b;
+                    costItem(it) <- ciByCode('EXP-004');
+                    bplMonth(it) <- mn();
+                    bplAmount(it) <- timeRate(ll) * (OVERRIDE baseRate(profession(ll)), 500.0) * ppArea(pi);   // КФ-П1: ставка профессии
+                }
+        }
+    // доходы
+    FOR ProdPlanItem pi IS ProdPlanItem AND ppPlan(pi) = bplProdPlan(b) DO {
+        LOCAL prod = Nomenclature ();
+        prod() <- GROUP MAX Nomenclature n IF nomType(n) = NomType.product AND prodCrop(n) = ppCrop(pi);   // КФ-8: ссылка вместо имени
+        IF prod() AND priceOf(bplScenario(b), prod()) THEN
+            NEW it = BudgetPLItem {
+                budgetPL(it) <- b;
+                costItem(it) <- ciByCode('EXP-008');
+                bplMonth(it) <- 8;
+                bplAmount(it) <- (OVERRIDE targetYield(ppCrop(pi)), 0.0) / 10.0 * ppArea(pi) * priceOf(bplScenario(b), prod());
+                bplCrop(it) <- ppCrop(pi);
+            }
+    }
+    bplStatus(b) <- DocCalcStatus.calculated;
+    APPLY;
+}
+
+approveBudgetPL 'Утвердить БДР' (BudgetPL b) {
+    bplStatus(b) <- DocCalcStatus.approved;
+    // КФ-Д3: событие «Бюджет утверждён»
+    kuPublish(KuEventKind.budgetApproved, 'BudgetPL', nameBplProdPlan(b),
+        'БДР; план: ' + nameBplProdPlan(b) + '; сценарий: ' + nameBplScenario(b)
+        + '; доходы: ' + (OVERRIDE ('' + incomeTotal(b)), '0')
+        + '; расходы: ' + (OVERRIDE ('' + expenseTotal(b)), '0'));
+    APPLY;
+}
+
+// ФТ1.5.1: расчёт БДДС по БДР. ⚠ упрощение: отсрочка N дней = сдвиг на
+// N/30 месяцев (вниз); доход — месяц статьи.
+calculateBudgetCF 'Рассчитать БДДС' (BudgetCF f) {
+    FOR BudgetCFItem it IS BudgetCFItem AND budgetCF(it) = f DO DELETE it;
+    APPLY;
+    LOCAL shift = INTEGER ();
+    FOR BudgetPLItem it IS BudgetPLItem AND budgetPL(it) = bcfBudgetPL(f) DO {
+        shift() <- (OVERRIDE deferralDays(ptByCode('PAY-01')), 30) / 30;
+        IF shift() < 0 THEN shift() <- 0;
+        NEW ni = BudgetCFItem {
+            budgetCF(ni) <- f;
+            moveKind(ni) <- IF ciKind(costItem(it)) = CostItemKind.income THEN MoveKind.income ELSE MoveKind.payment;
+            bcfMonth(ni) <- bplMonth(it) + IF ciKind(costItem(it)) = CostItemKind.expense THEN shift() ELSE 0;
+            bcfAmount(ni) <- bplAmount(it);
+            bcfSource(ni) <- OVERRIDE ciName(costItem(it)), '';
+            bcfPaymentTerm(ni) <- ptByCode('PAY-01');
+        }
+    }
+    bcfStatus(f) <- DocCalcStatus.calculated;
+    APPLY;
+}
+
+approveBudgetCF 'Утвердить БДДС' (BudgetCF f) {
+    bcfStatus(f) <- DocCalcStatus.approved;
+    // КФ-Д3: событие «Бюджет утверждён»
+    kuPublish(KuEventKind.budgetApproved, 'BudgetCF', nameBcfBudgetPL(f),
+        'БДДС; план: ' + nameBcfBudgetPL(f)
+        + '; сумма: ' + (OVERRIDE ('' + (GROUP SUM bcfAmount(BudgetCFItem it) IF budgetCF(it) = f)), '0'));
+    APPLY;
+}
+
+// ===================== Формы =====================
+
+// кнопки Excel-выгрузки (реализации — после объявления форм)
+nextStepNpk '→ NPK-программирование' (BudgetPL b) ABSTRACT;
+exportBudgetPLXls 'Выгрузить в Excel' () ABSTRACT;
+exportBudgetCFXls 'Выгрузить в Excel' () ABSTRACT;
+FORM priceScenarios 'Сценарии цен'
+    OBJECTS s = PriceScenario
+    PROPERTIES (s) READONLY psName, psValidFrom, psValidTo, namePsStatus, psVersion, psApprovedAt
+    PROPERTIES (s) NEWSESSION NEW, EDIT, DELETE, approvePriceScenario, copyPriceScenario
+;
+
+FORM priceScenario 'Сценарий цен'
+    OBJECTS s = PriceScenario PANEL
+    PROPERTIES (s) psName, psValidFrom, psValidTo
+    PROPERTIES (s) READONLY namePsStatus, psVersion, namePsBasedOn, copyFactor, psCreated, psApprovedAt
+    PROPERTIES (s) approvePriceScenario, copyPriceScenario
+
+    OBJECTS it = PriceScenarioItem
+    PROPERTIES (it) NEWSESSION NEW, DELETE
+    PROPERTIES (it) READONLY namePsiNom
+    PROPERTIES (it) psiPrice, setPsiNomenclatureAct
+    FILTERS scenario(it) = s
+
+    EDIT PriceScenario OBJECT s
+;
+
+FORM mtrPlans 'Планы МТР'
+    OBJECTS m = MtrPlan
+    PROPERTIES (m) READONLY nameMtrProdPlan, nameMtrScenario, nameMtrStatus
+    PROPERTIES (m) NEWSESSION NEW, EDIT, DELETE, calculateMtrPlan, approveMtrPlan
+;
+
+FORM mtrPlan 'План МТР'
+    OBJECTS m = MtrPlan PANEL
+    PROPERTIES (m) mtrProdPlan, mtrScenario
+    PROPERTIES (m) READONLY nameMtrStatus
+    PROPERTIES (m) calculateMtrPlan, approveMtrPlan
+    OBJECTS it = MtrPlanItem
+    PROPERTIES (it) NEWSESSION NEW, EDIT, DELETE
+    PROPERTIES (it) monthNo, mtrNomenclature, mtrQty
+    FILTERS mtrPlan(it) = m
+    EDIT MtrPlan OBJECT m
+;
+
+
+FORM budgetPLs 'БДР'
+    OBJECTS b = BudgetPL
+    PROPERTIES (b) READONLY nameBplProdPlan, nameBplScenario, nameBplStatus, incomeTotal, expenseTotal, margin
+    PROPERTIES (b) NEWSESSION NEW, EDIT, DELETE, calculateBudgetPL, approveBudgetPL
+    PROPERTIES () exportBudgetPLXls
+;
+
+// П.18: имена вместо числовых ИД + пикеры (объектные свойства в этом пине
+// показывают key0)
+FORM pickProdPlan 'Выбор годового плана'
+    OBJECTS pp = ProdPlan
+    PROPERTIES (pp) READONLY ppNumber, planYear, namePpStatus
+    ORDERS ppNumber(pp)
+;
+FORM pickCostItem 'Выбор статьи'
+    OBJECTS ci = CostItem
+    PROPERTIES (ci) READONLY ciName, ciGroup
+    ORDERS ciName(ci)
+;
+nameBciCostItem 'Статья' (BudgetPLItem it) = OVERRIDE ciName(costItem(it)), '';
+setBplProdPlanAct 'Выбрать план' (BudgetPL b) {
+    DIALOG pickProdPlan OBJECTS pp = bplProdPlan(b) INPUT pp NULL DO bplProdPlan(b) <- pp;
+}
+setBplScenarioAct 'Выбрать сценарий' (BudgetPL b) {
+    DIALOG pickPriceScenario OBJECTS sc = bplScenario(b) INPUT sc NULL DO bplScenario(b) <- sc;
+}
+setBciCostItemAct 'Выбрать статью' (BudgetPLItem it) {
+    DIALOG pickCostItem OBJECTS ci = costItem(it) INPUT ci NULL DO costItem(it) <- ci;
+}
+setBcfBudgetPLAct 'Выбрать БДР' (BudgetCF f) {
+    DIALOG budgetPLs OBJECTS b = bcfBudgetPL(f) INPUT b NULL DO bcfBudgetPL(f) <- b;
+}
+FORM budgetPL 'БДР'
+    OBJECTS b = BudgetPL PANEL
+    PROPERTIES (b) READONLY nameBplProdPlan, nameBplScenario
+    PROPERTIES (b) setBplProdPlanAct SHOWIF NOT bplProdPlan(b)
+    PROPERTIES (b) setBplScenarioAct SHOWIF NOT bplScenario(b)
+    PROPERTIES (b) READONLY nameBplStatus, incomeTotal, expenseTotal, margin
+    PROPERTIES (b) calculateBudgetPL, approveBudgetPL
+    OBJECTS it = BudgetPLItem
+    PROPERTIES (it) NEWSESSION NEW, EDIT, DELETE
+    PROPERTIES (it) READONLY nameBciCostItem
+    PROPERTIES (it) setBciCostItemAct SHOWIF NOT costItem(it)
+    PROPERTIES (it) bplMonth, bplAmount
+    FILTERS budgetPL(it) = b
+    EDIT BudgetPL OBJECT b
+;
+
+FORM budgetCFs 'БДДС'
+    OBJECTS f = BudgetCF
+    PROPERTIES (f) READONLY nameBcfBudgetPL, nameBcfStatus
+    PROPERTIES (f) NEWSESSION NEW, EDIT, DELETE, calculateBudgetCF, approveBudgetCF
+    PROPERTIES () exportBudgetCFXls
+;
+
+FORM budgetCF 'БДДС'
+    OBJECTS f = BudgetCF PANEL
+    PROPERTIES (f) READONLY nameBcfBudgetPL
+    PROPERTIES (f) setBcfBudgetPLAct SHOWIF NOT bcfBudgetPL(f)
+    PROPERTIES (f) READONLY nameBcfStatus
+    PROPERTIES (f) calculateBudgetCF, approveBudgetCF
+    OBJECTS it = BudgetCFItem
+    PROPERTIES (it) NEWSESSION NEW, EDIT, DELETE
+    PROPERTIES (it) moveKind, bcfMonth, bcfAmount, bcfSource, bcfPaymentTerm
+    FILTERS budgetCF(it) = f
+    EDIT BudgetCF OBJECT f
+;
+
+FORM paymentTerms 'Условия оплаты'
+    OBJECTS t = PaymentTerm
+    PROPERTIES (t) NEWSESSION NEW, EDIT, DELETE
+;
+
+FORM costItems 'Статьи затрат'
+    OBJECTS ci = CostItem
+    PROPERTIES (ci) NEWSESSION NEW, EDIT, DELETE
+;
+
+// КФ-Г6(3): прогноз выручки — колонкой в карточке годового плана
+EXTEND FORM prodPlan
+    PROPERTIES (i) READONLY ppRevenue
+;
+
+// ===================== Excel-выгрузка =====================
+exportBudgetPLXls () + {
+    PRINT budgetPLs XLSX SHEET 'БДР' TO exportFile;
+    open(exportFile());
+}
+
+exportBudgetCFXls () + {
+    PRINT budgetCFs XLSX SHEET 'БДДС' TO exportFile;
+    open(exportFile());
+}
+
+nextStepNpk (BudgetPL b) + {
+    IF bplStatus(b) = DocCalcStatus.approved THEN
+        MESSAGE 'Бюджет утверждён.\nСледующий шаг: запрограммировать урожай — NPK-расчёт (раздел «Урожай» → «Комплексные планы»).';
+    ELSE
+        MESSAGE 'Сначала утвердите бюджет';
+}
+
+// ===================== Сид =====================
+basePlan2027 () = GROUP MAX ProdPlan p IF ppNumber(p) = 'ГП-2027-1';
+baseScenario () = GROUP MAX PriceScenario s IF psName(s) = 'Базовый 2027';
+optScenario () = GROUP MAX PriceScenario s IF psName(s) = 'Оптимистичный 2027';
+pessScenario () = GROUP MAX PriceScenario s IF psName(s) = 'Пессимистичный 2027';
+
+budgetSeed () {
+    IF NOT (GROUP MAX PaymentTerm t) THEN {
+        NEW t = PaymentTerm { ptCode(t) <- 'PAY-01'; ptName(t) <- 'Отсрочка платежа 30 дней'; payKind(t) <- PaymentTermKind.deferral; deferralDays(t) <- 30; overdueDays(t) <- 14; penaltyPercent(t) <- 0.1; }
+        NEW t = PaymentTerm { ptCode(t) <- 'PAY-02'; ptName(t) <- 'Предоплата 50%'; payKind(t) <- PaymentTermKind.prepay; prepayPercent(t) <- 50.0; }
+        NEW t = PaymentTerm { ptCode(t) <- 'PAY-03'; ptName(t) <- 'Оплата по факту'; payKind(t) <- PaymentTermKind.onFact; }
+        APPLY;
+    }
+    IF NOT (GROUP MAX CostItem ci) THEN {
+        NEW ci = CostItem { ciCode(ci) <- 'EXP-001'; ciName(ci) <- 'Семена'; ciKind(ci) <- CostItemKind.expense; ciGroup(ci) <- 'Пшеница озимая'; }
+        NEW ci = CostItem { ciCode(ci) <- 'EXP-002'; ciName(ci) <- 'Удобрения (азотные)'; ciKind(ci) <- CostItemKind.expense; ciGroup(ci) <- 'Азотные'; }
+        NEW ci = CostItem { ciCode(ci) <- 'EXP-003'; ciName(ci) <- 'Удобрения (комплексные)'; ciKind(ci) <- CostItemKind.expense; ciGroup(ci) <- 'Комплексные'; }
+        NEW ci = CostItem { ciCode(ci) <- 'EXP-004'; ciName(ci) <- 'ФОТ'; ciKind(ci) <- CostItemKind.expense; ciGroup(ci) <- 'Оплата труда'; }
+        NEW ci = CostItem { ciCode(ci) <- 'EXP-005'; ciName(ci) <- 'ГСМ'; ciKind(ci) <- CostItemKind.expense; ciGroup(ci) <- 'Топливо'; }
+        NEW ci = CostItem { ciCode(ci) <- 'EXP-006'; ciName(ci) <- 'СЗР'; ciKind(ci) <- CostItemKind.expense; ciGroup(ci) <- 'Гербициды'; }
+        NEW ci = CostItem { ciCode(ci) <- 'EXP-007'; ciName(ci) <- 'Удобрения (фосфорные/калийные)'; ciKind(ci) <- CostItemKind.expense; ciGroup(ci) <- 'Фосфорные'; }
+        NEW ci = CostItem { ciCode(ci) <- 'EXP-008'; ciName(ci) <- 'Доходы от реализации'; ciKind(ci) <- CostItemKind.income; ciGroup(ci) <- 'Доходы'; }
+        APPLY;
+    }
+    // fallback-статья — ДО цикла сезонов и с нулём прошлого сезона: иначе на
+    // втором прогоне EXP-099 с NULL попадал в ELSE-ветку и получал 12.8 млн
+    IF NOT ciByCode('EXP-099') THEN {
+        NEW ci = CostItem { ciCode(ci) <- 'EXP-099'; ciName(ci) <- 'Прочие расходы'; ciKind(ci) <- CostItemKind.expense; ciGroup(ci) <- 'Прочее'; prevSeasonCost(ci) <- 0.0; }
+        APPLY;
+    }
+    // КП08: справочные суммы предыдущего сезона по статьям (сезон −1)
+    FOR CostItem ci IS CostItem AND NOT prevSeasonCost(ci) AND ciCode(ci) != 'EXP-099' DO {
+        prevSeasonCost(ci) <- IF ciCode(ci) = 'EXP-001' THEN 780000.0
+            ELSE IF ciCode(ci) = 'EXP-002' THEN 960000.0
+            ELSE IF ciCode(ci) = 'EXP-003' THEN 540000.0
+            ELSE IF ciCode(ci) = 'EXP-004' THEN 420000.0
+            ELSE IF ciCode(ci) = 'EXP-005' THEN 610000.0
+            ELSE IF ciCode(ci) = 'EXP-006' THEN 350000.0
+            ELSE IF ciCode(ci) = 'EXP-007' THEN 480000.0
+            ELSE 12800000.0;
+        APPLY;
+    }
+    // сценарий «Базовый 2027»: цены из basePrice номенклатуры
+    IF NOT (GROUP MAX PriceScenario s) THEN {
+        NEW s = PriceScenario { psName(s) <- 'Базовый 2027'; psValidFrom(s) <- 2027_01_01; psValidTo(s) <- 2027_12_31; }
+        APPLY;
+    }
+    IF NOT (GROUP MAX PriceScenarioItem it) THEN
+        FOR Nomenclature n IS Nomenclature AND basePrice(n) DO
+            NEW it = PriceScenarioItem {
+                scenario(it) <- baseScenario();
+                psiNomenclature(it) <- n;
+                psiPrice(it) <- basePrice(n);
+            }
+    APPLY;
+    IF baseScenario() AND psStatus(baseScenario()) != PriceScenarioStatus.approved THEN {
+        psStatus(baseScenario()) <- PriceScenarioStatus.approved;
+        psApprovedAt(baseScenario()) <- currentDateTime();
+    }
+    APPLY;
+    // «Оптимистичный 2027» — черновик ×1.15 (демо сценарного анализа)
+    IF NOT optScenario() THEN {
+        NEW s = PriceScenario { psName(s) <- 'Оптимистичный 2027'; psValidFrom(s) <- 2027_01_01; psValidTo(s) <- 2027_12_31; psBasedOn(s) <- baseScenario(); copyFactor(s) <- 1.15; }
+        APPLY;
+        FOR PriceScenarioItem it IS PriceScenarioItem AND scenario(it) = baseScenario() DO
+            NEW ni = PriceScenarioItem {
+                scenario(ni) <- optScenario();
+                psiNomenclature(ni) <- psiNomenclature(it);
+                psiPrice(ni) <- psiPrice(it) * 1.15;
+            }
+        APPLY;
+    }
+    // «Пессимистичный 2027» — черновик для стресс-теста (демо для кредитора,
+    // docs/11-demo-scenarios.md Б3): продукция ×0.85, затратная номенклатура ×1.1
+    IF NOT pessScenario() THEN {
+        NEW s = PriceScenario { psName(s) <- 'Пессимистичный 2027'; psValidFrom(s) <- 2027_01_01; psValidTo(s) <- 2027_12_31; psBasedOn(s) <- baseScenario(); }
+        APPLY;
+        FOR PriceScenarioItem it IS PriceScenarioItem AND scenario(it) = baseScenario() DO
+            NEW ni = PriceScenarioItem {
+                scenario(ni) <- pessScenario();
+                psiNomenclature(ni) <- psiNomenclature(it);
+                psiPrice(ni) <- psiPrice(it) * IF nomType(psiNomenclature(it)) = NomType.product THEN 0.85 ELSE 1.1;
+            }
+        APPLY;
+    }
+    // БДР по пессимистичному сценарию — стресс-тест считается, но не утверждается
+    IF pessScenario() AND basePlan2027() AND NOT (GROUP MAX BudgetPL b IF bplScenario(b) = pessScenario()) THEN {
+        NEW b = BudgetPL { bplProdPlan(b) <- basePlan2027(); bplScenario(b) <- pessScenario(); }
+        APPLY;
+    }
+    FOR BudgetPL b IS BudgetPL AND bplScenario(b) = pessScenario() AND bplStatus(b) = DocCalcStatus.draft DO calculateBudgetPL(b);
+    // МТР/БДР/БДДС по ГП-2027-1; гварды скоуплены по сценарию: раньше
+    // стресс-БДР (создаётся выше) блокировал создание базового на чистой БД,
+    // а БДДС привязывался к пессимистичному БДР
+    IF NOT (GROUP MAX MtrPlan m) AND basePlan2027() AND baseScenario() THEN {
+        NEW m = MtrPlan { mtrProdPlan(m) <- basePlan2027(); mtrScenario(m) <- baseScenario(); }
+        APPLY;
+    }
+    IF (GROUP MAX MtrPlan m IF mtrProdPlan(m) = basePlan2027()) AND NOT (GROUP MAX MtrPlanItem it) THEN
+        FOR MtrPlan m IS MtrPlan AND mtrProdPlan(m) = basePlan2027() DO calculateMtrPlan(m);
+    IF NOT (GROUP MAX BudgetPL b IF bplScenario(b) = baseScenario()) AND basePlan2027() AND baseScenario() THEN {
+        NEW b = BudgetPL { bplProdPlan(b) <- basePlan2027(); bplScenario(b) <- baseScenario(); }
+        APPLY;
+    }
+    IF (GROUP MAX BudgetPL b IF bplProdPlan(b) = basePlan2027() AND bplScenario(b) = baseScenario())
+        AND NOT (GROUP MAX BudgetPLItem it IF bplScenario(budgetPL(it)) = baseScenario()) THEN
+        FOR BudgetPL b IS BudgetPL AND bplProdPlan(b) = basePlan2027() AND bplScenario(b) = baseScenario() DO calculateBudgetPL(b);
+    IF NOT (GROUP MAX BudgetCF f) AND (GROUP MAX BudgetPL b IF bplProdPlan(b) = basePlan2027()
+            AND bplScenario(b) = baseScenario() AND bplStatus(b) = DocCalcStatus.calculated) THEN {
+        NEW f = BudgetCF { bcfBudgetPL(f) <- GROUP MAX BudgetPL b IF bplProdPlan(b) = basePlan2027() AND bplScenario(b) = baseScenario(); }
+        APPLY;
+    }
+    IF NOT (GROUP MAX BudgetCFItem it) THEN
+        FOR BudgetCF f IS BudgetCF AND bcfStatus(f) = DocCalcStatus.draft DO calculateBudgetCF(f);
+    // утверждённость — дозаправкой
+    FOR MtrPlan m IS MtrPlan AND mtrStatus(m) = DocCalcStatus.calculated DO mtrStatus(m) <- DocCalcStatus.approved;
+    // стресс-тестовый БДР (пессимистичный) остаётся «Рассчитан» — не утверждаем
+    FOR BudgetPL b IS BudgetPL AND bplStatus(b) = DocCalcStatus.calculated AND bplScenario(b) = baseScenario() DO bplStatus(b) <- DocCalcStatus.approved;
+    FOR BudgetCF f IS BudgetCF AND bcfStatus(f) = DocCalcStatus.calculated DO bcfStatus(f) <- DocCalcStatus.approved;
+    APPLY;
+}
+
+// ===================== Б5: сравнение сценариев =====================
+sumByItem 'Сумма, ₽' (BudgetPL b, CostItem ci) = GROUP SUM bplAmount(BudgetPLItem it) IF budgetPL(it) = b AND costItem(it) = ci;
+sumDelta 'Δ, ₽' (BudgetPL b1, BudgetPL b2, CostItem ci) = (OVERRIDE sumByItem(b1, ci), 0.0) - (OVERRIDE sumByItem(b2, ci), 0.0);
+FORM budgetCompare 'Сравнение сценариев БДР'
+    OBJECTS b1 = BudgetPL PANEL
+    PROPERTIES (b1) READONLY nameBplScenario
+    OBJECTS b2 = BudgetPL PANEL
+    PROPERTIES (b2) READONLY nameBplScenario
+    OBJECTS ci = CostItem
+    PROPERTIES READONLY sum1 = sumByItem(b1, ci), sum2 = sumByItem(b2, ci), delta = sumDelta(b1, b2, ci)
+    PROPERTIES (ci) READONLY ciName
+    FILTERS sumByItem(b1, ci) OR sumByItem(b2, ci)
+;
+
+// ===================== Ценовые ориентиры рынка (октябрь 2026) =====================
+// Источники: открытые обзоры (oleoscope — подсолнечник; kaicc/ОЗК — пшеница;
+// СПбМТСБ/обзоры — ДТ, карбамид) + косвенные оценки для позиций без прямой
+// котировки. Идемпотентно: один прогон по наличию сценария-маркера.
+marketScenario () = GROUP MAX PriceScenario s IF psName(s) = 'Рынок: октябрь 2026 (ориентир)';
+marketPriceSeed () {
+    IF NOT marketScenario() THEN {
+        // актуализация базовых цен номенклатуры до рыночных ориентиров
+        FOR Nomenclature n IS Nomenclature AND nomCode(n) = 'N-00001' DO basePrice(n) <- 38000.0;   // семена пшеницы элита
+        FOR Nomenclature n IS Nomenclature AND nomCode(n) = 'N-00002' DO basePrice(n) <- 95000.0;   // семена кукурузы F1
+        FOR Nomenclature n IS Nomenclature AND nomCode(n) = 'N-00003' DO basePrice(n) <- 36000.0;   // карбамид (≈37 тыс., agroserver/agroru)
+        FOR Nomenclature n IS Nomenclature AND nomCode(n) = 'N-00004' DO basePrice(n) <- 28500.0;   // аммиачная селитра (косвенно)
+        FOR Nomenclature n IS Nomenclature AND nomCode(n) = 'N-00005' DO basePrice(n) <- 45000.0;   // NPK 16-16-16 (косвенно)
+        FOR Nomenclature n IS Nomenclature AND nomCode(n) = 'N-00006' DO basePrice(n) <- 42000.0;   // суперфосфат двойной (косвенно)
+        FOR Nomenclature n IS Nomenclature AND nomCode(n) = 'N-00007' DO basePrice(n) <- 55000.0;   // сульфат калия (косвенно)
+        FOR Nomenclature n IS Nomenclature AND nomCode(n) = 'N-00011' DO basePrice(n) <- 60.0;      // ДТ, руб/л (СПбМТСБ ≈69,7 тыс ₽/т ≈ 59 ₽/л)
+        FOR Nomenclature n IS Nomenclature AND nomCode(n) = 'N-00012' DO basePrice(n) <- 520.0;     // масло моторное (косвенно)
+        FOR Nomenclature n IS Nomenclature AND nomCode(n) = 'N-00013' DO basePrice(n) <- 15500.0;   // пшеница 3 кл (ОЗК ≈16,7 тыс, юг ≈14,5 тыс)
+        FOR Nomenclature n IS Nomenclature AND nomCode(n) = 'N-00014' DO basePrice(n) <- 13000.0;   // кукуруза (обзоры ≈12-13,5 тыс)
+        NEW s = PriceScenario { psName(s) <- 'Рынок: октябрь 2026 (ориентир)'; psValidFrom(s) <- 2026_10_01; psValidTo(s) <- 2027_07_01; }
+        APPLY;
+        FOR Nomenclature n IS Nomenclature AND basePrice(n) DO
+            NEW it = PriceScenarioItem { scenario(it) <- marketScenario(); psiNomenclature(it) <- n; psiPrice(it) <- basePrice(n); }
+        // дополнительно: продукция без номенклатурной позиции (косвенные оценки)
+                kuPublish(KuEventKind.jobDone, 'PriceScenario', 'Рынок: октябрь 2026 (ориентир)',
+            'Сценарий-ориентир создан из открытых источников (oleoscope, kaicc/ОЗК, СПбМТСБ) + косвенных оценок');
+        APPLY;
+    }
+}

@@ -1,0 +1,76 @@
+MODULE WeatherWttr;
+
+// Провайдер погоды: wttr.in (открытый сервис, без ключа; текущая погода +
+// 3 дня прогноза по координатам). Fallback-режим: работает только когда
+// не задан ключ OpenWeatherMap — чтобы не дублировать OWM-провайдер.
+// Реализует ABSTRACT Weather.updateWeather(Location) через EXTERNAL HTTP + IMPORT JSON.
+// ⚠ wttr.in отдаёт все значения строками — импортируем в STRING и приводим типы.
+REQUIRE Weather, WeatherOpenWeatherMap, Options;
+
+NAMESPACE Weather;
+
+// ===== Разбор JSON ответа wttr.in (?format=j1):
+// { "current_condition": [ { temp_C, FeelsLikeC, humidity, cloudcover, precipMM } ],
+//   "weather": [ { date, mintempC, maxtempC, avgtempC, totalprecipMM } x3 ] } =====
+wttrCurTemp = DATA LOCAL STRING (INTEGER);
+wttrCurFeels = DATA LOCAL STRING (INTEGER);
+wttrCurHum = DATA LOCAL STRING (INTEGER);
+wttrCurCloud = DATA LOCAL STRING (INTEGER);
+wttrCurPrecip = DATA LOCAL STRING (INTEGER);
+
+wttrDate = DATA LOCAL STRING (INTEGER);
+wttrTMin = DATA LOCAL STRING (INTEGER);
+wttrTMax = DATA LOCAL STRING (INTEGER);
+wttrTAvg = DATA LOCAL STRING (INTEGER);
+wttrPrecip = DATA LOCAL STRING (INTEGER);
+
+FORM wttrImport 'Импорт прогноза погоды (wttr.in)'
+    OBJECTS current_condition = INTEGER
+    PROPERTIES (current_condition) wttrCurTemp EXTID 'temp_C', wttrCurFeels EXTID 'FeelsLikeC',
+        wttrCurHum EXTID 'humidity', wttrCurCloud EXTID 'cloudcover', wttrCurPrecip EXTID 'precipMM'
+    OBJECTS weather = INTEGER
+    PROPERTIES (weather) wttrDate EXTID 'date', wttrTMin EXTID 'mintempC', wttrTMax EXTID 'maxtempC',
+        wttrTAvg EXTID 'avgtempC', wttrPrecip EXTID 'totalprecipMM'
+;
+
+// ===== Загрузка прогноза для точки =====
+updateWeatherWttr (Location l) {
+    // только fallback: при настроенном ключе OWM работает штатный провайдер
+    IF NOT owmApiKey() AND latitude(l) AND longitude(l) THEN {
+        LOCAL response = JSONFILE ();
+        EXTERNAL HTTP GET 'https://wttr.in/' + latitude(l) + ',' + longitude(l) + '?format=j1' TO response;
+        IF failedHttp() THEN {
+            MESSAGE 'wttr.in: ошибка запроса ' + statusHttp() NOWAIT;
+        } ELSE {
+            IMPORT wttrImport JSON FROM response();
+            // перезаписываем прогноз точки целиком
+            FOR location(WeatherForecast wf) = l DO DELETE wf;
+            FOR wttrCurTemp(INTEGER c) DO
+                NEW f = WeatherForecast {
+                    location(f) <- l;
+                    time(f) <- currentZDateTime();
+                    fetched(f) <- currentZDateTime();
+                    temperature(f) <- DOUBLE(wttrCurTemp(c));
+                    feelsLike(f) <- DOUBLE(wttrCurFeels(c));
+                    humidity(f) <- INTEGER(wttrCurHum(c));
+                    cloudCover(f) <- INTEGER(wttrCurCloud(c));
+                    precipitation(f) <- round0(DOUBLE(wttrCurPrecip(c)) * 10.0); // мм/час → ×10 условно к %
+                    conditionName(f) <- 'wttr.in (открытые данные)';
+                }
+            FOR wttrDate(INTEGER w) DO
+                NEW f = WeatherForecast {
+                    location(f) <- l;
+                    time(f) <- ZDATETIME(wttrDate(w) + ' 12:00:00');
+                    fetched(f) <- currentZDateTime();
+                    temperature(f) <- DOUBLE(wttrTAvg(w));
+                    feelsLike(f) <- DOUBLE(wttrTAvg(w));
+                    precipitation(f) <- round0(DOUBLE(wttrPrecip(w)) * 10.0);
+                    conditionName(f) <- 'wttr.in: ' + wttrTMin(w) + '…' + wttrTMax(w) + ' °C';
+                }
+            APPLY;
+        }
+    }
+}
+updateWeather(Location l) + {
+    updateWeatherWttr(l);
+}

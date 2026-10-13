@@ -1,0 +1,414 @@
+MODULE KuIntegration;
+
+// КФ-ИН6: телеметрия/скаутинг — MITE-первичность (решение пользователя,
+// волна 2): Device/Measurement — единая точка факта; привязка устройств к
+// полям — kuDeviceField (KuLand); датчики почвы KU-SOL-*, флот KU-FLK-*
+// (раздел «Инфраструктура и интеграции» spec-work 10.10)
+
+// Код Урожая: REST-эндпоинты интеграций (Волна 4 — ФТ6.1–6.5).
+// Заглушки-контракты: принимают/возвращают JSON, фиксируют вызовы в журнале
+// IntegrationLog. Реальная отправка — второй этап (УКЭП/СКЗИ/регистрация).
+REQUIRE KuProdPlan, KuBudget, KuYield;
+
+NAMESPACE Ku;
+
+// ===================== Журнал интеграционных вызовов =====================
+CLASS IntegrationLog 'Вызов интеграции';
+TABLE integrationLog (IntegrationLog);
+ilAt 'Время' = DATA DATETIME (IntegrationLog) NONULL;
+ilSystem 'Внешняя система' = DATA ISTRING[40] (IntegrationLog) NONULL;
+ilOperation 'Операция' = DATA ISTRING[60] (IntegrationLog);
+ilRequest 'Запрос (JSON)' = DATA TEXT (IntegrationLog);
+ilResponse 'Ответ (JSON)' = DATA TEXT (IntegrationLog);
+ilStatus 'Статус' = DATA ISTRING[20] (IntegrationLog) NONULL;
+WHEN SET (IntegrationLog l IS IntegrationLog) DO ilAt(l) <- currentDateTime();
+// статус по умолчанию — только если не задан явно (NEW-блок integrationCall
+// различает live-вызов и второй этап; раньше WHEN SET затирал на APPLY)
+WHEN SET (IntegrationLog l IS IntegrationLog) AND NOT CHANGED(ilStatus(l)) DO
+    ilStatus(l) <- 'Принят (второй этап)';
+
+// { и } в строках lsFusion — ключи локализации: получаем формулами
+lcb () = [FORMULA STRING[1] 'chr(123)']();
+rcb () = [FORMULA STRING[1] 'chr(125)']();
+
+// ===================== Профили внешних систем (эндпоинты) =====================
+// Параметры подключения к ФГИС/1С по результатам изучения API-документации
+// (docs-external/*.md). Режим по умолчанию — deferred (второй этап: УКЭП/СКЗИ/
+// регистрация); при ieLive=TRUE и заполненном URL выполняется реальный вызов.
+CLASS IntegrationEndpoint 'Внешняя система (эндпоинт)';
+TABLE integrationEndpoint (IntegrationEndpoint);
+ieCode 'Код' = DATA ISTRING[20] (IntegrationEndpoint) NONULL IN id;
+ieName 'Система' = DATA ISTRING[100] (IntegrationEndpoint) NONULL;
+ieProtocol 'Протокол' = DATA ISTRING[80] (IntegrationEndpoint);
+ieEndpointUrl 'URL эндпоинта' = DATA ISTRING[250] (IntegrationEndpoint);
+ieAuthNote 'Авторизация' = DATA ISTRING[250] (IntegrationEndpoint);
+ieToken 'Токен/учётка' = DATA ISTRING[250] (IntegrationEndpoint);
+ieLive 'Живой вызов' = DATA BOOLEAN (IntegrationEndpoint);
+ieDocs 'Документация' = DATA ISTRING[250] (IntegrationEndpoint);
+ieByCode = GROUP AGGR IntegrationEndpoint e BY ieCode(e);
+
+// хелпер: записать вызов в журнал; при включённом live-режиме — реальный
+// HTTP POST (JSON) с Authorization из ieToken; иначе — отложенный ответ
+integrationCall (IntegrationEndpoint e, ISTRING[60] operation, TEXT payloadJson) {
+    LOCAL respText = TEXT ();
+    respText() <- 'status=deferred; endpoint=' + (OVERRIDE ieEndpointUrl(e), 'не настроен')
+        + '; auth=' + (OVERRIDE ieAuthNote(e), '—');
+    IF e AND ieLive(e) AND ieEndpointUrl(e) THEN {
+        LOCAL headers = STRING(STRING);
+        headers('Content-Type') <- 'application/json';
+        IF ieToken(e) THEN headers('Authorization') <- ieToken(e);
+        TRY {
+            LOCAL resp = JSONFILE ();
+            EXTERNAL HTTP POST ieEndpointUrl(e) HEADERS headers PARAMS JSONFILE(payloadJson) TO resp;
+            respText() <- 'HTTP ' + (OVERRIDE ('' + statusHttp()), '?') + ' — вызов выполнен';
+        } CATCH {
+            respText() <- 'ошибка вызова: ' + (OVERRIDE messageCaughtException(), 'нет связи/URL');
+        }
+    }
+    NEW l = IntegrationLog {
+        ilSystem(l) <- OVERRIDE ieName(e), 'внешняя система';
+        ilOperation(l) <- operation;
+        ilRequest(l) <- payloadJson;
+        ilResponse(l) <- respText();
+        ilStatus(l) <- IF e AND ieLive(e) AND ieEndpointUrl(e) THEN 'Отправлен live-вызов' ELSE 'Принят (второй этап)';
+    }
+    kuPublish(KuEventKind.jobDone, 'Integration', (OVERRIDE ieCode(e), 'external'), operation + ' — вызов зафиксирован');
+    APPLY;
+}
+// вызов без профиля (для систем вне справочника)
+integrationStub (ISTRING[40] system, ISTRING[60] operation, TEXT requestJson) {
+    NEW l = IntegrationLog {
+        ilSystem(l) <- system;
+        ilOperation(l) <- operation;
+        ilRequest(l) <- requestJson;
+        ilResponse(l) <- 'status=deferred; reason=второй этап: требуется УКЭП/СКЗИ и регистрация';
+        ilStatus(l) <- 'Принят (второй этап)';
+    }
+    kuPublish(KuEventKind.jobDone, 'Integration', system, operation + ' — вызов зафиксирован (второй этап)');
+    APPLY;
+}
+
+// ===================== ФТ6.1: обмен с финансово-учётной системой (1С) =====================
+// Схема (docs-external/1С-обмен-заявки-ДС.md): заявки — через собственный
+// HTTP-сервис 1С (POST /hs/agro/payment-requests, JSON, Basic), НСИ/статусы —
+// через стандартный OData (GET /odata/standard.odata/...).
+apiExternalAccountingSync 'API: синхронизация с учётной системой' (ISTRING[40] direction, ISTRING[200] entityJson) {
+    integrationCall(ieByCode('accounting1c'), 'Синхронизация НСИ (' + direction + ')',
+        lcb()
+        + '"com":"odata.sync", "direction":"' + direction + '",'
+        + '"odataReadUrl":"' + (OVERRIDE ieEndpointUrl(ieByCode('accounting1c')), 'http://<1c-host>/<base>/odata/standard.odata/') + '/Catalog_Контрагенты?$filter=DeletionMark eq false&$format=json",'
+        + '"entities":' + (OVERRIDE entityJson, '[]')
+        + rcb());
+    EXPORT JSON FROM
+        system = 'externalAccounting',
+        direction = direction,
+        contract = 'OData standard.odata ( чтение НСИ/статусов ) + HTTP-сервис /hs (запись)',
+        status = 'deferred';
+    RETURN JSONFILE(exportFile());
+}
+
+
+
+// ===================== ФТ6.2: ФГИС «Зерно» (СДИЗ) =====================
+// SOAP 1.1, СМЭВ-подобный цикл SendRequest→SendResponse→Ack, конверт подписывается
+// ЭЦП ГОСТ (InformationSystemSignature); WSDL zerno.mcx.gov.ru/ws/api/fgiz?wsdl
+soapEnvelope (ISTRING[60] businessAction, TEXT businessContent) =
+    '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
+    + ' xmlns:typ="urn://x-artefacts-mcx-gov-ru/fgiz-zerno/api/ws/types/1.0.5">'
+    + '<soapenv:Header/><soapenv:Body><typ:SendRequest>'
+    + '<typ:MessageID>uuid:' + (OVERRIDE ('' + currentDateTime()), '') + '</typ:MessageID>'
+    + '<typ:MessagePrimaryContent>' + businessContent + '</typ:MessagePrimaryContent>'
+    + '<typ:TestMessage>true</typ:TestMessage>'
+    + '<!-- InformationSystemSignature: ЭЦП ГОСТ Р 34.10/34.11-2012 (XMLDSig detached PKCS#7) -->'
+    + '</typ:SendRequest></soapenv:Body></soapenv:Envelope>';
+
+apiSdizRegister 'API: зарегистрировать СДИЗ' (ISTRING[20] actNumber, ISTRING[200] batchJson) {
+    integrationCall(ieByCode('fgisZerno'), 'Регистрация СДИЗ (' + actNumber + ')',
+        soapEnvelope('RequestCreateSDIZ',
+            '<ns:RequestCreateSDIZ xmlns:ns="urn://x-artefacts-mcx-gov-ru/fgiz-zerno/api/lots">'
+            + '<ns:lotNumber>по акту ' + actNumber + '</ns:lotNumber>'
+            + '<ns:batch>' + (OVERRIDE batchJson, lcb() + rcb()) + '</ns:batch>'
+            + '</ns:RequestCreateSDIZ>'));
+    EXPORT JSON FROM
+        system = 'fgisZerno',
+        operation = 'sdizRegister',
+        wsdl = 'https://zerno.mcx.gov.ru/ws/api/fgiz?wsdl',
+        cycle = 'SOAP: SendRequest → SendResponse → Ack',
+        requirements = 'ЭЦП ГОСТ в InformationSystemSignature, регистрация ХС, версии API ≥1.0.9',
+        act = actNumber,
+        status = 'deferred';
+    RETURN JSONFILE(exportFile());
+}
+
+apiSdizCancel 'API: погасить/аннулировать СДИЗ' (ISTRING[30] sdizNumber, ISTRING[10] operation) {
+    // скобки вокруг IF: одиночный IF-THEN-ELSE имеет низший приоритет и «забирал»
+    // всю последующую конкатенацию в ELSE-ветку — конверт разваливался
+    integrationCall(ieByCode('fgisZerno'), operation + ' СДИЗ (' + sdizNumber + ')',
+        soapEnvelope(IF operation = 'cancel' THEN 'RequestCanceledSDIZ' ELSE 'RequestCreateExtinction',
+            '<ns:' + (IF operation = 'cancel' THEN 'RequestCanceledSDIZ' ELSE 'RequestCreateExtinction')
+            + ' xmlns:ns="urn://x-artefacts-mcx-gov-ru/fgiz-zerno/api/sdiz">'
+            + '<ns:sdizNumber>' + sdizNumber + '</ns:sdizNumber>'
+            + '</ns:' + (IF operation = 'cancel' THEN 'RequestCanceledSDIZ' ELSE 'RequestCreateExtinction') + '>'));
+    EXPORT JSON FROM
+        system = 'fgisZerno',
+        operation = operation,
+        sdiz = sdizNumber,
+        status = 'deferred';
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== ФТ6.3: ФГИС «Сатурн» (ПиА) =====================
+// SE-API: JSON поверх POST к единому эндпоинту, авторизация ЕСИА→Bearer (access 14 дн.);
+// сущность PatUsage, ЖЦ draft→actual; справочник PatProduct = Госкаталог препаратов
+apiSaturnActCreate 'API: зарегистрировать акт применения ПиА' (ISTRING[20] fieldCode, ISTRING[200] actJson) {
+    integrationCall(ieByCode('fgisSaturn'), 'Акт применения ПиА (' + fieldCode + ')',
+        lcb()
+        + '"com":"execOperation", "otype":"PatUsage", "op":"static/createNew()",'
+        + '"opargs":' + lcb() + '"theCard":' + lcb()
+        + '"head":' + lcb() + '"docNum":"' + fieldCode + '-' + (OVERRIDE ('' + extractDay(currentDate())), '') + '","is420":false' + rcb() + ','
+        + '"acreageList":[' + lcb() + '"acreageId":"' + fieldCode + '","batchDtoList":[' + (OVERRIDE actJson, lcb() + rcb()) + ']' + rcb() + ']'
+        + rcb() + rcb() + ','
+        + '"auth":"ЕСИА → refresh-токен /login → GET /backend/role/newaccesstoken → Bearer"'
+        + rcb());
+    EXPORT JSON FROM
+        system = 'fgisSaturn',
+        operation = 'PatUsage.static/createNew()',
+        api = 'SE-API (REST-подобный JSON, POST)',
+        docs = 'wiki.fgis-saturn.ru (раздел SE-API), каталог препаратов — PatProduct.static/getList()',
+        field = fieldCode,
+        status = 'deferred';
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== ФТ6.4: ФГИС «ВетИС» (эВСД) =====================
+// Ветис.API v2.1: SOAP, submitApplicationRequest→receiveApplicationResult;
+// Basic(login:password ИС) + apiKey + issuerId (UUID ХС в Цербере); сервис mercury-g2b
+apiVsdCreate 'API: оформить эВСД' (ISTRING[20] batchNumber, ISTRING[200] vsdJson) {
+    integrationCall(ieByCode('fgisVetis'), 'Оформление эВСД (' + batchNumber + ')',
+        '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
+        + ' xmlns:apl="http://api.vetrf.ru/schema/cdm/application" xmlns:merc="http://api.vetrf.ru/schema/cdm/mercury/application">'
+        + '<soapenv:Header/><soapenv:Body><apl:submitApplicationRequest>'
+        + '<apl:apiKey>#apiKey#</apl:apiKey>'
+        + '<apl:application><apl:serviceId>mercury-g2b.service</apl:serviceId>'
+        + '<apl:issuerId>#issuerId-Цербер#</apl:issuerId><apl:data>'
+        + '<merc:prepareOutgoingConsignmentRequest><merc:localTransactionId>a1</merc:localTransactionId>'
+        + '<merc:consignment><merc:batch>' + (OVERRIDE vsdJson, lcb() + rcb()) + '</merc:batch></merc:consignment>'
+        + '</merc:prepareOutgoingConsignmentRequest></apl:data></apl:application>'
+        + '</apl:submitApplicationRequest></soapenv:Body></soapenv:Envelope>'
+        + ' <!-- Basic-auth служебной ИС; результат — receiveApplicationResult (хранится 3 дня) -->');
+    EXPORT JSON FROM
+        system = 'fgisVetis',
+        operation = 'mercury-g2b: prepareOutgoingConsignment',
+        endpoint = 'https://api.vetrf.ru/platform/services/2.1/ApplicationManagementService',
+        docs = 'help.vetrf.ru/wiki/Ветис.API',
+        batch = batchNumber,
+        status = 'deferred';
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== ФТ6.5: приём внешних данных =====================
+// метео: POST факт/прогноз по координатам
+apiWeatherPush 'API: принять метеоданные' (ISTRING[20] source, ISTRING[500] weatherJson) {
+    integrationStub('Внешние данные', 'Метеоданные (' + source + ')', weatherJson);
+    EXPORT JSON FROM
+        system = 'weatherProvider',
+        source = source,
+        format = 'JSON: date, tMin, tMax, precip, wind, radiation',
+        accepted = TRUE;
+    RETURN JSONFILE(exportFile());
+}
+
+// ДЗЗ/NDVI: POST снимки/индексы по полю
+apiNdviPush 'API: принять NDVI' (ISTRING[16] fieldCode, ISTRING[500] ndviJson) {
+    integrationStub('Внешние данные', 'NDVI (' + fieldCode + ')', ndviJson);
+    EXPORT JSON FROM
+        system = 'satelliteProvider',
+        field = fieldCode,
+        format = 'JSON: date, ndvi, source',
+        accepted = TRUE;
+    RETURN JSONFILE(exportFile());
+}
+
+// телеметрия: POST показания датчиков — записывается в контур MITE
+// (Device/Measurement; основной канал приёма — UDP/MQTT, это REST-фронт,
+// Волна 2 «MITE-первичность»). Формат — массив объектов:
+// [{"devId":930001,"lat":55.06,"lon":73.48,"temp":8.5,"hum":70}] —
+// поля опциональны, время серверное. Разбор — stringToFile → resultFile()
+// → IMPORT TO (LOCAL NESTED, паттерн KuEtl/Mite-DBF): варианты IMPORT …
+// FIELDS…DO из строки в этом пине НЕ выполняют блок вовсе (зафиксировано
+// и на apiRotationSave — там клетки не сохраняются, отдельный дефект)
+apiTelemetryPush 'API: принять телеметрию' (ISTRING[20] deviceId, ISTRING[500] telemetryJson) {
+    integrationStub('Внешние данные', 'Телеметрия (' + deviceId + ')', telemetryJson);
+    LOCAL NESTED devId = INTEGER (INTEGER);
+    LOCAL NESTED lat = ISTRING[24] (INTEGER);
+    LOCAL NESTED lon = ISTRING[24] (INTEGER);
+    LOCAL NESTED temp = ISTRING[24] (INTEGER);
+    LOCAL NESTED hum = ISTRING[24] (INTEGER);
+    stringToFile(telemetryJson);
+    IMPORT JSON FROM resultFile() TO devId, lat, lon, temp, hum;
+    // паттерн Mite.lsf (импорт DBF): FOR по объектному множеству с row-join
+    // внутри агрегата — вложенный FOR (row → объект) в этом пине не срабатывает
+    FOR [GROUP SUM 1 IF Device dv = device(devId(INTEGER row)) BY dv](Device dv) DO {
+        APPLY FOR dv = device(devId(INTEGER row)) INLINE NEW m = Measurement DO {
+            device(m) <- dv;
+            dateTime(m) <- currentZDateTime();
+            IF (OVERRIDE lat(row), '') != '' AND kuLatType() THEN value(m, kuLatType()) <- DOUBLE(lat(row));
+            IF (OVERRIDE lon(row), '') != '' AND kuLonType() THEN value(m, kuLonType()) <- DOUBLE(lon(row));
+            IF (OVERRIDE temp(row), '') != '' AND kuTempType() THEN value(m, kuTempType()) <- DOUBLE(temp(row));
+            IF (OVERRIDE hum(row), '') != '' AND kuHumType() THEN value(m, kuHumType()) <- DOUBLE(hum(row));
+        }
+        IF canceled() THEN BREAK;
+    }
+    EXPORT JSON FROM
+        system = 'fieldSensors',
+        device = deviceId,
+        rows = GROUP SUM 1 IF devId(INTEGER row);
+    RETURN JSONFILE(exportFile());
+}
+
+// ===================== Форма =====================
+apiPaymentRequestSend 'API: отправить заявку на оплату' (ISTRING[20] sheetNumber, ISTRING[200] itemsJson) {
+    // контракт по 1С-документу «Заявка на расходование ДС» (ERP/КА2)
+    integrationCall(ieByCode('accounting1c'), 'Заявка на расходование ДС (' + sheetNumber + ')',
+        lcb()
+        + '"POST":"(hs)/agro/payment-requests",'
+        + '"idempotencyKey":"PR-' + sheetNumber + '",'
+        + '"sheet":"' + sheetNumber + '",'
+        + '"items":' + (OVERRIDE itemsJson, '[]') + ','
+        + '"ddsArticle":"Аренда", "costItems":"см. заявки (prCostItem)", "statusExpected":"Не согласована → Согласована → К оплате/Отклонена"'
+        + rcb());
+    EXPORT JSON FROM
+        system = 'externalAccounting',
+        operation = 'paymentRequest',
+        contract = 'POST /hs/agro/payment-requests (JSON, Basic auth, идемпотентный ключ)',
+        sheet = sheetNumber,
+        status = 'deferred';
+    RETURN JSONFILE(exportFile());
+}
+
+FORM integrationLog 'Журнал интеграционных вызовов'
+    OBJECTS l = IntegrationLog
+    PROPERTIES (l) READONLY ilAt, ilSystem, ilOperation, ilStatus
+    PROPERTIES (l) NEWSESSION EDIT
+    ORDERS ilAt(l) DESC
+;
+
+FORM integrationEndpoint 'Параметры внешней системы'
+    OBJECTS e = IntegrationEndpoint
+    PROPERTIES (e) NEWSESSION NEW, EDIT, DELETE
+;
+
+// КФ-ИН4: последний вызов профиля (из журнала IntegrationLog по имени системы)
+ieLastCallAt 'Последний вызов' (IntegrationEndpoint e) =
+    GROUP MAX ilAt(IntegrationLog l) IF ilSystem(l) = ieName(e);
+ieLastCallStatus 'Статус последнего' (IntegrationEndpoint e) =
+    GROUP LAST ilStatus(IntegrationLog l) ORDER ilAt(l), l IF ilSystem(l) = ieName(e);
+// метео/NDVI (ФТ6.5) заглушками без профилей — провайдеры Weather контура MITE
+FORM integrationEndpoints 'Внешние системы (эндпоинты)'
+    OBJECTS e = IntegrationEndpoint
+    PROPERTIES (e) READONLY ieCode, ieName, ieProtocol, ieEndpointUrl, ieLive, ieLastCallAt, ieLastCallStatus
+    PROPERTIES (e) NEWSESSION EDIT
+    PROPERTIES (e) DELETE
+;
+
+// сид профилей внешних систем (docs-external/*.md); идемпотентно по коду
+endpointSeed () {
+    IF NOT ieByCode('fgisSaturn') THEN NEW e = IntegrationEndpoint {
+        ieCode(e) <- 'fgisSaturn'; ieName(e) <- 'ФГИС «Сатурн» (Россельхознадзор)';
+        ieProtocol(e) <- 'SE-API: JSON поверх POST (единый эндпоинт)';
+        ieEndpointUrl(e) <- 'https://api.fgis-saturn.ru/probeInnerArm/innerArm/seapi/';
+        ieAuthNote(e) <- 'ЕСИА → refresh-токен /login → newaccesstoken → Bearer (access 14 дн.)';
+        ieDocs(e) <- 'wiki.fgis-saturn.ru (SE-API); см. docs-external/ФГИС-Сатурн-API.md';
+    }
+    IF NOT ieByCode('fgisZerno') THEN NEW e = IntegrationEndpoint {
+        ieCode(e) <- 'fgisZerno'; ieName(e) <- 'ФГИС «Зерно» (Минсельхоз/Центр Агроаналитики)';
+        ieProtocol(e) <- 'SOAP 1.1: SendRequest → SendResponse → Ack (TestMessage=true на проде)';
+        ieEndpointUrl(e) <- 'https://zerno.mcx.gov.ru/ws/api/fgiz';
+        ieAuthNote(e) <- 'ЭЦП ГОСТ в InformationSystemSignature + регистрация ХС; WSDL: …?wsdl';
+        ieDocs(e) <- 'specagro.ru/fgis/api; см. docs-external/ФГИС-Зерно-API.md';
+    }
+    IF NOT ieByCode('fgisVetis') THEN NEW e = IntegrationEndpoint {
+        ieCode(e) <- 'fgisVetis'; ieName(e) <- 'ФГИС «ВетИС»/Меркурий (Россельхознадзор)';
+        ieProtocol(e) <- 'SOAP v2.1: submitApplicationRequest → receiveApplicationResult';
+        ieEndpointUrl(e) <- 'https://api.vetrf.ru/platform/services/2.1/ApplicationManagementService';
+        ieAuthNote(e) <- 'HTTP Basic (login ИС) + apiKey + issuerId (UUID ХС в Цербере)';
+        ieDocs(e) <- 'help.vetrf.ru/wiki/Ветис.API; см. docs-external/ФГИС-ВетИС-Меркурий-API.md';
+    }
+    IF NOT ieByCode('accounting1c') THEN NEW e = IntegrationEndpoint {
+        ieCode(e) <- 'accounting1c'; ieName(e) <- 'Учётная система 1С (ERP/КА2)';
+        ieProtocol(e) <- 'REST: POST /hs/agro/* (свой HTTP-сервис) + OData standard.odata';
+        ieEndpointUrl(e) <- 'http://<1c-host>/<base>/hs/agro/payment-requests';
+        ieAuthNote(e) <- 'HTTP Basic служебного пользователя (роль УдаленныйДоступOData/ограниченная)';
+        ieDocs(e) <- 'см. docs-external/1С-обмен-заявки-ДС.md';
+    }
+    APPLY;
+    // демо-вызовы: образцы реальных контрактов в журнале интеграций (один раз)
+    IF NOT (GROUP MAX 1 IF IntegrationLog l IS IntegrationLog AND ilOperation(l) LIKE 'Акт применения%') THEN {
+        apiSaturnActCreate('KH-001', '"batchId":"demo-batch-1","dosage":1.5,"countPu":2,"harmfulObject":"мучнистая роса"');
+        apiSdizRegister('АУ-2027-1', '<volume>510</volume><culture>пшеница мягкая</culture>');
+        apiPaymentRequestSend('ПВ-2026-10', '"contract":"АР-2024-018","amount":1450000.00');
+    }
+}
+
+// ===================== Заявки на расходование ДС (ТЗ ФТ3.7 UC-03) =====================
+CLASS PaymentRequest 'Заявка на расходование ДС';
+TABLE paymentRequest (PaymentRequest);
+prSheet 'Платёжная ведомость' = DATA PaymentSheet (PaymentRequest) NONULL;
+prContract 'Договор' = DATA LeaseContract (PaymentRequest) NONULL;
+prContractor 'Контрагент' = DATA Contractor (PaymentRequest) NONULL;
+prAmount 'Сумма к выплате' = DATA NUMERIC[14,2] (PaymentRequest) NONULL;
+prCostItem 'Статья ДДС' = DATA CostItem (PaymentRequest);   // КФ-З19
+namePrCostItem 'Статья ДДС' (PaymentRequest pr) = OVERRIDE ciName(prCostItem(pr)), '';
+setPrCostItemAct 'Выбрать статью' (PaymentRequest pr) {
+    DIALOG pickCostItem OBJECTS ci = prCostItem(pr) INPUT ci NULL DO prCostItem(pr) <- ci;
+}
+prStatus 'Статус' = DATA PaymentRequestStatus (PaymentRequest) NONULL;
+prCreatedAt 'Создана' = DATA DATETIME (PaymentRequest);
+prReason 'Основание корректировки' = DATA ISTRING[200] (PaymentRequest);
+WHEN SET (PaymentRequest pr IS PaymentRequest) DO {
+    prStatus(pr) <- PaymentRequestStatus.posted;
+    prCreatedAt(pr) <- currentDateTime();
+}
+CLASS PaymentRequestStatus 'Статус заявки' {
+    posted 'Проведена', sent 'Отправлена в учётную систему', rejected 'Отклонена'
+}
+namePrStatus 'Статус' (PaymentRequest pr) = staticCaption(prStatus(pr));
+namePrContractor 'Контрагент' (PaymentRequest pr) = OVERRIDE fullName(prContractor(pr)), '';
+namePrContract 'Договор' (PaymentRequest pr) = number(prContract(pr));
+
+// кнопка на ведомости: создать заявки по строкам (UC-03 ТЗ 4.2.3.4)
+createPaymentRequests 'Сформировать выплаты' (PaymentSheet s) {
+    IF sheetStatus(s) != PaymentSheetStatus.approved THEN {
+        MESSAGE 'Сначала утвердите ведомость.';
+    } ELSE {
+        // одна заявка на договор (агрегация по строкам ведомости)
+        FOR LeaseContract c IS LeaseContract AND (GROUP MAX 1 IF PaymentSheetItem i IS PaymentSheetItem AND contract(i) = c AND sheet(i) = s) DO
+            IF NOT (GROUP MAX 1 IF PaymentRequest pr IS PaymentRequest AND prSheet(pr) = s AND prContract(pr) = c) THEN
+                NEW pr = PaymentRequest {
+                    prSheet(pr) <- s;
+                    prContract(pr) <- c;
+                    prContractor(pr) <- tenant(c);
+                    prAmount(pr) <- GROUP SUM toPay(PaymentSheetItem i) IF sheet(i) = s AND contract(i) = c;
+                }
+        kuPublish(KuEventKind.jobDone, 'PaymentRequest', 'Выплаты',
+            'Заявок на ДС создано: ' + (OVERRIDE ('' + (GROUP SUM 1 IF PaymentRequest pr IS PaymentRequest AND prSheet(pr) = s)), '0'));
+        APPLY;
+        MESSAGE 'Заявки сформированы: ' + (OVERRIDE ('' + (GROUP SUM 1 IF PaymentRequest pr IS PaymentRequest AND prSheet(pr) = s)), '0')
+            + '. Отправка в учётную систему — apiPaymentRequestSend (второй этап).';
+    }
+}
+
+// КФ-З18: оплата по отправленной заявке (выбор пикером, автоподстановка)
+registerPaymentByRequest 'Оплатить по заявке' (PaymentRequest pr) {
+    IF prStatus(pr) = PaymentRequestStatus.sent THEN
+        registerPaymentEntry(prContract(pr), prAmount(pr), 'PR-' + (OVERRIDE ('' + periodFrom(prSheet(pr))), ''));
+    ELSE MESSAGE 'Заявка не в статусе «Отправлена».';
+}
+FORM paymentRequests 'Заявки на расходование ДС'
+    OBJECTS pr = PaymentRequest
+    PROPERTIES (pr) READONLY namePrContract, namePrContractor, prAmount, namePrStatus, prCreatedAt, prReason
+    PROPERTIES (pr) NEWSESSION NEW, EDIT, DELETE
+    PROPERTIES (pr) READONLY namePrCostItem
+    PROPERTIES (pr) setPrCostItemAct SHOWIF NOT prCostItem(pr)
+    PROPERTIES (pr) registerPaymentByRequest
+;;;

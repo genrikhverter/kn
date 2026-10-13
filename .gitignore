@@ -1,0 +1,37 @@
+# Сборка и зависимости
+target/
+*.class
+*.jar
+*.war
+.m2/
+node_modules/
+
+# Артефакты стенда (не версионируются: собираются и бэкапятся на месте)
+artifacts/
+backups/*.gz
+backups/*.sql
+backups/backup.log
+
+# Python (мост KNP)
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Платформа LSfusion (внешний git-клон с пином, см. docs/12-deploy-guide.md §5)
+sources/platform/
+
+# IDE/ОС
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+.DS_Store
+Thumbs.db
+
+# Логи и временные
+*.log
+*.tmp

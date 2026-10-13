@@ -1,0 +1,104 @@
+# Единственное отличие от инструкции (29.08.2026): хост-пути /opt/mite
+# заменены на фактический корень проекта /home/vmalt/knp-dev/mite_dev.
+# При переносе проекта в /opt/mite достаточно вернуть исходные пути
+# (либо: sudo ln -s /home/vmalt/knp-dev/mite_dev /opt/mite).
+services:
+  db:
+    build:
+      context: .
+      dockerfile: Dockerfile.db
+    container_name: mite_db
+    restart: unless-stopped
+    volumes:
+      # Именованный volume: данные переживают пересоздание контейнера и
+      # пересборку образа (раньше жили в слое контейнера и терялись).
+      # Первоначальное заполнение — восстановлением из бэкапа, см.
+      # docs/08-operations.md §Восстановление.
+      - mite_pgdata:/var/lib/pgsql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - mite_net
+
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.builder
+    container_name: mite_builder
+    volumes:
+      - /home/vmalt/knp-dev/mite_dev/sources/platform:/build/platform
+      - /home/vmalt/knp-dev/mite_dev/sources/mite_public:/build/mite_public
+      - /home/vmalt/knp-dev/mite_dev/artifacts:/artifacts
+      # кэш Maven на хосте: переживает пересборки, зависимости качаются один раз
+      # (settings.xml с зеркалами лежит рядом, в .m2/settings.xml)
+      - /home/vmalt/knp-dev/mite_dev/.m2:/root/.m2
+    command: >
+      bash -c "
+      cd /build/platform &&
+      export JAVA_HOME=/usr/lib/jvm/java-21-openjdk && mvn clean install -DskipTests -pl '!desktop-client,!web-client' &&
+      export JAVA_HOME=/usr/lib/jvm/java-11-openjdk && cd /build/platform/desktop-client && mvn clean install -DskipTests &&
+      export JAVA_HOME=/usr/lib/jvm/java-21-openjdk && cd /build/platform/web-client && mvn clean install -DskipTests &&
+      cd /build/mite_public && mvn clean package -P assemble,embed-server -DskipTests &&
+
+      rm -rf /artifacts/lib && mvn dependency:copy-dependencies -DoutputDirectory=/artifacts/lib -DincludeScope=runtime &&
+
+      cp /build/platform/server/target/lsfusion-server-7.0-SNAPSHOT.jar /artifacts/ &&
+      cp /build/mite_public/target/iot-1.0-SNAPSHOT.jar /artifacts/ &&
+      cp /build/platform/web-client/target/lsfusion-client-7.0-SNAPSHOT.war /artifacts/ &&
+      cd /tmp && rm -rf wp && mkdir wp && cd wp &&
+      jar xf /artifacts/lsfusion-client-7.0-SNAPSHOT.war WEB-INF/web.xml &&
+      sed -i 's|<param-value>localhost</param-value>|<param-value>server</param-value>|' WEB-INF/web.xml &&
+      jar uf /artifacts/lsfusion-client-7.0-SNAPSHOT.war WEB-INF/web.xml &&
+      echo 'Сборка успешно завершена!'
+      "
+    networks:
+      - mite_net
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: mite_server
+    restart: unless-stopped
+    depends_on:
+      - db
+    volumes:
+      - /home/vmalt/knp-dev/mite_dev/artifacts:/opt/lsfusion
+    ports:
+      - "7651:7651"
+      - "7652:7652"
+    networks:
+      - mite_net
+
+  grafana:
+    build:
+      context: .
+      dockerfile: Dockerfile.grafana
+    container_name: mite_grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    networks:
+      - mite_net
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: mite_web
+    restart: unless-stopped
+    depends_on:
+      - server
+    volumes:
+      - /home/vmalt/knp-dev/mite_dev/artifacts/lsfusion-client-7.0-SNAPSHOT.war:/usr/share/tomcat/webapps/ROOT.war
+    ports:
+      - "8080:8080"
+    networks:
+      - mite_net
+
+networks:
+  mite_net:
+    driver: bridge
+
+volumes:
+  mite_pgdata:

@@ -1,0 +1,2579 @@
+MODULE KuLand;
+
+// Код Урожая: земельный банк — участки, поля, контрагенты, договоры аренды,
+// агрохиманализ, взаиморасчёты, уведомления.
+// Спецификация: docs/02-data-model.md §2,§7; docs/03-logic-KuLand.md.
+REQUIRE KuCrop, Location, Organization, OrgLocation, Authentication, Weather;
+
+NAMESPACE Ku;
+
+// ===================== Перечисления =====================
+CLASS LandClass 'Класс земель' {
+    c1 'I', c2 'II', c3 'III', c4 'IV', c5 'V'
+}
+CLASS PlotStatus 'Статус участка' {
+    free 'Свободен',
+    leased 'В аренде',
+    encumbered 'Под обременением',
+    disputed 'Спорный'
+}
+CLASS LeaseContractStatus 'Статус договора' {
+    draft 'Черновик',
+    active 'Действует',
+    expired 'Истёк',
+    terminated 'Расторгнут досрочно'
+,
+    archived 'Архивный'}
+CLASS ContractorKind 'Тип контрагента' {
+    person 'Физическое лицо',
+    entrepreneur 'ИП',
+    company 'Юридическое лицо',
+    government 'Гос. орган',
+    foreign 'Иностранное лицо'
+}
+CLASS ContractorStatus 'Статус контрагента' {
+    active 'Активен',
+    archived 'Архив',
+    liquidated 'Ликвидирован',
+    reorganizing 'В процессе реорганизации',
+    contested 'Оспорен'
+}
+CLASS PaymentPeriodicity 'Периодичность платежей' {
+    weekly 'Еженедельно', monthly 'Ежемесячно', quarterly 'Ежеквартально', yearly 'Ежегодно'
+}
+CLASS LeaseEntryKind 'Вид записи' {
+    obligation 'Начисление',
+    payment 'Оплата'
+}
+CLASS PaymentSheetStatus 'Статус ведомости' {
+    draft 'Черновик', approved 'Утверждена'
+}
+CLASS LeaseNotifyKind 'Тип уведомления' {
+    rent 'Арендная плата',
+    expiry 'Окончание договора'
+}
+
+// ===================== Тип почвы =====================
+// Атрибуты: гранулометрия, плотность сложения, нормы гумуса/pH —
+// потребители: поля/агрохимия, группировка при калибровке (ФТ4.3 v2.0)
+CLASS Granulometry 'Гранулометрический состав' {
+    clay 'Глина', heavyLoam 'Тяжёлый суглинок', midLoam 'Средний суглинок',
+    lightLoam 'Лёгкий суглинок', sandyLoam 'Супесь', sand 'Песок'
+}
+CLASS SoilType 'Тип почвы';
+TABLE soilType (SoilType);
+name 'Наименование' = DATA ISTRING[60] (SoilType) NONULL IN id;
+code 'Код' = DATA ISTRING[8] (SoilType);
+granulometry 'Гранулометрический состав' = DATA Granulometry (SoilType);
+nameGranulometry 'Гранулометрический состав' (SoilType st) = staticCaption(granulometry(st));
+densitySoil 'Плотность сложения, г/см³' = DATA NUMERIC[5,2] (SoilType);
+humusNorm 'Гумус (норма), %' = DATA NUMERIC[5,2] (SoilType);
+phNormMin 'pH норма, мин' = DATA NUMERIC[4,1] (SoilType);
+phNormMax 'pH норма, макс' = DATA NUMERIC[4,1] (SoilType);
+
+// ===================== Земельный участок (ФТ3.1) =====================
+CLASS LandPlot 'Земельный участок';
+TABLE landPlot (LandPlot);
+name 'Название' = DATA ISTRING[60] (LandPlot) NONULL IN id;
+cadastralNumber 'Кадастровый номер' = DATA ISTRING[40] (LandPlot) NONULL;
+plotStatus 'Статус' = DATA PlotStatus (LandPlot) NONULL;
+namePlotStatus 'Статус' (LandPlot p) = staticCaption(plotStatus(p));
+areaSqm 'Площадь, кв.м' = DATA NUMERIC[14,2] (LandPlot) NONULL;
+areaHaPlot 'Площадь, га' (LandPlot p) = areaSqm(p) / 10000.0;
+polygonGeoJson 'Границы (GeoJSON)' = DATA TEXT (LandPlot);
+pkkUrl 'Ссылка на публичную кадастровую карту' = DATA ISTRING[500] (LandPlot);
+encumbrance 'Обременения (JSON)' = DATA TEXT (LandPlot);
+egrnExtract 'Выписка ЕГРН' = DATA RAWFILE (LandPlot);
+organization 'Организация' = DATA Organization (LandPlot) NONULL;
+nameOrganizationPlot 'Организация' (LandPlot p) = name(organization(p));
+note 'Примечания' = DATA TEXT (LandPlot);
+created 'Создано' = DATA DATETIME (LandPlot);
+createdBy 'Автор' = DATA CustomUser (LandPlot);
+nameLpCreatedBy 'Автор' (LandPlot p) = OVERRIDE nameKuUser(createdBy(p)), '';
+// п.18а UI-обзора: «Изменено» участка — при создании равно «Создано» (п.15)
+plotUpdated 'Изменено' = DATA DATETIME (LandPlot);
+WHEN CHANGED(name(LandPlot p)) OR CHANGED(cadastralNumber(p)) OR CHANGED(areaSqm(p))
+    OR CHANGED(polygonGeoJson(p)) OR CHANGED(encumbrance(p)) DO
+    plotUpdated(p) <- currentDateTime();
+
+plotByCadastral = GROUP AGGR LandPlot p BY cadastralNumber(p);
+WHEN SET(LandPlot p IS LandPlot) DO {
+    plotStatus(p) <- PlotStatus.free;
+    created(p) <- currentDateTime();
+    // п. обзора 12.10(3-я порция): до первых правок «Изменено» = «Создано»
+    plotUpdated(p) <- created(p);
+    createdBy(p) <- currentUser();
+}
+
+// ===================== Поле (агрономическое, СТ «Справочник полей») =====================
+CLASS Field 'Поле';
+TABLE field (Field);
+name 'Название' = DATA ISTRING[60] (Field) NONULL IN id;
+code 'Код поля' = DATA ISTRING[16] (Field) NONULL;
+organization 'Организация' = DATA Organization (Field) NONULL;
+nameOrganization 'Организация' (Field f) = name(organization(f));
+areaHa 'Площадь, га' = DATA NUMERIC[10,2] (Field) NONULL;
+boundaryGeoJson 'Границы (GeoJSON)' = DATA TEXT (Field);
+centerLat 'Центр, широта' = DATA DOUBLE (Field);
+centerLon 'Центр, долгота' = DATA DOUBLE (Field);
+location 'Точка размещения (погода)' = DATA Location (Field);
+nameLocation (Field f) = name(location(f));
+
+// ===================== Геометрия поля (КФ-3, кодфикс 09.10) =====================
+// Площадь/центр из GeoJSON-контура; площадь «вручную» защищена от перезаписи;
+// Sкад — сумма площадей участков связи FieldPlot; расхождение >2% — предупреждение
+areaManual 'Площадь вручную' = DATA BOOLEAN (Field);
+geoAreaSqm 'Площадь по геометрии, кв.м' = DATA NUMERIC[14,2] (Field);
+geoAreaHa 'Площадь по геометрии, га' (Field f) = (OVERRIDE geoAreaSqm(f), 0) / 10000.0;
+areaMismatch '⚠ S: расхождение >2%' (Field f) =
+    IF geoAreaSqm(f) AND areaHa(f) THEN
+        (OVERRIDE geoAreaSqm(f), 0) / 10000.0 * 0.98 > (OVERRIDE areaHa(f), 0)
+        OR (OVERRIDE geoAreaSqm(f), 0) / 10000.0 * 1.02 < (OVERRIDE areaHa(f), 0);
+recalcFieldGeometry 'Пересчитать по геометрии' (Field f) INTERNAL 'mite.FieldGeometryAction' (Field);
+WHEN CHANGED(boundaryGeoJson(Field f)) AND f IS Field DO
+    recalcFieldGeometry(f);
+recalcFieldGeometryAct 'Пересчитать по геометрии' (Field f) {
+    areaManual(f) <- NULL;
+    recalcFieldGeometry(f);
+    APPLY;
+    IF areaMismatch(f) THEN
+        MESSAGE 'Площадь по геометрии отличается от площади поля более чем на 2% — проверьте контур.';
+}
+
+// ===================== Живая погода (интеграция контура MITE Weather) =====================
+// Волна 1 (08.10): единый погодный слой «Кода Урожая» над контуром MITE —
+// WeatherForecast по погодным точкам полей (kuUpdateWeather, KuSimulation).
+// Слой живёт здесь, в общем предке: KuSimulation и KuYield — сиблинги в графе
+// REQUIRE и друг друга не видят. Фолбэк за датами без прогноза (сезон за
+// горизонтом провайдера) — метеонормы seasonTemp (KuSimulation).
+
+kuRainThreshold 'Порог вероятности осадков, %' = DATA INTEGER ();
+
+// Дата точки прогноза = сравнение полуинтервалом [dt, dt+1): ZDATETIME и DATE
+// напрямую не сравниваются (ошибка классов) — граница приводится toZDateTime
+kuWfTempCnt (Location l, DATE dt) = GROUP SUM 1
+    IF Weather.WeatherForecast f IS Weather.WeatherForecast AND Weather.location(f) = l
+        AND Weather.time(f) >= toZDateTime(dt) AND Weather.time(f) < toZDateTime(dt + 1) AND Weather.temperature(f);
+kuWfTempDay 't° за сутки (прогноз), °C' (Location l, DATE dt) =
+    (GROUP SUM Weather.temperature(Weather.WeatherForecast f) IF Weather.location(f) = l
+        AND Weather.time(f) >= toZDateTime(dt) AND Weather.time(f) < toZDateTime(dt + 1) AND Weather.temperature(f))
+    / kuWfTempCnt(l, dt);
+kuWfPrecipDay 'Осадки за сутки (вероятность), %' (Location l, DATE dt) =
+    GROUP MAX Weather.precipitation(Weather.WeatherForecast f) IF Weather.location(f) = l
+        AND Weather.time(f) >= toZDateTime(dt) AND Weather.time(f) < toZDateTime(dt + 1);
+kuWfHas 'Есть прогноз на дату' (Location l, DATE dt) = GROUP MAX 1
+    IF Weather.WeatherForecast f IS Weather.WeatherForecast AND Weather.location(f) = l
+        AND Weather.time(f) >= toZDateTime(dt) AND Weather.time(f) < toZDateTime(dt + 1);
+
+// погодная точка сезона (демо: одна на организацию, поля привязаны к ней)
+kuSeasonLoc () = GROUP MAX Location l IF (GROUP MAX Field f IF location(f) = l) IS Field;
+
+kuDateShort (DATE dt) = '' + extractDay(dt) + '.' + extractMonthNumber(dt);
+// метка дождливого дня окраса i (0..6 от сегодня); пустая строка — осадков нет
+kuRainDayMark (INTEGER i) =
+    IF kuWfPrecipDay(kuSeasonLoc(), currentDate() + i) >= (OVERRIDE kuRainThreshold(), 50)
+        THEN kuDateShort(currentDate() + i) + ' ' ELSE '';
+// даты осадков в 7-дневном окне (пусто = сухое окно; ОАФ А.3.1.2 — сухой
+// период > 24 ч возвращает задание в работу)
+kuWindowRainy () = kuRainDayMark(0) + kuRainDayMark(1) + kuRainDayMark(2) + kuRainDayMark(3)
+    + kuRainDayMark(4) + kuRainDayMark(5) + kuRainDayMark(6);
+
+soilType 'Тип почвы' = DATA SoilType (Field) NONULL;
+nameSoilType 'Тип почвы' (Field f) = OVERRIDE name(soilType(f)), '';
+landClass 'Класс земель' = DATA LandClass (Field);
+nameLandClass (Field f) = staticCaption(landClass(f));
+bonitet 'Бонитет (1-100)' = DATA INTEGER (Field);
+slope 'Уклон, %' = DATA NUMERIC[5,2] (Field);
+erosion 'Эрозионная опасность' = DATA ISTRING[16] (Field);
+lastCrop 'Последняя культура' = DATA Crop (Field);
+nameLastCrop 'Последняя культура' (Field f) = OVERRIDE nameCrop(lastCrop(f)), '';
+lastSowDate 'Дата последнего посева' = DATA DATE (Field);
+currentCrop 'Текущая культура' = DATA Crop (Field);
+nameCurrentCrop 'Текущая культура' (Field f) = OVERRIDE nameCrop(currentCrop(f)), '';
+fieldState 'Состояние поля' = DATA ISTRING[24] (Field);
+stateScore 'Оценка состояния (1-5)' = DATA INTEGER (Field);
+planYield 'Плановая урожайность, ц/га' = DATA NUMERIC[10,2] (Field);
+factYield 'Фактическая урожайность, ц/га' = DATA NUMERIC[10,2] (Field);
+note 'Примечания' = DATA TEXT (Field);
+created 'Создано' = DATA DATETIME (Field);
+createdBy 'Автор' = DATA CustomUser (Field);
+nameFieldCreatedBy 'Автор' (Field f) = OVERRIDE nameKuUser(createdBy(f)), '';
+
+fieldByCode = GROUP AGGR Field f BY code(f);
+// доза N планового питания (для темы карты «Внесение удобрений», КП09);
+// заполняется из комплексного плана (KuYield) при расчёте баланса
+fertDoseN 'Доза N (план), кг д.в./га' = DATA NUMERIC[10,2] (Field);
+WHEN SET(Field f IS Field) DO {
+    created(f) <- currentDateTime();
+    createdBy(f) <- currentUser();
+}
+
+// ===================== История поля (агрегат «поле × сезон», КФ-И1) =====================
+// Единый профиль по годам: план (утверждавшиеся севообороты + строки ГП) и
+// факт (проведённые акты урожая). Источник валидации севооборота (КФ-И4,
+// глубина — вся история) и формы «История поля» (КФ-И2).
+// Append-only: строки НЕ удаляются при удалении планов/актов; архив плана
+// не отменяет его вклада. Наполнение — реализация хука в KuProdPlan
+// (видит севообороты, ГП и акты); класс здесь — читается из KuRotation
+refreshFieldHistory (Field f) ABSTRACT;   // КФ-И1: реализация в KuProdPlan
+rebuildFieldHistory 'Пересобрать историю поля' (Field f) {
+    refreshFieldHistory(f);
+    APPLY;
+}
+// ⚠ каждая итерация в NEWSESSION: FOR по объектам с APPLY в теле без
+// NEWSESSION тихо умирает после первой итерации (эмпирически 10.10;
+// паттерн kuSimDaily)
+rebuildAllFieldHistory 'Пересобрать историю (все поля)' () {
+    FOR Field f IS Field DO
+        NEWSESSION {
+            refreshFieldHistory(f);
+        }
+    APPLY;
+}
+CLASS FieldSeason 'История поля (сезон)';
+TABLE fieldSeason (FieldSeason);
+fsField 'Поле' = DATA Field (FieldSeason) NONULL;
+fsYear 'Год' = DATA INTEGER (FieldSeason) NONULL;
+fsPlanCrop 'План: культура' = DATA Crop (FieldSeason);
+fsFactCrop 'Факт: культура' = DATA Crop (FieldSeason);
+fsPlanYieldC 'План, ц/га' = DATA NUMERIC[10,2] (FieldSeason);
+fsFactYieldC 'Факт, ц/га' = DATA NUMERIC[10,2] (FieldSeason);
+fsReason 'Причина отклонения' = DATA ISTRING[200] (FieldSeason);
+fsSrc 'Источник' = DATA ISTRING[12] (FieldSeason);
+// уникальность (поле, год) — GROUP AGGR-констрейнт; дубли не заводятся
+seasonOf = GROUP AGGR FieldSeason s BY fsField(s), fsYear(s);
+nameFsPlanCrop 'План' (FieldSeason s) = OVERRIDE nameCrop(fsPlanCrop(s)), '';
+nameFsFactCrop 'Факт' (FieldSeason s) = OVERRIDE nameCrop(fsFactCrop(s)), '';
+fsDeviates (FieldSeason s) = fsPlanCrop(s) AND fsFactCrop(s) AND fsPlanCrop(s) != fsFactCrop(s);
+fsDeviationMark '⚠' (FieldSeason s) = IF fsDeviates(s) THEN '⚠' ELSE '';
+
+// связь поле ↔ участок (возможно несколько участков)
+CLASS FieldPlot 'Участок в составе поля';
+TABLE fieldPlot (FieldPlot);
+field 'Поле' = DATA Field (FieldPlot) AUTOSET;
+plot 'Участок' = DATA LandPlot (FieldPlot) NONULL;
+// КФ-3: кадастровая площадь поля — сумма площадей участков связи
+areaKad 'S кадастровая, га' (Field f) = (GROUP SUM areaSqm(plot(FieldPlot fp)) IF field(fp) = f) / 10000.0;
+areaDiff 'S разница (кадастровая−поле), га' (Field f) = IF areaKad(f) AND areaHa(f) THEN areaKad(f) - areaHa(f);
+nameFpField 'Поле' (FieldPlot fp) = OVERRIDE name(field(fp)), '';
+fpCadastral 'Кадастровый номер' (FieldPlot fp) = cadastralNumber(plot(fp));
+fpPlotStatus 'Статус участка' (FieldPlot fp) = namePlotStatus(plot(fp));
+fpAreaHa 'Площадь, га' (FieldPlot fp) = areaHaPlot(plot(fp));
+linkedFieldsList 'Связанные поля (имена)' (LandPlot p) = GROUP CONCAT name(Ku.field[FieldPlot](fx)) IF plot[FieldPlot](fx) = p, ', ' ORDER name(Ku.field[FieldPlot](fx));
+
+// п.3 обзора 12.10: геометрическая связка поле↔участок. Java-экшен считает
+// пересечения контуров (LinkFieldPlotsAction) и кладёт пары в JSON-свойство,
+// LSF материализует FieldPlot (relinkFieldPlotsAct) — транзакционно, без SQL
+linkFieldPlotsHit 'Поле входит в участок (геометрия)' = DATA BOOLEAN (Field, LandPlot);
+linkFieldPlotsInternal INTERNAL 'LinkFieldPlotsAction' (LandPlot);
+delFieldPlotAct 'Удалить' (FieldPlot fp) {
+    DELETE fp;
+    APPLY;
+}
+relinkFieldPlotsAct 'Пересчитать состав по геометрии' (LandPlot p) {
+    // Java (LinkFieldPlotsAction) отмечает пары в linkFieldPlotsHit —
+    // готовые пары вместо разбора строк: IMPORT-DO рождал строки без
+    // system__class, LIKE-паттерн матчил один код из многих (quirk 12.10(4))
+    linkFieldPlotsInternal(p);
+    FOR FieldPlot fp IS FieldPlot AND plot(fp) = p DO
+        DELETE fp;
+    FOR Field f IS Field AND linkFieldPlotsHit(f, p) DO
+        NEW fp = FieldPlot { field(fp) <- f; plot(fp) <- p; };
+    FOR Field fx IS Field AND linkFieldPlotsHit(fx, p) DO
+        linkFieldPlotsHit(fx, p) <- NULL;
+    APPLY;
+}
+
+// ===================== Агрохиманализ (ФТ3.6) =====================
+CLASS SoilAnalysis 'Агрохиманализ';
+TABLE soilAnalysis (SoilAnalysis);
+analysisDate 'Дата проведения' = DATA DATE (SoilAnalysis) NONULL;
+field 'Поле' = DATA Field (SoilAnalysis) AUTOSET;
+nameField 'Поле' (SoilAnalysis a) = name(field(a));
+n 'N, мг/кг' = DATA DOUBLE (SoilAnalysis) NONULL;
+p 'P, мг/кг' = DATA DOUBLE (SoilAnalysis) NONULL;
+k 'K, мг/кг' = DATA DOUBLE (SoilAnalysis) NONULL;
+ph 'pH (кислотность)' = DATA DOUBLE (SoilAnalysis) NONULL;
+humus 'Гумус, %' = DATA NUMERIC[5,2] (SoilAnalysis) NONULL;   // КФ-З21: десятые (агрохимпаспорта)
+document 'Документ' = DATA RAWFILE (SoilAnalysis);
+created 'Создано' = DATA DATETIME (SoilAnalysis);
+createdBy 'Автор' = DATA CustomUser (SoilAnalysis);
+nameSaCreatedBy 'Автор' (SoilAnalysis a) = OVERRIDE nameKuUser(createdBy(a)), '';
+WHEN SET(SoilAnalysis a IS SoilAnalysis) DO {
+    created(a) <- currentDateTime();
+    createdBy(a) <- currentUser();
+}
+
+// вычисляемые связи поля ↔ анализ
+lastAnalysisDate 'Дата последнего анализа' (Field f) = GROUP MAX analysisDate(SoilAnalysis a) IF field(a) = f;
+lastN 'N (посл.)' (Field f) = GROUP LAST n(SoilAnalysis a) ORDER analysisDate(a), a IF field(a) = f;
+lastP 'P (посл.)' (Field f) = GROUP LAST p(SoilAnalysis a) ORDER analysisDate(a), a IF field(a) = f;
+lastK 'K (посл.)' (Field f) = GROUP LAST k(SoilAnalysis a) ORDER analysisDate(a), a IF field(a) = f;
+lastPh 'pH (посл.)' (Field f) = GROUP LAST ph(SoilAnalysis a) ORDER analysisDate(a), a IF field(a) = f;
+lastHumus 'Гумус (посл.)' (Field f) = GROUP LAST humus(SoilAnalysis a) ORDER analysisDate(a), a IF field(a) = f;
+// КФ-З22: возраст анализа; дедуп (field, analysisDate) — CONSTRAINT
+analysisAgeDays 'Возраст анализа, дн.' (Field f) = currentDate() - lastAnalysisDate(f);
+nameAnalysisAgeDays (Field f) = OVERRIDE ('' + analysisAgeDays(f)), '';
+analysisStale '⚠ анализ старше 1 года' (Field f) = (OVERRIDE analysisAgeDays(f), 0) > 365;
+saByFieldDate = GROUP AGGR SoilAnalysis a BY field(a), analysisDate(a);
+
+// ===================== Контрагент (СТ «Справочник юр/физлиц») =====================
+CLASS Contractor 'Контрагент';
+TABLE contractor (Contractor);
+contractorKind 'Тип' = DATA ContractorKind (Contractor) NONULL;
+nameContractorKind 'Тип' (Contractor x) = staticCaption(contractorKind(x));
+contractorStatus 'Статус' = DATA ContractorStatus (Contractor);
+nameContractorStatus 'Статус' (Contractor x) = staticCaption(contractorStatus(x));
+inn 'ИНН' = DATA ISTRING[12] (Contractor);   // КФ-З2: NONULL снят — обязательность CONSTRAINT'ом (иностранцы без ИНН)
+fullName 'Наименование (полное)' = DATA ISTRING[255] (Contractor) NONULL IN id;
+shortName 'Наименование (краткое)' = DATA ISTRING[100] (Contractor);
+lastName 'Фамилия' = DATA ISTRING[60] (Contractor);
+firstName 'Имя' = DATA ISTRING[60] (Contractor);
+middleName 'Отчество' = DATA ISTRING[60] (Contractor);
+birthDate 'Дата рождения' = DATA DATE (Contractor);
+snils 'СНИЛС' = DATA ISTRING[14] (Contractor);
+citizenship 'Гражданство (ОКСМ)' = DATA ISTRING[8] (Contractor);
+// JSON-ключи (спека): {series, number, issued_by, issue_date}
+passportData 'Паспорт (JSON)' = DATA TEXT (Contractor);
+kpp 'КПП' = DATA ISTRING[9] (Contractor);
+ogrn 'ОГРН/ОГРНИП' = DATA ISTRING[15] (Contractor);
+okpo 'ОКПО' = DATA ISTRING[10] (Contractor);
+opf 'Правовая форма' = DATA ISTRING[20] (Contractor);
+legalAddress 'Юридический адрес' = DATA ISTRING[255] (Contractor);
+postalAddress 'Почтовый адрес' = DATA ISTRING[255] (Contractor);
+director 'Руководитель (JSON)' = DATA TEXT (Contractor);
+contacts 'Контакты (JSON)' = DATA TEXT (Contractor);
+bankAccounts 'Счета (JSON)' = DATA TEXT (Contractor);
+created 'Создано' = DATA DATETIME (Contractor);
+ctUpdated 'Изменено' = DATA DATETIME (Contractor);
+createdBy 'Автор' = DATA CustomUser (Contractor);
+nameCtCreatedBy 'Автор' (Contractor x) = OVERRIDE nameKuUser(createdBy(x)), '';
+
+// КФ-З1/З2: маски реквизитов (контрольные суммы — этап 2, Java-валидация)
+ckIsPerson (Contractor x) = contractorKind(x) = ContractorKind.person OR contractorKind(x) = ContractorKind.entrepreneur;
+ckIsCompany (Contractor x) = contractorKind(x) = ContractorKind.company OR contractorKind(x) = ContractorKind.government;
+ckHasInn (Contractor x) = ckIsPerson(x) OR ckIsCompany(x);
+cInnOk (Contractor x) = NOT inn(x)
+    OR inn(x) LIKE '__________' OR inn(x) LIKE '____________';   // 10 или 12 цифр
+CONSTRAINT Contractor x IS Contractor AND contractorKind(x) != ContractorKind.foreign
+    AND NOT cInnOk(x) CHECKED BY inn MESSAGE 'ИНН — 10 или 12 цифр (для иностранного лица не проверяется)';
+CONSTRAINT Contractor x IS Contractor AND contractorKind(x) != ContractorKind.foreign AND NOT inn(x)
+    CHECKED BY inn MESSAGE 'ИНН обязателен для всех типов, кроме иностранного лица';
+CONSTRAINT Contractor x IS Contractor AND snils(x) AND NOT snils(x) LIKE '___-___-___ __'
+    CHECKED BY snils MESSAGE 'СНИЛС — формат XXX-XXX-XXX XX';
+CONSTRAINT Contractor x IS Contractor AND ogrn(x) AND NOT (ogrn(x) LIKE '_____________' OR ogrn(x) LIKE '_______________')
+    CHECKED BY ogrn MESSAGE 'ОГРН — 13 или 15 цифр';
+CONSTRAINT Contractor x IS Contractor AND ckIsCompany(x) AND kpp(x) AND NOT kpp(x) LIKE '_________'
+    CHECKED BY kpp MESSAGE 'КПП — 9 цифр';
+
+contractorByInn = GROUP AGGR Contractor x BY inn(x);
+contractorByOgrn = GROUP AGGR Contractor x BY ogrn(x);
+WHEN SET(Contractor x IS Contractor) DO {
+    contractorStatus(x) <- ContractorStatus.active;
+    created(x) <- currentDateTime();
+    createdBy(x) <- currentUser();
+    ctUpdated(x) <- currentDateTime();   // п.15: до первого изменения «Изменено» = «Создано»
+}
+
+// ===================== Договор аренды (ФТ3.2) =====================
+CLASS LeaseContract 'Договор аренды';
+TABLE leaseContract (LeaseContract);
+number 'Номер' = DATA ISTRING[40] (LeaseContract) NONULL IN id;
+signDate 'Дата заключения' = DATA DATE (LeaseContract) NONULL;
+contractStatus 'Статус' = DATA LeaseContractStatus (LeaseContract) NONULL;
+nameContractStatus 'Статус' (LeaseContract c) = staticCaption(contractStatus(c));
+tenant 'Арендатор' = DATA Contractor (LeaseContract) NONULL;
+nameTenant 'Арендатор' (LeaseContract c) = OVERRIDE fullName(tenant(c)), '';
+landlord 'Арендодатель' = DATA Contractor (LeaseContract) NONULL;
+nameLandlord 'Арендодатель' (LeaseContract c) = OVERRIDE fullName(landlord(c)), '';
+plot 'Участок' = DATA LandPlot (LeaseContract) NONULL;
+namePlot 'Участок' (LeaseContract c) = name(plot(c));
+isPartial 'Часть участка' = DATA BOOLEAN (LeaseContract);
+partialAddress 'Адрес части' = DATA ISTRING[200] (LeaseContract);
+partialAreaHa 'Площадь части, га' = DATA NUMERIC[10,2] (LeaseContract);
+dateFrom 'Действует с' = DATA DATE (LeaseContract) NONULL;
+dateTo 'Действует по' = DATA DATE (LeaseContract) NONULL;
+autoProlong 'Автопролонгация' = DATA BOOLEAN (LeaseContract);
+// КФ-З14: способ оплаты и индексация — енумы («Натуральная» — этап 2)
+CLASS PaymentMethod 'Способ оплаты' {
+    cashless 'Безналичный', cash 'Наличный', offset 'Зачёт встречных требований'
+}
+paymentMethod 'Способ оплаты' = DATA PaymentMethod (LeaseContract);
+indexation 'Порядок индексации' = DATA IndexationKind (LeaseContract);
+namePayMethod 'Способ оплаты' (LeaseContract c) = staticCaption(paymentMethod(c));
+CLASS IndexationKind 'Индексация' {
+    percent 'Процент от ставки', cpi 'Индекс инфляции (ИПЦ)', fixed 'Фиксированная надбавка'
+}
+nameIndexKind 'Индексация' (LeaseContract c) = staticCaption(indexation(c));
+indexValue 'Индексация, %' = DATA NUMERIC[6,2] (LeaseContract);   // рек.
+CLASS LeaseContractType 'Тип договора' {
+    lease 'Аренда', sale 'Купля-продажа'   // субаренда/безвозмездное — этап 2 (спека 09.10)
+}
+contractType 'Тип договора' = DATA LeaseContractType (LeaseContract) NONULL;
+nameContractType 'Тип договора' (LeaseContract c) = staticCaption(contractType(c));
+// КФ-З16: статус участка «В аренде» производен от действующего договора
+WHEN SET(LeaseContract c IS LeaseContract) AND contractStatus(c) = LeaseContractStatus.active
+    AND plot(c) IS LandPlot DO
+    plotStatus(plot(c)) <- PlotStatus.leased;
+
+// КФ-З3: гейты статуса контрагента
+CONSTRAINT LeaseContract c IS LeaseContract AND (SET(tenant(c)) OR SET(landlord(c)))
+    AND (contractorStatus(tenant(c)) = ContractorStatus.liquidated
+        OR contractorStatus(tenant(c)) = ContractorStatus.contested
+        OR contractorStatus(landlord(c)) = ContractorStatus.liquidated
+        OR contractorStatus(landlord(c)) = ContractorStatus.contested)
+    CHECKED BY tenant, landlord MESSAGE 'Нельзя связать договор с ликвидированным/оспоренным контрагентом';
+setContractorStatusGuardAct 'Сменить статус' (Contractor x) {
+    IF contractorStatus(x) = ContractorStatus.liquidated
+        AND (GROUP MAX 1 IF LeaseContract c AND tenant(c) = x AND contractStatus(c) = LeaseContractStatus.active
+            OR LeaseContract c2 AND landlord(c2) = x AND contractStatus(c2) = LeaseContractStatus.active) THEN
+        MESSAGE 'Нельзя перевести в «Ликвидирован»: у контрагента есть действующие договоры.';
+    ELSE {
+        INPUT st = ContractorStatus DO contractorStatus(x) <- st;
+        APPLY;
+    }
+}
+
+rentAmount 'Арендная плата, руб' = DATA NUMERIC[14,2] (LeaseContract) NONULL;
+regNumber 'Номер гос. регистрации права' = DATA ISTRING[30] (LeaseContract);
+regDate 'Дата регистрации в ЕГРН' = DATA DATE (LeaseContract);
+
+CONSTRAINT LeaseContract c IS LeaseContract AND regNumber(c)
+    AND NOT regNumber(c) LIKE '__-__/___/___-___/___'
+    CHECKED BY regNumber MESSAGE 'Номер регистрации: формат __-__/___/___-___/___';
+CONSTRAINT LeaseContract c IS LeaseContract AND regDate(c) AND signDate(c)
+    AND (regDate(c) < signDate(c) OR regDate(c) > currentDate())
+    CHECKED BY regDate MESSAGE 'Дата регистрации — не раньше подписания и не позже сегодня';
+periodicity 'Периодичность' = DATA PaymentPeriodicity (LeaseContract) NONULL;
+namePeriodicity (LeaseContract c) = staticCaption(periodicity(c));
+paymentDay 'День платежа (число месяца)' = DATA INTEGER (LeaseContract) NONULL;   // КФ-З13: 1–31 (была DATE)
+CONSTRAINT LeaseContract c IS LeaseContract AND (paymentDay(c) < 1 OR paymentDay(c) > 31)
+    CHECKED BY paymentDay MESSAGE 'День платежа — число от 1 до 31';
+
+scan 'Скан договора' = DATA RAWFILE (LeaseContract);
+addendum 'Доп. соглашения' = DATA RAWFILE (LeaseContract);
+organization 'Организация' = DATA Organization (LeaseContract) NONULL;
+nameOrganizationContract 'Организация' (LeaseContract c) = name(organization(c));
+created 'Создано' = DATA DATETIME (LeaseContract);
+createdBy 'Автор' = DATA CustomUser (LeaseContract);
+nameLcCreatedBy 'Автор' (LeaseContract c) = OVERRIDE nameKuUser(createdBy(c)), '';
+
+WHEN SET(LeaseContract c IS LeaseContract) DO {
+    contractStatus(c) <- LeaseContractStatus.draft;
+    created(c) <- currentDateTime();
+    createdBy(c) <- currentUser();
+}
+
+// ===================== Взаиморасчёты (ФТ3.7) =====================
+CLASS LeaseEntry 'Запись взаиморасчётов';
+TABLE leaseEntry (LeaseEntry);
+contract 'Договор' = DATA LeaseContract (LeaseEntry) AUTOSET;
+nameContract 'Договор' (LeaseEntry e) = number(contract(e));
+contractor 'Контрагент' = DATA Contractor (LeaseEntry);
+nameEntryContractor 'Контрагент' (LeaseEntry e) = OVERRIDE fullName(contractor(e)), '';
+entryOrganization 'Организация' = DATA Organization (LeaseEntry);
+entryKind 'Вид' = DATA LeaseEntryKind (LeaseEntry) NONULL;
+nameEntryKind 'Вид' (LeaseEntry e) = staticCaption(entryKind(e));
+amount 'Сумма' = DATA NUMERIC[16,2] (LeaseEntry) NONULL;
+entryDate 'Дата' = DATA DATE (LeaseEntry) NONULL;
+sourceDoc 'Документ-основание' = DATA ISTRING[40] (LeaseEntry);
+
+obligationSum 'Начислено' (LeaseContract c) = GROUP SUM amount(LeaseEntry e) IF entryKind(e) = LeaseEntryKind.obligation AND contract(e) = c;
+paymentSum 'Оплачено' (LeaseContract c) = GROUP SUM amount(LeaseEntry e) IF entryKind(e) = LeaseEntryKind.payment AND contract(e) = c;
+balanceContract 'Сальдо' (LeaseContract c) = (OVERRIDE obligationSum(c), 0.0) - (OVERRIDE paymentSum(c), 0.0);
+overdue 'Просрочено' (LeaseContract c) = IF contractStatus(c) = LeaseContractStatus.active AND balanceContract(c) > 0
+    AND extractDay(currentDate()) > paymentDay(c) + 14 THEN balanceContract(c);   // ⚠ допущение: просрочка = текущий день месяца > платёжного + 14
+
+// версионирование ключевых полей (W1.6, ТЗ 4.2.3.1–2): старое → новое
+// ===================== Версионирование участков (паттерн core-mdm KNP) =====================
+// Снимок ключевых атрибутов при каждом изменении: снапшот JSON + причина.
+// Эталон — land_plot_version/diff_snapshot из knp_core-mdm.
+CLASS LandPlotVersion 'Версия участка';
+TABLE landPlotVersion (LandPlotVersion);
+lpvPlot 'Участок' = DATA LandPlot (LandPlotVersion);
+nameLpvPlot 'Участок' (LandPlotVersion v) = OVERRIDE name(lpvPlot(v)), '';
+lpvAt 'Время' = DATA DATETIME (LandPlotVersion) NONULL;
+lpvUser 'Пользователь' = DATA ISTRING[80] (LandPlotVersion);
+lpvAreaSqm 'Площадь, кв.м' = DATA NUMERIC[14,2] (LandPlotVersion);
+lpvStatus 'Статус' = DATA ISTRING[40] (LandPlotVersion);
+lpvCadastral 'Кадастровый номер' = DATA ISTRING[40] (LandPlotVersion);
+lpvSnapshot 'Снимок (JSON)' = DATA TEXT (LandPlotVersion);
+lpvReason 'Причина изменения' = DATA ISTRING[100] (LandPlotVersion);
+WHEN SET (LandPlotVersion v IS LandPlotVersion) DO {
+    lpvAt(v) <- currentDateTime();
+    IF currentUser() THEN lpvUser(v) <- login(currentUser());
+}
+kuSnapshotPlot 'Зафиксировать версию участка' (LandPlot p, ISTRING[100] reason) {
+    EXPORT JSON FROM
+        name = name(LandPlot x),
+        cadastralNumber = cadastralNumber(x),
+        areaSqm = areaSqm(x),
+        status = staticCaption(plotStatus(x)),
+        note = note(x)
+    WHERE x = p;
+    NEW v = LandPlotVersion {
+        lpvPlot(v) <- p;
+        lpvAreaSqm(v) <- areaSqm(p);
+        lpvStatus(v) <- staticCaption(plotStatus(p));
+        lpvCadastral(v) <- cadastralNumber(p);
+        LOCAL polyFile = FILE ();
+        EXPORT JSON FROM polygon = polygonGeoJson(p) TO polyFile;
+        lpvSnapshot(v) <- (OVERRIDE STRING(JSONFILE(exportFile())), '') + '|' + (OVERRIDE STRING(JSONFILE(polyFile())), '');
+        lpvReason(v) <- reason;
+    }
+    APPLY;
+}
+
+// IS Class-гарды: WHEN CHANGED срабатывает и на удаляемых объектах (сброс в NULL)
+// — без них удаление участка замусоривало журнал аудита и версии LandPlotVersion
+WHEN (CHANGED (cadastralNumber(LandPlot p)) OR CHANGED (areaSqm(p)) OR CHANGED (plotStatus(p)) OR CHANGED (polygonGeoJson(p))) AND p IS LandPlot DO {
+    kuAuditChange('Земельный участок', name(p), 'Кадастровый номер', (OVERRIDE ('' + PREV(cadastralNumber(p))), '—'), '' + cadastralNumber(p));
+    kuSnapshotPlot(p, 'Изменение кадастрового номера');
+}
+WHEN CHANGED (areaSqm(LandPlot p)) AND p IS LandPlot DO {
+    kuAuditChange('Земельный участок', name(p), 'Площадь, кв.м', (OVERRIDE ('' + PREV(areaSqm(p))), '—'), '' + areaSqm(p));
+    kuSnapshotPlot(p, 'Изменение площади');
+}
+WHEN CHANGED (plotStatus(LandPlot p)) AND p IS LandPlot DO {
+    kuAuditChange('Земельный участок', name(p), 'Статус', (OVERRIDE staticCaption(PREV(plotStatus(p))), '—'), staticCaption(plotStatus(p)));
+    kuSnapshotPlot(p, 'Изменение статуса');
+}
+WHEN CHANGED (rentAmount(LeaseContract c)) AND c IS LeaseContract DO
+    kuAuditChange('Договор аренды', number(c), 'Арендная плата', (OVERRIDE ('' + PREV(rentAmount(c))), '—'), '' + rentAmount(c));
+WHEN CHANGED (dateTo(LeaseContract c)) AND c IS LeaseContract DO
+    kuAuditChange('Договор аренды', number(c), 'Действует до', (OVERRIDE ('' + PREV(dateTo(c))), '—'), '' + dateTo(c));
+WHEN CHANGED (contractStatus(LeaseContract c)) AND c IS LeaseContract DO
+    kuAuditChange('Договор аренды', number(c), 'Статус', (OVERRIDE staticCaption(PREV(contractStatus(c))), '—'), staticCaption(contractStatus(c)));
+
+// состояние договора для матричной визуализации (ФТ3.5); КФ-ГК1: шкала
+// синхронизирована с картой и уведомлениями ФТ3.3 (90/365 дней)
+contractStateMark 'Состояние' (LeaseContract c) =
+    IF contractStatus(c) != LeaseContractStatus.active THEN staticCaption(contractStatus(c))
+    ELSE IF overdue(c) THEN '✖ просрочено'
+    ELSE IF dateTo(c) < currentDate() + 90 THEN '⚠ истекает ≤90 дн.'
+    ELSE IF dateTo(c) < currentDate() + 365 THEN '▲ 91–365 дн.'
+    ELSE 'ок';
+
+// ===================== Платёжная ведомость (ФТ3.7) =====================
+CLASS PaymentSheet 'Платёжная ведомость';
+TABLE paymentSheet (PaymentSheet);
+sheetOrganization 'Организация' = DATA Organization (PaymentSheet) NONULL;
+nameSheetOrganization 'Организация' (PaymentSheet s) = name(sheetOrganization(s));
+periodFrom 'Период с' = DATA DATE (PaymentSheet) NONULL;
+periodTo 'Период по' = DATA DATE (PaymentSheet) NONULL;
+responsible 'Ответственный' = DATA CustomUser (PaymentSheet);
+sheetStatus 'Статус' = DATA PaymentSheetStatus (PaymentSheet) NONULL;
+nameSheetStatus 'Статус' (PaymentSheet s) = staticCaption(sheetStatus(s));
+created 'Создано' = DATA DATETIME (PaymentSheet);
+WHEN SET(PaymentSheet s IS PaymentSheet) DO {
+    sheetStatus(s) <- PaymentSheetStatus.draft;
+    responsible(s) <- currentUser();
+    created(s) <- currentDateTime();
+}
+
+CLASS PaymentSheetItem 'Строка ведомости';
+TABLE paymentSheetItem (PaymentSheetItem);
+sheet 'Ведомость' = DATA PaymentSheet (PaymentSheetItem) AUTOSET;
+contract 'Договор' = DATA LeaseContract (PaymentSheetItem) NONULL;
+nameItemContract 'Договор' (PaymentSheetItem i) = number(contract(i));
+itemContractor 'Контрагент' (PaymentSheetItem i) = OVERRIDE fullName(tenant(contract(i))), '';
+accruedItem 'Начислено за период' = DATA NUMERIC[16,2] (PaymentSheetItem);
+debtItem 'Задолженность' = DATA NUMERIC[16,2] (PaymentSheetItem);
+toPay 'К выплате' = DATA NUMERIC[16,2] (PaymentSheetItem) NONULL;
+adjustReason 'Основание корректировки' = DATA ISTRING[200] (PaymentSheetItem);
+// КФ-З20: аудит корректировок строк ведомости (UC-02, финансовый след)
+WHEN CHANGED(toPay(PaymentSheetItem i)) AND i IS PaymentSheetItem DO
+    kuAuditChange('PaymentSheet', 'строка ' + (OVERRIDE nameItemContract(i), ''), 'Сумма к выплате',
+        (OVERRIDE ('' + PREV(toPay(i))), ''), (OVERRIDE ('' + toPay(i)), ''));
+WHEN CHANGED(adjustReason(PaymentSheetItem i)) AND i IS PaymentSheetItem DO
+    kuAuditChange('PaymentSheet', 'строка ' + (OVERRIDE nameItemContract(i), ''), 'Основание',
+    (OVERRIDE PREV(adjustReason(i)), ''), (OVERRIDE adjustReason(i), ''));
+
+// ===================== Уведомления (ФТ3.3) =====================
+CLASS LeaseNotificationLog 'Журнал уведомлений';
+TABLE leaseNotificationLog (LeaseNotificationLog);
+lnlContract 'Договор' = DATA ISTRING[40] (LeaseNotificationLog);
+lnlKind 'Тип' = DATA ISTRING[30] (LeaseNotificationLog);
+lnlText 'Текст' = DATA ISTRING[250] (LeaseNotificationLog);
+lnlAt 'Время' = DATA DATETIME (LeaseNotificationLog);
+WHEN SET(LeaseNotificationLog l IS LeaseNotificationLog) DO lnlAt(l) <- currentDateTime();
+
+CLASS LeaseNotification 'Уведомление по договору';
+TABLE leaseNotification (LeaseNotification);
+contract 'Договор' = DATA LeaseContract (LeaseNotification) AUTOSET;
+notifyKind 'Тип' = DATA LeaseNotifyKind (LeaseNotification) NONULL;
+daysBefore 'За сколько дней' = DATA INTEGER (LeaseNotification) NONULL;
+channel 'Канал' = DATA ISTRING[20] (LeaseNotification);
+enabled 'Включено' = DATA BOOLEAN (LeaseNotification);
+
+// уведомления «на сегодня» (вычисляются, журнал — ServiceLog в KuBudget)
+notifyDueRent 'Платёж близко' (LeaseNotification n) =
+    enabled(n) AND notifyKind(n) = LeaseNotifyKind.rent
+    AND contract(n) IS LeaseContract
+    AND paymentDay(contract(n)) <= extractDay(currentDate()) + daysBefore(n)
+    AND paymentDay(contract(n)) >= extractDay(currentDate());
+notifyDueExpiry 'Истекает' (LeaseNotification n) =
+    enabled(n) AND notifyKind(n) = LeaseNotifyKind.expiry
+    AND dateTo(contract(n)) <= currentDate() + daysBefore(n)
+    AND dateTo(contract(n)) >= currentDate();
+
+// ===================== Валидации =====================
+// КФ-З7: последняя группа — от 1 цифры (реальные номера 2–4+); цепочка LIKE-масок
+// КФ-З13: конструктор даты (год, месяц, день) — платформенной функции нет
+mkDate (INTEGER y, INTEGER m, INTEGER d) = FORMULA DATE 'make_date($1, $2, $3)';
+// КФ-З15: скан обязателен для действующего договора
+CONSTRAINT LeaseContract c IS LeaseContract AND contractStatus(c) = LeaseContractStatus.active
+    AND CHANGED(scan(c)) AND NOT scan(c)
+    CHECKED BY scan MESSAGE 'Загрузите скан договора (обязателен для действующего)';
+kadNumOk (LandPlot p) = cadastralNumber(p) LIKE '__:__:______:_'
+    OR cadastralNumber(p) LIKE '__:__:______:__'
+    OR cadastralNumber(p) LIKE '__:__:______:___'
+    OR cadastralNumber(p) LIKE '__:__:______:____'
+    OR cadastralNumber(p) LIKE '__:__:______:_____';
+CONSTRAINT NOT kadNumOk(LandPlot p) CHECKED BY cadastralNumber MESSAGE 'Кадастровый номер: 2 цифры : 2 : 6 : от 1 цифры (только цифры)';
+CONSTRAINT areaSqm(LandPlot p) IS NUMERIC AND (areaSqm(p) < 1 OR areaSqm(p) >= 1000000000)
+    CHECKED BY areaSqm MESSAGE 'Площадь участка — от 1 до 1 млрд кв.м (ФТ3.1)';
+CONSTRAINT plotStatus(LandPlot p) = PlotStatus.encumbered AND NOT encumbrance(p) CHECKED BY encumbrance MESSAGE 'Для статуса «Под обременением» заполните обременения';
+CONSTRAINT bonitet(Field f) IS INTEGER AND (bonitet(f) < 1 OR bonitet(f) > 100) CHECKED BY bonitet MESSAGE 'Бонитет — целое от 1 до 100';
+CONSTRAINT slope(Field f) IS NUMERIC AND (slope(f) < 0 OR slope(f) > 30) CHECKED BY slope MESSAGE 'Уклон — от 0 до 30%';
+CONSTRAINT stateScore(Field f) IS INTEGER AND (stateScore(f) < 1 OR stateScore(f) > 5) CHECKED BY stateScore MESSAGE 'Оценка состояния — от 1 до 5';
+CONSTRAINT areaHa(Field f) <= 0 CHECKED BY areaHa MESSAGE 'Площадь поля должна быть положительной';
+CONSTRAINT SoilAnalysis a IS SoilAnalysis AND (n(a) < 0 OR p(a) < 0 OR k(a) < 0 OR ph(a) < 0) CHECKED BY n MESSAGE 'Показатели агрохиманализа не могут быть отрицательными';
+CONSTRAINT humus(SoilAnalysis a) IS INTEGER AND (humus(a) < 0 OR humus(a) > 100) CHECKED BY humus MESSAGE 'Гумус — от 0 до 100%';
+CONSTRAINT dateTo(LeaseContract c) <= dateFrom(c) CHECKED BY dateTo MESSAGE 'Дата окончания должна быть позже даты начала';
+CONSTRAINT tenant(LeaseContract c) = landlord(c) CHECKED BY landlord MESSAGE 'Арендатор и арендодатель не могут совпадать';
+CONSTRAINT isPartial(LeaseContract c) AND NOT partialAddress(c) CHECKED BY partialAddress MESSAGE 'Для части участка укажите адрес';
+CONSTRAINT rentAmount(LeaseContract c) IS NUMERIC AND rentAmount(c) < 0.01 CHECKED BY rentAmount MESSAGE 'Цена договора — не меньше 0,01 руб';
+CONSTRAINT toPay(PaymentSheetItem i) != (OVERRIDE accruedItem(i), 0.0) + (OVERRIDE debtItem(i), 0.0) AND NOT adjustReason(i) CHECKED BY adjustReason MESSAGE 'При корректировке суммы укажите основание';
+// КП07/UC-02: корректировка сверх начисления с задолженностью — блокируется
+CONSTRAINT PaymentSheetItem i IS PaymentSheetItem
+    AND toPay(i) > (OVERRIDE accruedItem(i), 0.0) + (OVERRIDE debtItem(i), 0.0) + 0.005
+    CHECKED BY toPay MESSAGE 'Сумма к выплате превышает начисление с задолженностью';
+CONSTRAINT daysBefore(LeaseNotification n) < 1 CHECKED BY daysBefore MESSAGE '«За сколько дней» — не меньше 1';
+
+// защита от повторного начисления за тот же период (по sourceDoc)
+obligationRentPosted (LeaseContract c, DATE from, DATE to) =
+    GROUP SUM 1 IF contract(LeaseEntry e) = c AND entryKind(e) = LeaseEntryKind.obligation
+    AND sourceDoc(e) = 'начисление ' + (OVERRIDE ('' + from), '') + '..' + (OVERRIDE ('' + to), '');
+
+// ===================== Действия =====================
+// КФ-З13: начисления по календарю периодичности (месяц/квартал/год), дедуп по
+// sourceDoc 'RENT-<номер>-<год>-<№>'; еженедельная — исключена (спека этап 2,
+// миграция weekly→monthly зафиксирована в комментарии); эталон сида: пересоздание
+// БД даст записи по каждому периоду — сверить ведомость (см. handoff)
+leaseContractByNumber (ISTRING[20] num) = GROUP MAX LeaseContract c IF number(c) = num;
+accrueRentFor (DATE from, DATE to) {
+        FOR LeaseContract c IS LeaseContract AND contractStatus(c) = LeaseContractStatus.active DO {
+            // месяцы периода: от первого месяца from до месяца to — по платежам
+            LOCAL mn = DATE ();
+            mn() <- (OVERRIDE (mkDate(extractYear(from), extractMonthNumber(from), 1)), from);
+            WHILE mn() <= to DO {
+                LOCAL due = DATE ();
+                // ближайший платёжный день месяца (clamp к последнему дню месяца)
+                due() <- mkDate(extractYear(mn()), extractMonthNumber(mn()),
+                    (OVERRIDE paymentDay(c), 1));
+                IF extractDay(due()) > extractDay(mkDate(extractYear(mn()) + (IF extractMonthNumber(mn()) = 12 THEN 1 ELSE 0), (IF extractMonthNumber(mn()) = 12 THEN 1 ELSE extractMonthNumber(mn()) + 1), 1) - 1) THEN
+                    due() <- mkDate(extractYear(mn()) + (IF extractMonthNumber(mn()) = 12 THEN 1 ELSE 0), (IF extractMonthNumber(mn()) = 12 THEN 1 ELSE extractMonthNumber(mn()) + 1), 1) - 1;
+                // периодичность: monthly — каждый месяц; quarterly — мес % 3 = 1; yearly — январь
+                IF due() >= from AND due() <= to
+                    AND (periodicity(c) = PaymentPeriodicity.monthly
+                        OR periodicity(c) = PaymentPeriodicity.weekly   // миграция: weekly → monthly
+                        OR (periodicity(c) = PaymentPeriodicity.quarterly AND (extractMonthNumber(mn()) = 1 OR extractMonthNumber(mn()) = 4 OR extractMonthNumber(mn()) = 7 OR extractMonthNumber(mn()) = 10))
+                        OR (periodicity(c) = PaymentPeriodicity.yearly AND extractMonthNumber(mn()) = 1))
+                AND NOT (GROUP MAX 1 IF LeaseEntry e AND contract(e) = c AND entryKind(e) = LeaseEntryKind.obligation
+                    AND sourceDoc(e) = 'RENT-' + number(c) + '-' + ('' + extractYear(mn())) + '-' + ('' + extractMonthNumber(mn())))
+                THEN NEW e = LeaseEntry {
+                    contract(e) <- c;
+                    contractor(e) <- tenant(c);
+                    entryOrganization(e) <- organization(c);
+                    entryKind(e) <- LeaseEntryKind.obligation;
+                    amount(e) <- rentAmount(c);
+                    entryDate(e) <- due();
+                    sourceDoc(e) <- 'RENT-' + number(c) + '-' + ('' + extractYear(mn())) + '-' + ('' + extractMonthNumber(mn()));
+                }
+                mn() <- mkDate(extractYear(mn()) + (IF extractMonthNumber(mn()) = 12 THEN 1 ELSE 0), (IF extractMonthNumber(mn()) = 12 THEN 1 ELSE extractMonthNumber(mn()) + 1), 1);
+            }
+            APPLY;
+        }
+}
+
+accrueRent 'Начислить аренду' () {
+    INPUT from = DATE DO
+    INPUT to = DATE DO
+        accrueRentFor(from, to);
+}registerPayment 'Зарегистрировать оплату' (LeaseContract c) {
+    INPUT amount = NUMERIC[16,2] DO
+        INPUT d = DATE DO NEW e = LeaseEntry {
+            contract(e) <- c;
+            contractor(e) <- tenant(c);
+            entryOrganization(e) <- organization(c);
+            entryKind(e) <- LeaseEntryKind.payment;
+            amount(e) <- amount;
+            entryDate(e) <- d;
+            sourceDoc(e) <- 'ручная оплата';
+        }
+    APPLY;
+}
+// КФ-З18: оплата по отправленной заявке (PaymentRequest живёт в KuIntegration —
+// ниже по графу; обёртка там же, см. registerPaymentByRequest)
+registerPaymentEntry (LeaseContract c, DOUBLE amount, ISTRING[40] srcDoc) {
+    NEW e = LeaseEntry {
+        contract(e) <- c;
+        contractor(e) <- tenant(c);
+        entryOrganization(e) <- organization(c);
+        entryKind(e) <- LeaseEntryKind.payment;
+        amount(e) <- amount;
+        entryDate(e) <- currentDate();
+        sourceDoc(e) <- srcDoc;
+    }
+    APPLY;
+}
+
+// ФТ3.7: ведомость за период
+buildPaymentSheet 'Сформировать ведомость' () {
+    IF NOT organization(currentUser()) THEN
+        MESSAGE 'У текущего пользователя не указана организация — ведомость не формируется.';
+    ELSE {
+    INPUT from = DATE DO
+        INPUT to = DATE DO {
+        LOCAL s = PaymentSheet ();
+        NEW sh = PaymentSheet {
+            sheetOrganization(sh) <- organization(currentUser());
+            periodFrom(sh) <- from;
+            periodTo(sh) <- to;
+            s() <- sh;
+        }
+        FOR LeaseContract c IS LeaseContract
+            AND organization(c) = organization(currentUser()) AND contractStatus(c) = LeaseContractStatus.active
+        DO NEW i = PaymentSheetItem {
+            sheet(i) <- s();
+            contract(i) <- c;
+            accruedItem(i) <- (GROUP SUM amount(LeaseEntry e) IF entryKind(e) = LeaseEntryKind.obligation
+                AND contract(e) = c AND entryDate(e) >= from AND entryDate(e) <= to);
+            debtItem(i) <- (GROUP SUM amount(LeaseEntry e) IF entryKind(e) = LeaseEntryKind.obligation
+                AND contract(e) = c AND entryDate(e) < from)
+                - (GROUP SUM amount(LeaseEntry e) IF entryKind(e) = LeaseEntryKind.payment
+                AND contract(e) = c AND entryDate(e) < from);
+            toPay(i) <- (OVERRIDE (GROUP SUM amount(LeaseEntry e) IF entryKind(e) = LeaseEntryKind.obligation
+                AND contract(e) = c AND entryDate(e) >= from AND entryDate(e) <= to), 0.0)
+                + (OVERRIDE debtItem(i), 0.0);
+        }
+        APPLY;
+    }
+    }
+}
+
+approvePaymentSheet 'Утвердить ведомость' (PaymentSheet s) {
+    IF sheetStatus(s) = PaymentSheetStatus.approved THEN
+        MESSAGE 'Ведомость уже утверждена — повторное утверждение создало бы двойные платежи.';
+    ELSE {
+        sheetStatus(s) <- PaymentSheetStatus.approved;
+        FOR PaymentSheetItem i IS PaymentSheetItem AND sheet(i) = s DO NEW e = LeaseEntry {
+            contract(e) <- contract(i);
+            contractor(e) <- tenant(contract(i));
+            entryOrganization(e) <- organization(contract(i));
+            entryKind(e) <- LeaseEntryKind.payment;
+            amount(e) <- toPay(i);
+            entryDate(e) <- currentDate();
+            sourceDoc(e) <- 'ведомость ' + (OVERRIDE ('' + periodFrom(s)), '');
+        }
+        APPLY;
+    }
+}
+
+// суточная задача (ФТ3.3 + пролонгация); в прототипе — кнопка, планировщик — 05
+kuLandDaily 'Суточные задачи земли' () {
+    kuJobStart('Суточные задачи земли');
+    // уведомления (ФТ3.3) — запись в журнал при наступлении;
+    // дедуп за сутки: повторный запуск/кнопка не дублируют записи журнала
+    FOR LeaseNotification n IS LeaseNotification AND (notifyDueRent(n) OR notifyDueExpiry(n))
+        AND NOT (GROUP MAX 1 IF LeaseNotificationLog l AND lnlContract(l) = number(contract(n))
+            AND lnlKind(l) = staticCaption(notifyKind(n)) AND lnlAt(l) >= currentDateTime() - 86400)
+    DO
+        NEW l = LeaseNotificationLog {
+            lnlContract(l) <- number(contract(n));
+            lnlKind(l) <- staticCaption(notifyKind(n));
+            lnlText(l) <- IF notifyDueRent(n) THEN 'Через ' + ('' + daysBefore(n)) + ' дн. наступает срок оплаты по договору №' + number(contract(n))
+                ELSE 'Через ' + ('' + daysBefore(n)) + ' дн. истекает срок действия договора №' + number(contract(n)) + ' с арендатором ' + (OVERRIDE fullName(tenant(contract(n))), '—');   // КФ-З23: ОАФ А.1.2.2
+        }
+    // истечение / пролонгация
+    FOR LeaseContract c IS LeaseContract AND contractStatus(c) = LeaseContractStatus.active AND dateTo(c) < currentDate() DO {
+        IF autoProlong(c) THEN dateTo(c) <- dateTo(c) + 365;
+        ELSE contractStatus(c) <- LeaseContractStatus.expired;
+    }
+    // плановая урожайность по культуре
+    FOR Field f IS Field AND currentCrop(f) AND NOT planYield(f) DO planYield(f) <- targetYield(currentCrop(f));
+    APPLY;
+    // Волна 4: сводка в канал уведомлений (журнал + Telegram/MAX) — только
+    // если за последний час появились свежие записи (дедуп за сутки выше)
+    // КФ-З23: канал-ветка — kuNotify только когда есть уведомления с каналом
+    // Telegram/«все» (канал 'журнал'/пусто = только внутренний журнал)
+    IF (GROUP SUM 1 IF LeaseNotificationLog l IS LeaseNotificationLog AND lnlAt(l) >= currentDateTime() - 3600
+        AND ((GROUP MAX channel(LeaseNotification n) IF contract(n) = leaseContractByNumber(lnlContract(l))) = 'Telegram'
+            OR (GROUP MAX channel(LeaseNotification n2) IF contract(n2) = leaseContractByNumber(lnlContract(l))) = 'все')) THEN
+        kuNotify('Договоры', 'Уведомлений по договорам за сутки: '
+            + (OVERRIDE ('' + (GROUP SUM 1 IF LeaseNotificationLog lx IS LeaseNotificationLog AND lnlAt(lx) >= currentDateTime() - 86400)), '0')
+            + ' — см. «Земля → Уведомления по договорам»');
+    kuJobFinish('Суточные задачи земли', 'Выполнено',
+        'Записей в журнал уведомлений: ' + (OVERRIDE ('' + (GROUP SUM 1 IF LeaseNotificationLog l IS LeaseNotificationLog)), '0'));
+}
+
+// ФТ3.5: матричная визуализация «строки = участки, столбцы = действующие
+// договоры, заполненная ячейка = отношение». Динамические столбцы декларативно
+// не выражаются — колонки Д1–Д5 = первые 5 действующих договоров по номеру
+// (паттерн фиксированных колонок, как М1–М5 в матрице севооборота ФТ1.1).
+contractRank 'Порядок среди действующих' (LeaseContract c) =
+    GROUP SUM 1 IF LeaseContract x AND x != c AND contractStatus(x) = LeaseContractStatus.active
+        AND number(x) < number(c) AND contractStatus(c) = LeaseContractStatus.active;
+colContract 'Договор колонки' (INTEGER i) =
+    GROUP MAX number(LeaseContract c) IF contractStatus(c) = LeaseContractStatus.active
+        AND (OVERRIDE contractRank(c), 0) = i - 1;
+plotInCol (LandPlot p, INTEGER i) =
+    GROUP MAX 1 IF LeaseContract c AND contractStatus(c) = LeaseContractStatus.active
+        AND plot(c) = p AND (OVERRIDE contractRank(c), 0) = i - 1;
+// П.9: ячейка = НОМЕР договора колонки (а не абстрактная ✓) — матрица
+// самодостаточна без отдельной таблицы-легенды
+mxMark (LandPlot p, INTEGER i) = IF plotInCol(p, i) THEN colContract(i) ELSE '';
+mx1 'Договор 1' (LandPlot p) = mxMark(p, 1);
+mx2 'Договор 2' (LandPlot p) = mxMark(p, 2);
+mx3 'Договор 3' (LandPlot p) = mxMark(p, 3);
+mx4 'Договор 4' (LandPlot p) = mxMark(p, 4);
+mx5 'Договор 5' (LandPlot p) = mxMark(p, 5);
+plotActiveContracts 'Действующие договоры' (LandPlot p) =
+    GROUP CONCAT number(LeaseContract c) IF plot(c) = p AND contractStatus(c) = LeaseContractStatus.active, ', ' ORDER number(c), c;
+colNumber 'Колонка матрицы' (LeaseContract c) = (OVERRIDE contractRank(c), 0) + 1;
+
+// реакция на выявленный стресс (ФТ2.6 → ФТ4.2): объявлено в KuLand (общий
+// предок KuSimulation и KuYield), реализация — в KuYield (рекомендация по БЗ);
+// stName — классифицированный тип стресса ('' → подбор правила по приоритету)
+
+// ===================== Кадастровый справочник (КП07, шаг 3) =====================
+// Локальный аналог внешнего сервиса кадастровой карты на закрытом стенде:
+// номер → официальная площадь и контур. В промышленном контуре заменяется
+// обменом с НСПД/Росреестром (внешние интеграции — вне рамок v2.0).
+CLASS CadastreCache 'Кадастровый справочник';
+TABLE cadastreCache (CadastreCache);
+ccNumber 'Кадастровый номер' = DATA ISTRING[40] (CadastreCache) NONULL IN id;
+ccAreaSqm 'Официальная площадь, кв.м' = DATA NUMERIC[14,2] (CadastreCache);
+ccPolygon 'Контур (GeoJSON)' = DATA TEXT (CadastreCache);
+ccSource 'Источник' = DATA ISTRING[60] (CadastreCache);
+cadastreByNumber = GROUP AGGR CadastreCache c BY ccNumber(c);
+
+fetchCadastre 'Запросить площадь и контур' (LandPlot p) {
+    IF NOT (cadastralNumber(p) LIKE '__:__:______:___') THEN {
+        MESSAGE 'Кадастровый номер не прошёл форматно-логический контроль (маска XX:XX:XXXXXX:XXX).';
+    } ELSE {
+        IF cadastreByNumber(cadastralNumber(p)) IS CadastreCache THEN {
+            FOR CadastreCache c IS CadastreCache AND ccNumber(c) = cadastralNumber(p) DO {
+                areaSqm(p) <- ccAreaSqm(c);
+                polygonGeoJson(p) <- ccPolygon(c);
+            }
+            relinkFieldPlotsAct(p);   // новый контур → пересчёт состава полей
+            MESSAGE 'Кадастровый справочник: официальная площадь и контур подставлены в карточку.';
+            APPLY;
+        } ELSE {
+            MESSAGE 'Номер отсутствует в кадастровом справочнике стенда — внесите данные из выписки ЕГРН вручную.';
+        }
+    }
+}
+
+apiCadastralFetch 'API: кадастровый справочник' (ISTRING[40] num) {
+    EXPORT JSON FROM
+        number = ccNumber(CadastreCache c),
+        areaSqm = ccAreaSqm(c),
+        source = ccSource(c)
+    WHERE ccNumber(c) = num;
+    RETURN JSONFILE(exportFile());
+}
+
+// п.19 UI-обзора: вместо пяти колонок Д1–Д5 — списки «номер; статус» участка
+plotContractsList 'Договоры' (LandPlot p) =
+    GROUP CONCAT number(LeaseContract c) IF plot[LeaseContract](c) = p, '; ' ORDER number(c);
+plotContractsStatuses 'Статусы договоров' (LandPlot p) =
+    GROUP CONCAT staticCaption(contractStatus(c)) IF plot[LeaseContract](c) = p, '; ' ORDER number(c);
+// П.9: единая матрица (строки = участки, колонки = действующие договоры
+// по возрастанию номера; в ячейке — номер договора, пусто = отношения нет);
+// расшифровка не нужна — номер виден прямо в ячейке
+FORM contractPlotMatrix 'Матрица: участки и договоры'
+    OBJECTS p = LandPlot
+    PROPERTIES (p) NEWSESSION EDIT
+    PROPERTIES (p) READONLY name, cadastralNumber, namePlotStatus, plotContractsList, plotContractsStatuses, plotActiveContracts
+;
+DESIGN contractPlotMatrix {
+    NEW matrixBox {
+        caption = 'Участки × договоры';
+        MOVE BOX(p);
+    }
+    BOX(p) { caption = ''; }
+    PROPERTY(name(p)) { charWidth = 18; }
+    PROPERTY(cadastralNumber(p)) { charWidth = 16; }
+    PROPERTY(plotContractsList(p)) { charWidth = 24; }
+    PROPERTY(plotContractsStatuses(p)) { charWidth = 24; }
+}
+
+// ===================== Выбор объектов: пикеры =====================
+// Сырые объектные свойства платформа показывает числовым id, поэтому
+// на формах — вычисляемые имена, а изменение ссылок — выбором из списка.
+
+namePlotStatusItem 'Статус' (PlotStatus s) = staticCaption(s);
+nameContractStatusItem 'Статус' (LeaseContractStatus s) = staticCaption(s);
+nameSheetStatusItem 'Статус' (PaymentSheetStatus s) = staticCaption(s);
+nameContractorKindItem 'Тип' (ContractorKind k) = staticCaption(k);
+nameContractorStatusItem 'Статус' (ContractorStatus t) = staticCaption(t);
+
+FORM pickOrganization 'Выбор организации'
+    OBJECTS o = Organization
+    PROPERTIES (o) READONLY name
+    ORDERS name(o)
+;
+FORM pickContractor 'Выбор контрагента'
+    OBJECTS x = Contractor
+    PROPERTIES (x) READONLY fullName, inn, nameContractorKind
+    ORDERS fullName(x)
+;
+FORM pickLandPlot 'Выбор участка'
+    OBJECTS p = LandPlot
+    PROPERTIES (p) READONLY name, cadastralNumber, namePlotStatus
+    ORDERS name(p)
+;
+FORM pickField 'Выбор поля'
+    OBJECTS f = Field
+    PROPERTIES (f) READONLY name, code, nameOrganization, areaHa
+    ORDERS name(f)
+;
+FORM pickSoilAnalysis 'Выбор агрохиманализа'
+    OBJECTS a = SoilAnalysis
+    PROPERTIES (a) READONLY analysisDate, nameField, n, p, k, ph
+    ORDERS analysisDate(a)
+;
+FORM pickPlotStatus 'Выбор статуса участка'
+    OBJECTS s = PlotStatus
+    PROPERTIES (s) READONLY namePlotStatusItem
+;
+FORM pickContractStatus 'Выбор статуса договора'
+    OBJECTS s = LeaseContractStatus
+    PROPERTIES (s) READONLY nameContractStatusItem
+;
+FORM pickSheetStatus 'Выбор статуса ведомости'
+    OBJECTS v = PaymentSheetStatus
+    PROPERTIES (v) READONLY nameSheetStatusItem
+;
+
+FORM pickContractorKind 'Выбор типа контрагента'
+    OBJECTS k = ContractorKind
+    PROPERTIES (k) READONLY nameContractorKindItem
+;
+FORM pickContractorStatus 'Выбор статуса контрагента'
+    OBJECTS t = ContractorStatus
+    PROPERTIES (t) READONLY nameContractorStatusItem
+;
+setContractorKindAct 'Выбрать тип' (Contractor x) {
+    DIALOG pickContractorKind OBJECTS k = contractorKind(x) INPUT k NULL DO contractorKind(x) <- k;
+}
+setContractorStatusAct 'Выбрать статус' (Contractor x) {
+    DIALOG pickContractorStatus OBJECTS t = contractorStatus(x) INPUT t NULL DO contractorStatus(x) <- t;
+}
+setPlotStatusAct 'Выбрать статус' (LandPlot p) {
+    DIALOG pickPlotStatus OBJECTS s = plotStatus(p) INPUT s NULL DO plotStatus(p) <- s;
+}
+setPlotOrganizationAct 'Выбрать организацию' (LandPlot p) {
+    DIALOG pickOrganization OBJECTS o = organization(p) INPUT o NULL DO organization(p) <- o;
+}
+// п.3 обзора 12.10: добавление поля в состав участка (кнопка NEW у FieldPlot
+// открывала автоформу с числовым идентификатором — платформенная ловушка)
+addFieldPlotAct 'Добавить поле' (LandPlot p) {
+    DIALOG pickField OBJECTS f INPUT f NULL DO NEW fp = FieldPlot { plot(fp) <- p; field(fp) <- f; } APPLY;
+}
+setContractStatusAct 'Выбрать статус' (LeaseContract c) {
+    DIALOG pickContractStatus OBJECTS s = contractStatus(c) INPUT s NULL DO contractStatus(c) <- s;
+}
+setTenantAct 'Выбрать арендатора' (LeaseContract c) {
+    DIALOG pickContractor OBJECTS x = tenant(c) INPUT x NULL DO tenant(c) <- x;
+}
+setLandlordAct 'Выбрать арендодателя' (LeaseContract c) {
+    DIALOG pickContractor OBJECTS x = landlord(c) INPUT x NULL DO landlord(c) <- x;
+}
+setContractPlotAct 'Выбрать участок' (LeaseContract c) {
+    DIALOG pickLandPlot OBJECTS p = plot(c) INPUT p NULL DO plot(c) <- p;
+}
+setContractOrgAct 'Выбрать организацию' (LeaseContract c) {
+    DIALOG pickOrganization OBJECTS o = organization(c) INPUT o NULL DO organization(c) <- o;
+}
+setSheetOrgAct 'Выбрать организацию' (PaymentSheet s) {
+    DIALOG pickOrganization OBJECTS o = sheetOrganization(s) INPUT o NULL DO sheetOrganization(s) <- o;
+}
+setSheetStatusAct 'Выбрать статус' (PaymentSheet s) {
+    DIALOG pickSheetStatus OBJECTS v = sheetStatus(s) INPUT v NULL DO sheetStatus(s) <- v;
+}
+
+// ===================== Формы =====================
+
+// кнопки Excel-выгрузки (реализации — после объявления форм)
+exportLandPlotsXls 'Выгрузить в Excel' () ABSTRACT;
+exportLeaseContractsXls 'Выгрузить в Excel' () ABSTRACT;
+exportFieldsXls 'Выгрузить в Excel' () ABSTRACT;
+exportSoilAnalysesXls 'Выгрузить в Excel' () ABSTRACT;
+nameGranulometryItem 'Гранулометрический состав' (Granulometry g) = staticCaption(g);
+FORM pickGranulometry 'Выбор гранулометрического состава'
+    OBJECTS g = Granulometry
+    PROPERTIES (g) READONLY nameGranulometryItem
+;
+setGranulometryAct 'Выбрать состав' (SoilType st) {
+    DIALOG pickGranulometry OBJECTS g = granulometry(st) INPUT g NULL DO granulometry(st) <- g;
+}
+FORM soilTypes 'Типы почв'
+    OBJECTS st = SoilType
+    PROPERTIES (st) READONLY name, code, nameGranulometry, densitySoil, humusNorm, phNormMin, phNormMax
+    PROPERTIES (st) NEWSESSION NEW, EDIT, DELETE
+    ORDERS name(st)
+;
+// карточка типа почвы: двойной клик по строке реестра открывает её
+FORM soilType 'Тип почвы'
+    OBJECTS st = SoilType PANEL
+    PROPERTIES (st) name, code
+    PROPERTIES (st) READONLY nameGranulometry
+    PROPERTIES (st) setGranulometryAct
+    PROPERTIES (st) densitySoil, humusNorm, phNormMin, phNormMax
+    EDIT SoilType OBJECT st
+;
+
+// КП07: автоматическая проверка кадастрового номера. В прототипе —
+// форматно-логический контроль маски; внешнее приложение-проверщик — 05
+checkCadastralNumber 'Проверить кадастровый номер' (LandPlot p) {
+    IF cadastralNumber(p) LIKE '__:__:______:___' THEN {
+        MESSAGE 'Кадастровый номер корректен. Внешняя проверка (ЕГРН) в прототипе не подключена.';
+    } ELSE {
+        MESSAGE 'Кадастровый номер не соответствует формату XX:XX:XXXXXX:XXX';
+    }
+}
+
+apiCadastralCheck 'API: проверка кадастра' (ISTRING[40] num) {
+    EXPORT JSON FROM number = num, formatValid = num LIKE '__:__:______:___', externalCheck = 'не подключён (прототип)';
+    RETURN JSONFILE(exportFile());
+}
+
+
+FORM landPlots 'Земельные участки'
+    OBJECTS p = LandPlot
+    PROPERTIES (p) READONLY name, cadastralNumber, namePlotStatus, areaHaPlot, nameOrganizationPlot
+    PROPERTIES (p) NEWSESSION NEW, EDIT, DELETE, checkCadastralNumber
+    PROPERTIES () exportLandPlotsXls
+    ORDERS name(p)
+;
+
+// большие JSON-поля с карточки убраны — модальные окна по кнопке
+// п.18 UI-обзора: JSON просматривается И редактируется; после ОК —
+// валидация парсером (IMPORT JSON), кривой JSON откатывается с сообщением
+FORM plotJson 'Геометрия участка (GeoJSON)'
+    OBJECTS p = LandPlot PANEL
+    PROPERTIES (p) polygonGeoJson
+;
+validatePlotJson (LandPlot p) {
+    IF polygonGeoJson(p) THEN {
+        LOCAL ok = BOOLEAN ();
+        TRY {
+            stringToFile(polygonGeoJson(p));
+            LOCAL NESTED jv = STRING[1] (INTEGER);
+            IMPORT JSON FROM resultFile() TO jv;
+            ok() <- TRUE;
+        } CATCH ok() <- NULL;
+        IF NOT ok() THEN {
+            polygonGeoJson(p) <- PREV(polygonGeoJson(p));
+            MESSAGE 'GeoJSON не распознан — изменения не сохранены.';
+        }
+    }
+}
+showPlotJsonAct 'Геометрия (GeoJSON)…' (LandPlot p) {
+    DIALOG plotJson OBJECTS p = p DO validatePlotJson(p);
+}
+FORM plotEncumbrance 'Обременения участка (JSON)'
+    OBJECTS p = LandPlot PANEL
+    PROPERTIES (p) encumbrance
+;
+validatePlotEncumbrance (LandPlot p) {
+    IF encumbrance(p) THEN {
+        LOCAL ok = BOOLEAN ();
+        TRY {
+            stringToFile(encumbrance(p));
+            LOCAL NESTED jv = STRING[1] (INTEGER);
+            IMPORT JSON FROM resultFile() TO jv;
+            ok() <- TRUE;
+        } CATCH ok() <- NULL;
+        IF NOT ok() THEN {
+            encumbrance(p) <- PREV(encumbrance(p));
+            MESSAGE 'JSON обременений не распознан — изменения не сохранены.';
+        }
+    }
+}
+showEncumbranceAct 'Обременения (JSON)…' (LandPlot p) {
+    DIALOG plotEncumbrance OBJECTS p = p DO validatePlotEncumbrance(p);
+}
+FORM landPlot 'Участок'
+    OBJECTS p = LandPlot PANEL
+    PROPERTIES (p) name, cadastralNumber, areaSqm
+    PROPERTIES (p) READONLY areaHaPlot
+    // п.1 обзора 12.10: статус и организация — выпадающие списки
+    // (элемент выбора платформы, вид принудительно Dropdown), кнопки-пикеры убраны
+    PROPERTIES (p) namePlotStatus SELECT 'Dropdown'
+    PROPERTIES (p) nameOrganizationPlot SELECT 'Dropdown'
+    PROPERTIES (p) pkkUrl
+    PROPERTIES (p) showPlotJsonAct, showEncumbranceAct, fetchCadastre, relinkFieldPlotsAct, addFieldPlotAct
+    PROPERTIES (p) egrnExtract, note
+    PROPERTIES (p) READONLY created, nameLpCreatedBy, plotUpdated
+
+    OBJECTS f = FieldPlot
+    PROPERTIES (f) delFieldPlotAct
+    PROPERTIES (f) READONLY nameFpField, fpCadastral, fpPlotStatus, fpAreaHa
+    FILTERS plot[FieldPlot](f) = p
+
+    OBJECTS c = LeaseContract
+    PROPERTIES (c) READONLY number, nameContractStatus, nameLandlord, dateFrom, dateTo, rentAmount
+    FILTERS plot(c) = p
+
+    EDIT LandPlot OBJECT p
+;
+DESIGN landPlot {
+    // п.2 обзора (5-я порция): растяжка блоков на ширину формы — STRETCH
+    // на КОНТЕЙНЕРЕ (alignment ребёнка в узкой ячейке панели не тянул)
+    NEW headBox {
+        alignment = STRETCH;
+        caption = 'Основные сведения';
+        NEW hRow1 { horizontal = TRUE; MOVE PROPERTY(name(p)); MOVE PROPERTY(cadastralNumber(p)); MOVE PROPERTY(areaSqm(p)); MOVE PROPERTY(areaHaPlot(p)); }
+        NEW hRow2 { horizontal = TRUE; MOVE PROPERTY(namePlotStatus(p)); MOVE PROPERTY(nameOrganizationPlot(p)); }
+        NEW hRow3 { horizontal = TRUE; MOVE PROPERTY(pkkUrl(p)); }
+    }
+    NEW actBox {
+        alignment = STRETCH;
+        caption = 'Действия и документы';
+        horizontal = TRUE;
+        MOVE PROPERTY(showPlotJsonAct(p));
+        MOVE PROPERTY(showEncumbranceAct(p));
+        MOVE PROPERTY(fetchCadastre(p));
+        MOVE PROPERTY(relinkFieldPlotsAct(p));
+    }
+    NEW docBox {
+        alignment = STRETCH;
+        caption = 'Документы и примечания';
+        MOVE PROPERTY(egrnExtract(p));
+        MOVE PROPERTY(note(p)) { alignment = STRETCH; charWidth = 120; }
+    }
+    NEW auditRow {   // п. обзора: «Создано» и «Изменено» — рядом
+        alignment = STRETCH;
+        horizontal = TRUE;
+        MOVE PROPERTY(created(p));
+        MOVE PROPERTY(plotUpdated(p));
+        MOVE PROPERTY(nameLpCreatedBy(p));
+    }
+    NEW fieldsBox {
+        alignment = STRETCH;
+        caption = 'Связанные поля';
+        MOVE PROPERTY(addFieldPlotAct(p));
+        MOVE BOX(f);
+    }
+    NEW contractsBox {
+        alignment = STRETCH;
+        caption = 'Договоры аренды участка';
+        MOVE BOX(c);
+    }
+    BOX(f) { caption = ''; alignment = STRETCH; }
+    BOX(c) { caption = ''; alignment = STRETCH; }
+}
+
+FORM fields 'Поля'
+    OBJECTS f = Field
+    PROPERTIES (f) READONLY name, code, nameOrganization, areaHa, nameSoilType, nameCurrentCrop
+    PROPERTIES (f) NEWSESSION NEW, EDIT, DELETE
+    PROPERTIES () exportFieldsXls
+    ORDERS name(f)
+;
+
+kuFieldPhase 'Феностадия' (Field f) = ABSTRACT ISTRING[8];   // КФ-10: реализация в KuSimulation
+kuFieldHasOpDates (Field f) = ABSTRACT INTEGER;   // КФ-М2: плановые даты операций сезонной ТК есть? реализация в KuYield
+
+FORM fieldCard 'Поле'
+    OBJECTS f = Field PANEL
+    // объектные атрибуты — именными свойствами: без них карточка показывает key0 числом
+    PROPERTIES (f) name, code
+    PROPERTIES (f) READONLY nameOrganization, nameSoilType, nameLandClass, nameLastCrop, nameCurrentCrop, kuFieldPhase, nameLocation
+    PROPERTIES (f) areaHa, areaManual, bonitet, slope, erosion, boundaryGeoJson, centerLat, centerLon
+    PROPERTIES (f) READONLY geoAreaHa, areaKad, areaDiff, areaMismatch
+    PROPERTIES (f) recalcFieldGeometryAct
+    PROPERTIES (f) lastSowDate, fieldState, stateScore
+    PROPERTIES (f) planYield, factYield, note
+    PROPERTIES (f) READONLY lastAnalysisDate, analysisStale, nameAnalysisAgeDays, lastN, lastP, lastK, lastPh, lastHumus, created, nameFieldCreatedBy
+
+    OBJECTS fp = FieldPlot
+    PROPERTIES (fp) READONLY fpCadastral, fpPlotStatus, fpAreaHa
+    PROPERTIES (fp) NEWSESSION NEW, EDIT, DELETE
+    FILTERS field(fp) = f
+
+    OBJECTS a = SoilAnalysis
+    PROPERTIES (a) READONLY analysisDate, n, p, k, ph, humus
+    PROPERTIES (a) NEWSESSION NEW, EDIT, DELETE
+    FILTERS field(a) = f
+
+    EDIT Field OBJECT f
+;
+
+FORM contractors 'Контрагенты'
+    OBJECTS x = Contractor
+    PROPERTIES (x) READONLY fullName, nameContractorKind, inn, nameContractorStatus
+    PROPERTIES (x) NEWSESSION NEW, EDIT, DELETE
+    ORDERS fullName(x)
+;
+
+// группы полей по типу контрагента: ФЛ/ИП — персональные данные,
+// ЮЛ/гос. орган — реквизиты организации; иностранное лицо — общие поля
+// П.3: «Изменено» — фиксация правок карточки
+statusReason 'Основание смены статуса' = DATA ISTRING[200] (Contractor);
+CONSTRAINT Contractor x IS Contractor
+    AND (contractorStatus(x) = ContractorStatus.liquidated OR contractorStatus(x) = ContractorStatus.contested)
+    AND NOT statusReason(x)
+    CHECKED BY statusReason MESSAGE 'Укажите основание смены статуса (№ решения суда / выписка ЕГРЮЛ)';
+
+// КФ-З4: аудит изменений контрагента (hash-chain)
+WHEN CHANGED(inn(Contractor x)) AND x IS Contractor DO
+    kuAuditChange('Contractor', (OVERRIDE fullName(x), ''), 'ИНН', (OVERRIDE ('' + PREV(inn(x))), ''), (OVERRIDE ('' + inn(x)), ''));
+WHEN CHANGED(ogrn(Contractor x)) AND x IS Contractor DO
+    kuAuditChange('Contractor', (OVERRIDE fullName(x), ''), 'ОГРН', (OVERRIDE ('' + PREV(ogrn(x))), ''), (OVERRIDE ('' + ogrn(x)), ''));
+WHEN CHANGED(fullName(Contractor x)) AND x IS Contractor DO
+    kuAuditChange('Contractor', (OVERRIDE fullName(x), ''), 'Наименование', (OVERRIDE PREV(fullName(x)), ''), (OVERRIDE fullName(x), ''));
+WHEN CHANGED(contractorStatus(Contractor x)) AND x IS Contractor DO
+    kuAuditChange('Contractor', (OVERRIDE fullName(x), ''), 'Статус', (OVERRIDE ('' + PREV(contractorStatus(x))), ''), (OVERRIDE ('' + contractorStatus(x)), ''));
+WHEN CHANGED(kpp(Contractor x)) AND x IS Contractor DO
+    kuAuditChange('Contractor', (OVERRIDE fullName(x), ''), 'КПП', (OVERRIDE ('' + PREV(kpp(x))), ''), (OVERRIDE ('' + kpp(x)), ''));
+WHEN CHANGED(fullName(Contractor x)) OR CHANGED(shortName(x)) OR CHANGED(inn(x))
+    OR CHANGED(contractorStatus(x)) OR CHANGED(contractorKind(x)) DO
+    ctUpdated(x) <- currentDateTime();
+// КФ-З4: аудит ключевых реквизитов (hash-chain)
+WHEN CHANGED(inn(Contractor x)) AND x IS Contractor DO
+    kuAuditChange('Contractor', (OVERRIDE shortName(x), fullName(x)), 'ИНН', (OVERRIDE ('' + PREV(inn(x))), ''), (OVERRIDE ('' + inn(x)), ''));
+WHEN CHANGED(ogrn(Contractor x)) AND x IS Contractor DO
+    kuAuditChange('Contractor', (OVERRIDE shortName(x), fullName(x)), 'ОГРН', (OVERRIDE ('' + PREV(ogrn(x))), ''), (OVERRIDE ('' + ogrn(x)), ''));
+WHEN CHANGED(fullName(Contractor x)) AND x IS Contractor DO
+    kuAuditChange('Contractor', (OVERRIDE shortName(x), fullName(x)), 'Полное наименование', (OVERRIDE PREV(fullName(x)), ''), (OVERRIDE fullName(x), ''));
+WHEN CHANGED(contractorStatus(Contractor x)) AND x IS Contractor DO
+    kuAuditChange('Contractor', (OVERRIDE shortName(x), fullName(x)), 'Статус', (OVERRIDE staticCaption(PREV(contractorStatus(x))), ''), (OVERRIDE staticCaption(contractorStatus(x)), ''));
+WHEN CHANGED(kpp(Contractor x)) AND x IS Contractor DO
+    kuAuditChange('Contractor', (OVERRIDE shortName(x), fullName(x)), 'КПП', (OVERRIDE ('' + PREV(kpp(x))), ''), (OVERRIDE ('' + kpp(x)), ''));
+FORM contractor 'Контрагент'
+    OBJECTS x = Contractor PANEL
+    // П.3: полное/краткое наименование — только ЮЛ и госорганам
+    PROPERTIES (x) fullName SHOWIF ckIsCompany(x), shortName SHOWIF ckIsCompany(x)
+    PROPERTIES (x) READONLY nameContractorKind, nameContractorStatus
+    // тип сменяем всегда (в т.ч. в незакрытой новой карточке — он определяет
+    // состав полей); статус — только пока не выбран
+    PROPERTIES (x) setContractorKindAct
+    PROPERTIES (x) setContractorStatusAct SHOWIF NOT contractorStatus(x)
+    PROPERTIES (x) inn SHOWIF ckHasInn(x)
+    PROPERTIES (x) lastName SHOWIF ckIsPerson(x), firstName SHOWIF ckIsPerson(x), middleName SHOWIF ckIsPerson(x)
+    PROPERTIES (x) birthDate SHOWIF ckIsPerson(x), snils SHOWIF ckIsPerson(x), citizenship SHOWIF ckIsPerson(x), passportData SHOWIF ckIsPerson(x)
+    PROPERTIES (x) kpp SHOWIF ckIsCompany(x), ogrn SHOWIF ckIsCompany(x), okpo SHOWIF ckIsCompany(x), opf SHOWIF ckIsCompany(x)
+    PROPERTIES (x) legalAddress SHOWIF ckIsCompany(x), postalAddress SHOWIF ckIsCompany(x)
+    PROPERTIES (x) director SHOWIF ckIsCompany(x), bankAccounts SHOWIF ckIsCompany(x)
+    PROPERTIES (x) contacts
+    PROPERTIES (x) READONLY created, nameCtCreatedBy, ctUpdated
+    EDIT Contractor OBJECT x
+;
+DESIGN contractor {
+    // П.3: компактная шапка — тип/статус/ИНН/контакты одним блоком,
+    // отраслевые группы полей ниже
+    NEW mainBox {
+        caption = 'Основные сведения';
+        NEW row1 { horizontal = TRUE; MOVE PROPERTY(nameContractorKind(x)); MOVE PROPERTY(nameContractorStatus(x)); MOVE PROPERTY(inn(x)); }
+        NEW row2 { horizontal = TRUE; MOVE PROPERTY(fullName(x)); }
+        NEW row3 { horizontal = TRUE; MOVE PROPERTY(shortName(x)); MOVE PROPERTY(contacts(x)); }
+    }
+    NEW personBox {
+        caption = 'Физическое лицо / ИП';
+        NEW row4 { horizontal = TRUE; MOVE PROPERTY(lastName(x)); MOVE PROPERTY(firstName(x)); MOVE PROPERTY(middleName(x)); }
+        NEW row5 { horizontal = TRUE; MOVE PROPERTY(birthDate(x)); MOVE PROPERTY(snils(x)); MOVE PROPERTY(citizenship(x)); }
+        MOVE PROPERTY(passportData(x));
+    }
+    NEW companyBox {
+        caption = 'Организация';
+        NEW row6 { horizontal = TRUE; MOVE PROPERTY(kpp(x)); MOVE PROPERTY(ogrn(x)); MOVE PROPERTY(okpo(x)); }
+        NEW row7 { horizontal = TRUE; MOVE PROPERTY(opf(x)); MOVE PROPERTY(director(x)); }
+        MOVE PROPERTY(legalAddress(x));
+        MOVE PROPERTY(postalAddress(x));
+        MOVE PROPERTY(bankAccounts(x));
+    }
+}
+
+FORM leaseContracts 'Договоры аренды'
+    OBJECTS c = LeaseContract
+    PROPERTIES (c) READONLY number, nameTenant, nameLandlord, namePlot, dateFrom, dateTo, nameContractStatus, contractStateMark
+    PROPERTIES (c) READONLY obligationSum, paymentSum, balanceContract
+    PROPERTIES (c) NEWSESSION NEW, EDIT, DELETE, registerPayment
+    PROPERTIES () exportLeaseContractsXls
+    ORDERS number(c)
+;
+
+// ТЗ 4.2.3.4: акт сверки взаиморасчётов по договору (Excel)
+FORM reconciliationAct 'Акт сверки взаиморасчётов'
+    OBJECTS c = LeaseContract PANEL
+    PROPERTIES (c) READONLY number, nameLandlord, nameContractStatus, dateFrom, dateTo, rentAmount
+    PROPERTIES (c) READONLY obligationSum, paymentSum, balanceContract
+    OBJECTS e = LeaseEntry
+    PROPERTIES (e) READONLY entryDate, nameEntryKind, amount, sourceDoc
+    FILTERS contract(e) = c
+    ORDERS entryDate(e)
+;
+printReconciliation 'Акт сверки (Excel)' (LeaseContract c) {
+    PRINT reconciliationAct OBJECTS c = c XLSX SHEET 'Акт сверки' TO exportFile;
+    open(exportFile());
+}
+
+FORM leaseContract 'Договор'
+    OBJECTS c = LeaseContract PANEL
+    PROPERTIES (c) number, signDate, nameContractStatus, nameTenant, nameLandlord, namePlot
+    PROPERTIES (c) setContractStatusAct, setTenantAct, setLandlordAct, setContractPlotAct
+    PROPERTIES (c) isPartial, partialAddress, partialAreaHa
+    PROPERTIES (c) dateFrom, dateTo, autoProlong, rentAmount, periodicity
+    PROPERTIES (c) paymentDay, paymentMethod, indexation, nameOrganizationContract, scan, addendum
+    PROPERTIES (c) setContractOrgAct
+    PROPERTIES (c) READONLY obligationSum, paymentSum, balanceContract, overdue, created, nameLcCreatedBy
+    PROPERTIES (c) printReconciliation
+
+    OBJECTS e = LeaseEntry
+    PROPERTIES (e) NEWSESSION NEW, EDIT, DELETE
+    FILTERS contract(e) = c
+
+    OBJECTS n = LeaseNotification
+    PROPERTIES (n) NEWSESSION NEW, EDIT, DELETE
+    FILTERS contract(n) = c
+
+    EDIT LeaseContract OBJECT c
+;
+DESIGN leaseContract {
+    // П.17: компактные ряды (по образцу карточки культуры), кнопки отдельно
+    NEW head {
+        caption = 'Договор аренды';
+        NEW row1 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(number(c));
+            MOVE PROPERTY(signDate(c));
+            MOVE PROPERTY(nameContractStatus(c));
+            MOVE PROPERTY(setContractStatusAct(c));
+        }
+        NEW row2 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(nameTenant(c));
+            MOVE PROPERTY(setTenantAct(c));
+            MOVE PROPERTY(nameLandlord(c));
+            MOVE PROPERTY(setLandlordAct(c));
+        }
+        NEW row3 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(namePlot(c));
+            MOVE PROPERTY(setContractPlotAct(c));
+            MOVE PROPERTY(nameOrganizationContract(c));
+            MOVE PROPERTY(setContractOrgAct(c));
+        }
+        NEW row4 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(dateFrom(c));
+            MOVE PROPERTY(dateTo(c));
+            MOVE PROPERTY(autoProlong(c));
+            MOVE PROPERTY(rentAmount(c));
+            MOVE PROPERTY(periodicity(c));
+        }
+        NEW row5 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(paymentDay(c));
+            MOVE PROPERTY(paymentMethod(c));
+            MOVE PROPERTY(indexation(c));
+        }
+        NEW row6 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(isPartial(c));
+            MOVE PROPERTY(partialAddress(c));
+            MOVE PROPERTY(partialAreaHa(c));
+        }
+        NEW row7 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(obligationSum(c));
+            MOVE PROPERTY(paymentSum(c));
+            MOVE PROPERTY(balanceContract(c));
+            MOVE PROPERTY(overdue(c));
+        }
+        NEW row8 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(created(c));
+            MOVE PROPERTY(nameLcCreatedBy(c));
+            MOVE PROPERTY(printReconciliation(c));
+        }
+        NEW docs {
+            caption = 'Документы';
+            horizontal = TRUE;
+            MOVE PROPERTY(scan(c));
+            MOVE PROPERTY(addendum(c));
+        }
+        // п.20 UI-обзора: записи и уведомления — в самый низ карточки
+        NEW tailEntries {
+            caption = 'Записи взаиморасчётов';
+            MOVE BOX(e);
+        }
+        NEW tailNotifications {
+            caption = 'Уведомления по договору';
+            MOVE BOX(n);
+        }
+    }
+}
+
+// П.17: карточки записей (были автоформы с числовым ИД при «добавить запись»)
+nameEntryKindItem (LeaseEntryKind k) = staticCaption(k);
+FORM pickEntryKind 'Выбор вида записи'
+    OBJECTS k = LeaseEntryKind
+    PROPERTIES (k) READONLY nameEntryKindItem
+;
+nameEntryOrganization 'Организация' (LeaseEntry e) = OVERRIDE name(entryOrganization(e)), '';
+setEntryKindAct 'Выбрать вид' (LeaseEntry e) {
+    DIALOG pickEntryKind OBJECTS k = entryKind(e) INPUT k NULL DO entryKind(e) <- k;
+}
+setEntryContractorAct 'Выбрать контрагента' (LeaseEntry e) {
+    DIALOG pickContractor OBJECTS x = contractor(e) INPUT x NULL DO contractor(e) <- x;
+}
+setEntryOrganizationAct 'Выбрать организацию' (LeaseEntry e) {
+    DIALOG pickOrganization OBJECTS o = entryOrganization(e) INPUT o NULL DO entryOrganization(e) <- o;
+}
+FORM leaseEntry 'Запись взаиморасчётов'
+    OBJECTS e = LeaseEntry PANEL
+    PROPERTIES (e) READONLY nameContract
+    PROPERTIES (e) READONLY nameEntryKind
+    PROPERTIES (e) setEntryKindAct
+    PROPERTIES (e) READONLY nameEntryContractor
+    PROPERTIES (e) setEntryContractorAct SHOWIF NOT contractor(e)
+    PROPERTIES (e) READONLY nameEntryOrganization
+    PROPERTIES (e) setEntryOrganizationAct SHOWIF NOT entryOrganization(e)
+    PROPERTIES (e) amount, entryDate
+    EDIT LeaseEntry OBJECT e
+;
+// п.20 UI-обзора: компактные ряды — суммы/даты в одну строку, выборы — рядом
+DESIGN leaseEntry {
+    NEW main {
+        caption = '';
+        NEW r1 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(nameContract(e));
+            MOVE PROPERTY(nameEntryKind(e));
+            MOVE PROPERTY(setEntryKindAct(e));
+        }
+        NEW r2 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(amount(e));
+            MOVE PROPERTY(entryDate(e));
+        }
+        NEW r3 {
+            caption = '';
+            horizontal = TRUE;
+            MOVE PROPERTY(nameEntryContractor(e));
+            MOVE PROPERTY(setEntryContractorAct(e));
+            MOVE PROPERTY(nameEntryOrganization(e));
+            MOVE PROPERTY(setEntryOrganizationAct(e));
+        }
+    }
+}
+FORM paymentSheetXls 'Платёжная ведомость (печать)'
+    OBJECTS s = PaymentSheet
+    PROPERTIES (s) READONLY nameSheetOrganization, periodFrom, periodTo, nameSheetStatus
+    OBJECTS i = PaymentSheetItem
+    PROPERTIES (i) READONLY nameItemContract, itemContractor, accruedItem, debtItem, toPay, adjustReason
+    FILTERS sheet(i) = s
+;
+printPaymentSheetXls 'Выгрузить ведомость (XLSX)' (PaymentSheet s) {
+    PRINT paymentSheetXls OBJECTS s = s XLSX SHEET 'Платёжная ведомость' TO exportFile;
+    open(exportFile());
+}
+FORM paymentSheets 'Платёжные ведомости'
+    OBJECTS s = PaymentSheet
+    PROPERTIES (s) READONLY nameSheetOrganization, periodFrom, periodTo, nameSheetStatus, responsible
+    PROPERTIES (s) printPaymentSheetXls
+    PROPERTIES (s) NEWSESSION NEW, DELETE, approvePaymentSheet
+;
+
+FORM paymentSheet 'Ведомость'
+    OBJECTS s = PaymentSheet PANEL
+    PROPERTIES (s) nameSheetOrganization, periodFrom, periodTo, nameSheetStatus, responsible
+    PROPERTIES (s) setSheetOrgAct, setSheetStatusAct
+    OBJECTS i = PaymentSheetItem
+    PROPERTIES (i) NEWSESSION NEW, DELETE
+    PROPERTIES (i) READONLY nameItemContract, itemContractor, accruedItem, debtItem
+    PROPERTIES (i) toPay, adjustReason
+    FILTERS sheet(i) = s
+    EDIT PaymentSheet OBJECT s
+;
+
+
+// хелперы (объявлены до сида)
+kuOrg () = GROUP MAX Organization o IF name(o) = 'Омский АНЦ';
+kuOrgNorth () = GROUP MAX Organization o IF name(o) = 'Агро-Север (демо RLS)';
+chernozem () = GROUP MAX SoilType st IF name(st) = 'Чернозём выщелоченный';
+dernovo () = GROUP MAX SoilType st IF name(st) = 'Дерново-подзолистая';
+kastanovaya () = GROUP MAX SoilType st IF name(st) = 'Каштановая';
+
+nameNotifContract 'Договор' (LeaseNotification n) = number(contract(n));
+nameNotifyKindItem (LeaseNotifyKind k) = staticCaption(k);
+FORM pickNotifyKind 'Выбор типа уведомления'
+    OBJECTS k = LeaseNotifyKind
+    PROPERTIES (k) READONLY nameNotifyKindItem
+;
+setNotifyKindAct 'Выбрать тип' (LeaseNotification n) {
+    DIALOG pickNotifyKind OBJECTS k = notifyKind(n) INPUT k NULL DO notifyKind(n) <- k;
+}
+nameNotifyKind 'Тип' (LeaseNotification n) = staticCaption(notifyKind(n));
+FORM leaseNotification 'Уведомление по договору'
+    OBJECTS n = LeaseNotification PANEL
+    PROPERTIES (n) READONLY nameNotifContract
+    PROPERTIES (n) READONLY nameNotifyKind
+    PROPERTIES (n) setNotifyKindAct
+    PROPERTIES (n) daysBefore, channel, enabled
+    EDIT LeaseNotification OBJECT n
+;
+
+FORM leaseNotificationLog 'Журнал уведомлений'
+    OBJECTS l = LeaseNotificationLog
+    PROPERTIES (l) READONLY lnlAt, lnlContract, lnlKind, lnlText
+    ORDERS lnlAt(l) DESC
+;
+
+FORM leaseExpiringList 'Истекающие договоры'
+    OBJECTS c = LeaseContract
+    PROPERTIES (c) READONLY number, nameTenant, dateFrom, dateTo, rentAmount
+    FILTERS contractStatus(c) = LeaseContractStatus.active
+        AND dateTo(c) >= currentDate() AND dateTo(c) <= currentDate() + 90
+    ORDERS dateTo(c)
+;
+runExpiringReport 'Отчёт: истекающие (90 дн.)' () {
+    PRINT leaseExpiringList XLSX SHEET 'Истекающие' TO exportFile;
+    open(exportFile());
+}
+FORM leaseNotifications 'Уведомления по договорам'
+    PROPERTIES () kuLandDaily, runExpiringReport
+    OBJECTS n = LeaseNotification
+    PROPERTIES (n) READONLY nameNotifContract, nameNotifyKind, daysBefore, notifyDueRent, notifyDueExpiry
+    PROPERTIES (n) NEWSESSION NEW, EDIT, DELETE
+    FILTERS notifyDueRent(n) OR notifyDueExpiry(n) OR NOT enabled(n)
+;
+
+
+// ===================== Интерактивная карта (UI-105, КП09, ФТ.GEO) =====================
+// Данные карты: секции FIELDS/FLEET/ZONES/SEL, разделители || (секции) ~ (записи) ^ (поля).
+// Гидрография демо исключена решением владельца 05.10 (возврат для
+// демонстрации водоохранной зоны — docs/14-field-contours §2)
+kuMapData = DATA TEXT ();   // п.16: подпись «Данные карты» убрана из UI
+// двусторонняя связность карты (docs/11 §10): выбранное поле (код) — подсветка
+// Инфраструктура хозяйства на карте (картография из карты-эталона KNP:
+// коровники, склады, весы, скважины — точки и полигоны; SQL-сидинг)
+CLASS MapInfra 'Объект инфраструктуры';
+TABLE mapInfra (MapInfra);
+miName 'Название' = DATA ISTRING[60] (MapInfra) NONULL;
+miNote 'Описание' = DATA TEXT (MapInfra);
+miLat 'Широта' = DATA DOUBLE (MapInfra);
+miLon 'Долгота' = DATA DOUBLE (MapInfra);
+miPolygon 'Контур (GeoJSON)' = DATA TEXT (MapInfra);
+
+// Наблюдения полевого скаутинга (UI-801)
+CLASS ScoutObservation 'Наблюдение (скаутинг)';
+TABLE scoutObservation (ScoutObservation);
+scField 'Поле' = DATA Field (ScoutObservation);
+scNameField 'Поле' (ScoutObservation o) = OVERRIDE name(scField(o)), '—';
+scAt 'Дата' = DATA DATETIME (ScoutObservation) NONULL;
+scKind 'Тип наблюдения' = DATA ISTRING[24] (ScoutObservation) NONULL;
+scLat 'Широта' = DATA DOUBLE (ScoutObservation);
+scLon 'Долгота' = DATA DOUBLE (ScoutObservation);
+scDescr 'Описание' = DATA TEXT (ScoutObservation);
+scPhoto 'Фото' = DATA RAWFILE (ScoutObservation);
+scAuthor 'Автор' = DATA ISTRING[60] (ScoutObservation);
+WHEN SET(ScoutObservation o IS ScoutObservation) DO {
+    scAt(o) <- currentDateTime();
+    // КФ-2: источник состояния поля — полевой скаутинг (спека 09.10);
+    // stateScore — только ручной ввод; прочие классы наблюдений не трогают
+    IF scKind(o) = 'вредители' THEN fieldState(scField(o)) <- 'Поражено вредителями';
+    ELSE IF scKind(o) = 'болезни' THEN fieldState(scField(o)) <- 'Поражено болезнями';
+    ELSE IF scKind(o) = 'сорняки' THEN fieldState(scField(o)) <- 'Засоренное';
+}
+
+// ===================== КФ-С1..С6 (11.10): реестр детекций стресса =====================
+// Единая точка правды «поле в стрессе»: активная детекция ЛЮБОГО показателя.
+// NDVI-детектор (KuSimulation.refreshNdviDetections) пишет сюда; датчики
+// почвы/осадки/скаутинг — детекторами ниже. kuFieldStress (хук карты) читает реестр.
+CLASS StressDetectionStatus 'Статус детекции' { active 'Активна', confirmed 'Подтверждена', resolved 'Устранена' }
+CLASS StressDetection 'Детекция стресса';
+TABLE stressDetection (StressDetection);
+sdField 'Поле' = DATA Field (StressDetection) NONULL;
+nameSdField 'Поле' (StressDetection d) = OVERRIDE name(sdField(d)), '—';
+sdIndicator 'Показатель' = DATA StressIndicator (StressDetection) NONULL;
+nameSdIndicator 'Показатель' (StressDetection d) = OVERRIDE name(sdIndicator(d)), '—';
+sdDetectedAt 'Обнаружено' = DATA DATETIME (StressDetection);
+sdMeasured 'Измерено' = DATA NUMERIC[10,3] (StressDetection);   // NULL — бинарные случаи (SCOUT_ALERT)
+sdThreshold 'Порог (снимок)' = DATA NUMERIC[10,3] (StressDetection);
+sdStatus 'Статус' = DATA StressDetectionStatus (StressDetection) NONULL;
+nameSdStatus 'Статус' (StressDetection d) = staticCaption(sdStatus(d));
+sdHypothesis 'Гипотеза типа' = DATA StressType (StressDetection);
+nameSdHypothesis 'Гипотеза типа' (StressDetection d) = OVERRIDE stName(sdHypothesis(d)), '—';
+sdScout 'Наблюдение' = DATA ScoutObservation (StressDetection);   // КФ-С4: откуда детекция
+WHEN SET(StressDetection d IS StressDetection) DO sdDetectedAt(d) <- currentDateTime();
+nameSdScout 'Наблюдение' (StressDetection d) = OVERRIDE scAuthor(sdScout(d)), '—';
+epochDaysAgo (DATETIME dt) = FORMULA INTEGER '(extract(epoch from (now() - $1)) / 86400)::int';
+sdAgeDays 'Возраст, сут' (StressDetection d) =
+    IF sdDetectedAt(d) THEN epochDaysAgo(sdDetectedAt(d));
+// активная детекция (поле, показатель) — уникальность ЛОГИКОЙ (не GROUP AGGR):
+// история остаётся строками, активная — последняя по времени (quirks: GROUP LAST)
+activeDetectionOf (Field f, StressIndicator si) =
+    GROUP LAST StressDetection d ORDER sdDetectedAt(d), d
+        IF sdField(d) = f AND sdIndicator(d) = si AND sdStatus(d) = StressDetectionStatus.active;
+activeDetectionOfField (Field f) =
+    GROUP MAX 1 IF StressDetection d IS StressDetection AND sdField(d) = f
+        AND sdStatus(d) = StressDetectionStatus.active;
+
+// ядро upsert: обновляет активную детекцию или создаёт новую (+ событие шины
+// при создании; kuPublish первым — он содержит APPLY, LOCAL после него мёртв)
+upsertDetection (Field f, StressIndicator si, DOUBLE measured, DOUBLE threshold, StressType hypo) {
+    IF activeDetectionOf(f, si) THEN {
+        FOR StressDetection d IS StressDetection AND d = activeDetectionOf(f, si) DO {
+            sdMeasured(d) <- measured;
+            sdThreshold(d) <- threshold;
+            sdDetectedAt(d) <- currentDateTime();
+            IF hypo THEN sdHypothesis(d) <- hypo;
+        }
+    } ELSE {
+        kuPublish(KuEventKind.stressDetected, 'Field', (OVERRIDE name(f), '—'),
+            'Показатель: ' + (OVERRIDE name(si), '—') + '; измерено ' + ('' + measured)
+            + ' (порог ' + ('' + threshold) + ')'
+            + (IF hypo THEN '; гипотеза: ' + (OVERRIDE stName(hypo), '—') ELSE ''));
+        NEW d = StressDetection {
+            sdField(d) <- f;
+            sdIndicator(d) <- si;
+            sdMeasured(d) <- measured;
+            sdThreshold(d) <- threshold;
+            sdStatus(d) <- StressDetectionStatus.active;
+            IF hypo THEN sdHypothesis(d) <- hypo;
+        }
+    }
+    APPLY;
+}
+resolveDetection (Field f, StressIndicator si) {
+    FOR StressDetection d IS StressDetection AND d = activeDetectionOf(f, si) DO
+        sdStatus(d) <- StressDetectionStatus.resolved;
+    APPLY;
+}
+
+// stWater/stUnmodeled: именованные lookup типов (siStressType — в KuCrop:
+// оба класса справочников там, KuCrop не видит KuLand)
+stWater () = stressByName('Засуха');
+stUnmodeled () = stressByName('Немоделируемый фактор');
+
+
+// КФ-С3: регистр осадков (⚠-допущение ADR-6: факт = суточный прогноз OWM
+// предыдущего дня; идемпотентный upsert по (точка, дата) — двойного счёта нет)
+CLASS PrecipLog 'Журнал осадков';
+TABLE precipLog (PrecipLog);
+plLocation 'Точка' = DATA Location (PrecipLog) NONULL;
+plDate 'Дата' = DATA DATE (PrecipLog) NONULL;
+plMm 'Осадки, мм' = DATA NUMERIC[8,1] (PrecipLog);
+plByLocDate = GROUP AGGR PrecipLog pl BY plLocation(pl), plDate(pl);
+precip10Of (Location l) =
+    GROUP SUM plMm(PrecipLog p) IF plLocation(p) = l
+        AND plDate(p) > currentDate() - 10 AND plDate(p) <= currentDate();
+// окно критической фазы BBCH 30–75 (фенофаза поля — из активной симуляции)
+fieldPhaseInWindow (Field f) =
+    IF kuFieldPhase(f) THEN
+        toInteger(kuFieldPhase(f)) >= 30 AND toInteger(kuFieldPhase(f)) <= 75;
+runPrecipDetections () {
+    FOR Field f IS Field AND currentCrop(f) AND fieldPhaseInWindow(f) DO
+        NEWSESSION {
+            IF (OVERRIDE precip10Of(location(f)), 0.0) < cropPrecip10(currentCrop(f)) THEN
+                upsertDetection(f, siByCode('PRECIP10'), (OVERRIDE precip10Of(location(f)), 0.0),
+                    cropPrecip10(currentCrop(f)), OVERRIDE siStressType(siByCode('PRECIP10')), stWater());
+            ELSE
+                resolveDetection(f, siByCode('PRECIP10'));
+        }
+}
+
+// КФ-С4: скаутинг «стресс» → детекция SCOUT_ALERT (гипотеза из наблюдения,
+// без гипотезы — немоделируемый фактор)
+scStressType 'Гипотеза (тип стресса)' = DATA StressType (ScoutObservation);
+nameScStressType (ScoutObservation o) = OVERRIDE stName(scStressType(o)), '—';
+WHEN SET(ScoutObservation o IS ScoutObservation) AND scKind(o) = 'стресс' DO {
+    NEW d = StressDetection {
+        sdField(d) <- scField(o);
+        sdIndicator(d) <- siByCode('SCOUT_ALERT');
+        sdStatus(d) <- StressDetectionStatus.active;
+        sdHypothesis(d) <- OVERRIDE scStressType(o), stUnmodeled();
+        sdScout(d) <- o;
+    }
+    APPLY;
+}
+
+FORM stressDetection 'Детекция стресса'
+    OBJECTS d = StressDetection PANEL
+    PROPERTIES (d) nameSdField, nameSdIndicator, sdMeasured, sdThreshold, nameSdHypothesis, nameSdScout, sdDetectedAt, nameSdStatus
+    PROPERTIES (d) sdStatus
+    EDIT StressDetection OBJECT d
+;
+
+kuMapSelected 'Поле на карте (код)' = DATA ISTRING[20] ();
+kuMapTheme 'Тема карты (подсказка)' = DATA TEXT ();   // UI-106: стартовая тема раскраски
+// флаг «на поле активный стресс» — реализация в KuSimulation (отклонения NDVI;
+// граф REQUIRE нелинейный, общий хук — в общем предке, паттерн onKuStress)
+kuFieldStress (Field f) = ABSTRACT INTEGER;
+// КФ-9: сортовая генетика последнего утверждённого комплексного плана поля —
+// реализация в KuYield (сиблинги KuSimulation/KuYield друг друга не видят);
+// потребители — модель KuGDD (KuSimulation) и фиксация сорта результата
+kuFieldVariety (Field f) = ABSTRACT Variety;
+onKuStress 'Обработать выявленный стресс' (Field f, StressType st, ISTRING[20] sev) ABSTRACT;   // КФ-А4/А5
+// КФ-10: феностадия поля — последняя точка активного базового результата
+// (решение пользователя: без фильтра по дате); реализация в KuSimulation
+kuFieldGdd 'САТ сорта поля' (Field f) = ABSTRACT NUMERIC[10,1];
+kuFieldBiomassMax 'Биомасса сорта поля' (Field f) = ABSTRACT NUMERIC[8,2];
+// зоны дифференцированного внесения (JSON k-means) — реализация в KuYield
+kuFieldZones (Field f) = ABSTRACT TEXT;
+// статус участка поля (тема «По статусу договора»)
+namePlotStatusByField 'Статус участка' (Field f) =
+    GROUP MAX staticCaption(plotStatus(LandPlot p)) IF plot(FieldPlot fp) = p AND field[FieldPlot](fp) = f;
+
+// Секции снапшота карты: строка секции — свойство на объекте, свёртка —
+// GROUP CONCAT одного свойства (выражения он не принимает — урок 04.10).
+// п.4 обзора (2-я порция): видимость геометрических связей в попапах карты
+fieldPlotsList 'Участки поля (кадастровые, карта)' (Field f) = GROUP CONCAT cadastralNumber(plot[FieldPlot](fp)) IF field[FieldPlot](fp) = f, ', ' ORDER cadastralNumber(plot[FieldPlot](fp));
+kuFieldRow (Field f) = '~' + name(f)
+    + '^' + ('' + (OVERRIDE centerLon(f), 0))
+    + '^' + ('' + (OVERRIDE centerLat(f), 0))
+    + '^' + ('' + areaHa(f))
+    + '^' + (OVERRIDE nameCurrentCrop(f), '-')
+    + '^' + ('' + (OVERRIDE factYield(f), 0))
+    + '^' + ('' + (OVERRIDE planYield(f), 0))
+    + '^' + code(f)
+    + '^0'
+    + '^' + ('' + (OVERRIDE fertDoseN(f), 0))
+    + '^' + (OVERRIDE namePlotStatusByField(f), '-')
+    + '^' + ('' + (OVERRIDE kuFieldStress(f), 0))
+    + '^' + ('' + (OVERRIDE lastN(f), 0))
+    + '^' + ('' + (OVERRIDE lastPh(f), 0))
+    + '^' + ('' + (OVERRIDE lastP(f), 0))
+    + '^' + ('' + (OVERRIDE lastK(f), 0))
+    + '^' + ('' + (OVERRIDE lastHumus(f), 0))
+    + '^' + (OVERRIDE fieldPlotsList(f), '-');
+kuFleetDemoField (Field f) = code(f) = 'KH-001' OR code(f) = 'KH-003' OR code(f) = 'KH-005';
+kuFleetRow (Field f) = '~Комбайн-' + code(f)
+    + '^' + ('' + (OVERRIDE centerLon(f), 0))
+    + '^' + ('' + (OVERRIDE centerLat(f), 0))
+    + '^В работе^' + name(f)
+    + '^6.2^18.4^Прямое комбайнирование';
+kuGeomRow (Field f) = '||GEOM~' + code(f) + '^' + boundaryGeoJson(f);
+kuInfraRow (MapInfra mi) = '||INFRA~' + miName(mi)
+    + '^' + ('' + (OVERRIDE miLon(mi), 0)) + '^' + ('' + (OVERRIDE miLat(mi), 0))
+    + '^' + (OVERRIDE miNote(mi), '-');
+kuInfraPolyRow (MapInfra mi) = '||INFRAPOLY~' + miName(mi)
+    + '^' + miPolygon(mi) + '^' + (OVERRIDE miNote(mi), '-');
+kuZoneRow (Field f) = '||ZONES~' + code(f) + '^' + kuFieldZones(f);
+kuScoutRow (ScoutObservation o) = '||SCOUT~' + ('' + (OVERRIDE scLon(o), 0))
+    + '^' + ('' + (OVERRIDE scLat(o), 0))
+    + '^' + (OVERRIDE scKind(o), '-')
+    + '^' + (OVERRIDE code(scField(o)), '-')
+    + '^' + (OVERRIDE scAuthor(o), '-')
+    + '^' + (OVERRIDE scDescr(o), '-');
+
+// ФТ3.4: кадастровые участки на карте. Договор участка → раскраска по сроку.
+// Оба свойства — GROUP LAST по одному ORDER: при нескольких договорах участка
+// номер и срок берутся от одного и того же договора (а не от двух разных)
+plotContractTo 'Действует до (карта)' (LandPlot p) = GROUP LAST dateTo(LeaseContract c) IF plot(c) = p ORDER dateTo(c), c;
+plotContractNum 'Договор (карта)' (LandPlot p) = GROUP LAST number(LeaseContract c) IF plot(c) = p ORDER dateTo(c), c;
+plotContractDays 'Дней до окончания (карта)' (LandPlot p) =
+    IF plotContractTo(p) THEN plotContractTo(p) - currentDate();   // без договора — пусто (не «0 дней»)
+plotFieldCode 'Поле участка (код)' (LandPlot p) = GROUP MAX code(field[FieldPlot](fp)) IF plot[FieldPlot](fp) = p;
+// п.4 обзора (2-я порция): видимость геометрических связей в попапах карты
+plotFieldsList 'Поля участка (коды, карта)' (LandPlot p) = GROUP CONCAT code(field[FieldPlot](fp)) IF plot[FieldPlot](fp) = p, ',' ORDER code(field[FieldPlot](fp));
+kuPlotRow (LandPlot p) = '||PLOTS~' + cadastralNumber(p)
+    + '^' + polygonGeoJson(p)
+    + '^' + (OVERRIDE plotContractNum(p), '-')
+    + '^' + (OVERRIDE ('' + plotContractDays(p)), '—')
+    + '^' + (OVERRIDE plotFieldCode(p), '-')
+    + '^' + (OVERRIDE plotFieldsList(p), '-');
+
+// ФТ4.4.4: маршруты вывоза урожая (VRP). Решатель — knp-bridge (greedy-urgency
+// + NN + 2-opt), вызов GET-вариантом, ответ плоский: машина^поля,через-запятую^т^т^км^ч
+kuVrpRoutes 'Маршруты VRP (снапшот)' = DATA TEXT ();
+kuVrpBridgeUrl () = 'http://192.168.189.129:8090';   // мост на host-сети ВМ
+// демо-материал кнопки VRP карты (этап 1); промышленные лоты — из заданий
+kuVrpVol 'Лот к вывозу, т (демо)' (Field f) = CASE WHEN code(f) = 'KH-001' THEN 22.0 WHEN code(f) = 'KH-002' THEN 16.0 WHEN code(f) = 'KH-003' THEN 18.0 WHEN code(f) = 'KH-004' THEN 12.0 WHEN code(f) = 'KH-005' THEN 9.0 WHEN code(f) = 'KH-006' THEN 8.0 WHEN code(f) = 'KH-007' THEN 15.0 WHEN code(f) = 'KH-008' THEN 7.0 WHEN code(f) = 'KH-009' THEN 11.0 WHEN code(f) = 'KH-010' THEN 5.0 ELSE 10.0;
+kuVrpTau 'Срочность лота, ч (демо)' (Field f) = CASE WHEN kuFieldStress(f) THEN 8 ELSE 24;
+kuVrpDemandRow (Field f) = code(f)
+    + ':' + ('' + (OVERRIDE centerLat(f), 0))
+    + ':' + ('' + (OVERRIDE centerLon(f), 0))
+    + ':' + ('' + kuVrpVol(f))
+    + ':' + ('' + kuVrpTau(f));
+kuVrpDemands () = GROUP CONCAT kuVrpDemandRow(Field f)
+    IF organization(f) IS Organization AND areaHa(f), ',' ORDER code(f);
+
+// ФТ.GEO.7 (демо RLS): фильтр снапшота по организации; пусто = все организации.
+// (объявлены до секций: LSfusion требует объявление раньше использования)
+kuMapOrgFilter 'Организация карты (RLS-демо)' = DATA ISTRING[40] ();
+// Урок LSfusion (05.10, дорогой): и NULL, и пустая строка в булевом контексте
+// дают «не TRUE» — NOT x терял ВСЕ строки при несохранённом/пустом фильтре
+// (карта без полей после рестарта). Правильный предикат — сравнение с пустотой:
+kuMapOrgOk (Field f) = (OVERRIDE kuMapOrgFilter(), '') = '' OR name(organization(f)) = kuMapOrgFilter();
+kuMapOrgOkPlot (LandPlot p) = (OVERRIDE kuMapOrgFilter(), '') = '' OR name(organization(p)) = kuMapOrgFilter();
+
+// ===================== Флот и телеметрия (Волна 2: MITE-первичность) =====================
+// Машины флота — устройства контура MITE (Device + Location-«машина» +
+// GPS-измерения Measurement); позиции вычисляет платформа: latitude/longitude
+// (Device) MATERIALIZED из последнего измерения (Location.lsf). Демо-флит
+// «Комбайн-<код поля>» — фолбэк, пока устройств с привязкой к полям нет.
+// Требование ОАФ А.3.1.2/А.3.1.1: позиции и статусы техники на карте.
+
+kuDeviceField 'Поле (флот)' = DATA Field (Device);
+nameKuDeviceField 'Поле' (Device d) = OVERRIDE name(kuDeviceField(d)), '—';
+kuDeviceName 'Машина' (Device d) = OVERRIDE name(location(d)), 'Датчик ' + ('' + id(d));
+kuDeviceLastSeen 'Последняя телеметрия' (Device d) = dateTime(lastMeasurement(d));
+// свежесть = телеметрия за последний час; ZDATETIME с LONG-арифметикой не
+// сравнивается — через getMilliSeconds (LONG, Time.lsf)
+kuDeviceFresh 'Данные свежие' (Device d) =
+    getMilliSeconds(dateTime(lastMeasurement(d))) >= getMilliSeconds(currentZDateTime()) - 3600000;
+nameKuDeviceStatus 'Статус' (Device d) = IF kuDeviceFresh(d) THEN 'В работе' ELSE 'Нет данных';
+kuMapOrgOkDevice (Device d) = (OVERRIDE kuMapOrgFilter(), '') = ''
+    OR (kuDeviceField(d) IS Field AND name(organization(kuDeviceField(d))) = kuMapOrgFilter());
+
+kuFleetDeviceRow (Device d) = '~' + kuDeviceName(d)
+    + '^' + ('' + (OVERRIDE longitude(d), 0))
+    + '^' + ('' + (OVERRIDE latitude(d), 0))
+    + '^' + nameKuDeviceStatus(d)
+    + '^' + nameKuDeviceField(d)
+    + '^--^--^Телеметрия MITE';
+// в секцию — только машины флота (KU-FLK-*), привязанные к полям КУ: у
+// почвенных датчиков (KU-SOL-*) есть координаты Location — без фильтра по
+// коду они попадали бы во флот; датчики MITE на складах — тоже мимо
+kuMapFleetDeviceRows () = GROUP CONCAT kuFleetDeviceRow(Device d)
+    IF longitude(d) AND latitude(d) AND kuDeviceField(d) IS Field
+        AND code(location(d)) LIKE 'KU-FLK%' AND kuMapOrgOkDevice(d), '' ORDER id(d);
+
+// типы измерений контура MITE (по наименованиям; создаются сидом платформы)
+kuLatType () = GROUP MAX MeasurementType mt IF name(mt) = 'Широта';
+kuLonType () = GROUP MAX MeasurementType mt IF name(mt) = 'Долгота';
+kuTempType () = GROUP MAX MeasurementType mt IF name(mt) = 'Температура';
+kuHumType () = GROUP MAX MeasurementType mt IF name(mt) = 'Влажность';
+kuBatteryType () = GROUP MAX MeasurementType mt IF name(mt) = 'Батарея';
+
+// ранг поля по коду внутри организации (0 = первое): демо-флот — 2 машины/орг
+kuFieldRank (Field f) = OVERRIDE (GROUP SUM 1 IF Field x IS Field
+    AND organization(x) = organization(f) AND code(x) < code(f)), 0;
+
+// ===================== Датчики почвы (Волна 3: NPK + MITE) =====================
+// Живые запасы N/P/K и влажность/температура почвы — измерения контура MITE
+// у устройства-датчика поля (код локации KU-SOL-*). Совмещение с балансовым
+// методом KuYield: датчик свежее лаборатории — приоритет при пересчёте NPK,
+// эталоны демо не рвутся (датчик — только по кнопке генератора, KH-900 без него)
+
+kuSoilNType () = GROUP MAX MeasurementType mt IF name(mt) = 'Азот почвы';
+kuSoilPType () = GROUP MAX MeasurementType mt IF name(mt) = 'Фосфор почвы';
+kuSoilKType () = GROUP MAX MeasurementType mt IF name(mt) = 'Калий почвы';
+kuSoilSeed () {
+    IF NOT kuSoilNType() THEN NEW mt = MeasurementType { name(mt) <- 'Азот почвы'; id(mt) <- 906; }
+    IF NOT kuSoilPType() THEN NEW mt = MeasurementType { name(mt) <- 'Фосфор почвы'; id(mt) <- 907; }
+    IF NOT kuSoilKType() THEN NEW mt = MeasurementType { name(mt) <- 'Калий почвы'; id(mt) <- 908; }
+    APPLY;
+}
+kuSoilSensor 'Датчик почвы' (Field f) = GROUP MAX Device d
+    IF kuDeviceField(d) = f AND code(location(d)) LIKE 'KU-SOL%';
+kuSensorN 'Датчик N, мг/кг' (Field f) = lastValue(kuSoilSensor(f), kuSoilNType());
+kuSensorP 'Датчик P, мг/кг' (Field f) = lastValue(kuSoilSensor(f), kuSoilPType());
+kuSensorK 'Датчик K, мг/кг' (Field f) = lastValue(kuSoilSensor(f), kuSoilKType());
+kuSensorMoist 'Датчик: влажность почвы, %' (Field f) = lastValue(kuSoilSensor(f), kuHumType());
+// КФ-С2: автодетектор влажности почвы (датчик KU-SOL); порог культуры,
+// дефолт 15% (⚠-допущение ADR-6 — требует агронома); датчика нет — пропуск
+soilMoistLimit (Crop c) = OVERRIDE cslValueOf(c, 'SOIL_MOIST'), 15.0;
+runSoilMoistDetections () {
+    FOR Field f IS Field AND kuSoilSensor(f) DO
+        NEWSESSION {
+            IF kuSensorMoist(f) AND kuSensorMoist(f) < soilMoistLimit(currentCrop(f)) THEN
+                upsertDetection(f, siByCode('SOIL_MOIST'), kuSensorMoist(f), soilMoistLimit(currentCrop(f)),
+                    OVERRIDE siStressType(siByCode('SOIL_MOIST')), stWater());
+            ELSE
+                resolveDetection(f, siByCode('SOIL_MOIST'));
+        }
+}
+
+kuSensorTemp 'Датчик: t° почвы, °C' (Field f) = lastValue(kuSoilSensor(f), kuTempType());
+
+
+kuMapFieldsSec () = GROUP CONCAT kuFieldRow(Field f)
+    IF organization(f) IS Organization AND kuMapOrgOk(f), '' ORDER name(f);
+// Волна 2: реальные устройства MITE первичны; демо-флит «Комбайн-<поле>» —
+// фолбэк, пока нет устройств с GPS-позицией и привязкой к полю
+kuMapFleetRows () = OVERRIDE kuMapFleetDeviceRows(),
+    (GROUP CONCAT kuFleetRow(Field f)
+        IF organization(f) IS Organization AND kuMapOrgOk(f) AND kuFleetDemoField(f), '' ORDER code(f));
+kuMapGeomSec () = GROUP CONCAT kuGeomRow(Field f)
+    IF organization(f) IS Organization AND kuMapOrgOk(f) AND boundaryGeoJson(f), '' ORDER code(f);
+kuMapInfraSec () = GROUP CONCAT kuInfraRow(MapInfra mi) IF miLat(mi), '' ORDER miName(mi);
+kuMapInfraPolySec () = GROUP CONCAT kuInfraPolyRow(MapInfra mi) IF miPolygon(mi), '' ORDER miName(mi);
+// КФ-ГК5: контур участка из кадастрового справочника (CadastreCache),
+// когда свой полигон не заполнен — новые участки без SQL-миграции
+kuPlotCacheRow (LandPlot p) = '||PLOTS~' + cadastralNumber(p)
+    + '^' + (OVERRIDE ccPolygon(cadastreByNumber(cadastralNumber(p))), '')
+    + '^' + (OVERRIDE plotContractNum(p), '-')
+    + '^' + (OVERRIDE ('' + plotContractDays(p)), '—')
+    + '^' + (OVERRIDE plotFieldCode(p), '-')
+    + '^' + (OVERRIDE plotFieldsList(p), '-');
+// п.16 UI-обзора: нормы pH типа почвы поля — ОТДЕЛЬНОЙ секцией PHN
+// (строку полей не расширяем: единый GROUP CONCAT 17 колонок уже стоил
+// 36-минутного старта — только append-SET шагами)
+kuMapPhNormRow (Field f) = '||PHN~' + code(f)
+    + '^' + ('' + (OVERRIDE phNormMin(soilType(f)), 0))
+    + '^' + ('' + (OVERRIDE phNormMax(soilType(f)), 0));
+kuMapPhNormSec () = GROUP CONCAT kuMapPhNormRow(Field f)
+    IF organization(f) IS Organization AND kuMapOrgOk(f) AND phNormMin(soilType(f)) AND phNormMax(soilType(f)), '' ORDER code(f);
+kuMapPlotsSec () = OVERRIDE (GROUP CONCAT kuPlotRow(LandPlot p) IF polygonGeoJson(p) AND kuMapOrgOkPlot(p), '' ORDER cadastralNumber(p)),
+    (GROUP CONCAT kuPlotCacheRow(LandPlot p) IF NOT polygonGeoJson(p) AND ccPolygon(cadastreByNumber(cadastralNumber(p))) AND kuMapOrgOkPlot(p), '' ORDER cadastralNumber(p));
+
+kuMapZonesSec () = GROUP CONCAT kuZoneRow(Field f) IF kuFieldZones(f), '' ORDER code(f);
+kuMapScoutsSec () = GROUP CONCAT kuScoutRow(ScoutObservation o) IF scLat(o), '' ORDER scAt(o);
+kuMapSelSec () = IF kuMapSelected() THEN '||SEL~' + kuMapSelected() ELSE '';
+kuMapOrgRow (Organization o) = '~' + name(o);
+kuMapOrgsSec () = GROUP CONCAT kuMapOrgRow(Organization o)
+    IF (GROUP MAX Field fx IF organization(fx) = o) IS Field, '' ORDER name(o);
+kuMapThemeSec () = IF kuMapTheme() THEN '||THEME~' + kuMapTheme() ELSE '';
+kuMapRoutesSec () = IF kuVrpRoutes() THEN '||ROUTES' + kuVrpRoutes() ELSE '';
+// C2: погодный оверлей — осадки/температура на 7 дней по погодной точке
+kuMapWeatherRow (INTEGER dayOffset) =
+    '~W' + ('' + dayOffset)
+    + '^' + ('' + (OVERRIDE kuWfPrecipDay(kuSeasonLoc(), currentDate() + dayOffset), 0))
+    + '^' + ('' + (OVERRIDE kuWfTempDay(kuSeasonLoc(), currentDate() + dayOffset), 0));
+kuMapWeatherSec () = GROUP CONCAT kuMapWeatherRow(INTEGER d) IF d >= 0 AND d <= 6, '' ORDER d;
+// C2: GPS-треки машин (последние точки измерений устройства поля)
+kuMapTrackRow (Device d) =
+    '~T^' + (OVERRIDE code(kuDeviceField(d)), '-')
+    + '^' + ('' + (OVERRIDE longitude(d), 0))
+    + '^' + ('' + (OVERRIDE latitude(d), 0));
+kuMapTrackSec () = GROUP CONCAT kuMapTrackRow(Device d)
+    IF longitude(d) AND latitude(d) AND kuDeviceField(d) IS Field AND kuMapOrgOkDevice(d), '' ORDER id(d);
+
+refreshKuMap 'Обновить карту' () {
+    // императивный сбор по частям: один SET на все 13 секций после добавления
+    // WTHR/TRACK (11.10) разрастал дерево запроса — компиляция при старте
+    // падала с 4 до 36 минут ( quirks: сбор снапшотов малыми чанками)
+    kuMapData() <- (OVERRIDE kuMapFieldsSec(), '')
+        + '||FLEET' + (OVERRIDE kuMapFleetRows(), '')
+        + (OVERRIDE kuMapGeomSec(), '')
+        + (OVERRIDE kuMapInfraSec(), '')
+        + (OVERRIDE kuMapInfraPolySec(), '')
+        + (OVERRIDE kuMapPlotsSec(), '')
+        + (OVERRIDE kuMapZonesSec(), '');
+    kuMapData() <- (OVERRIDE kuMapData(), '')
+        + (OVERRIDE kuMapScoutsSec(), '')
+        + kuMapRoutesSec();
+    kuMapData() <- (OVERRIDE kuMapData(), '')
+        + '||WTHR' + (OVERRIDE kuMapWeatherSec(), '')
+        + '||TRACK' + (OVERRIDE kuMapTrackSec(), '');
+    kuMapData() <- (OVERRIDE kuMapData(), '')
+        + (OVERRIDE kuMapPhNormSec(), '');
+    kuMapData() <- (OVERRIDE kuMapData(), '')
+        + '||ORGS' + (OVERRIDE kuMapOrgsSec(), '')
+        + kuMapSelSec()
+        + kuMapThemeSec();
+    APPLY;
+}
+
+// генератор тестовых данных (решение пользователя 08.10): без железа —
+// машины создаются идемпотентно (Location KU-FLK-<поле> + Device 930001+),
+// повторный запуск пишет свежие GPS-измерения (дрейф ~200 м у центра поля)
+kuSimTelemetry 'Имитировать телеметрию' () {
+    kuJobStart('Имитация телеметрии');
+    // LOCAL: ссылка NEW l не живёт за скобками своего блока (урок externalDataSeed)
+    LOCAL loc = Location ();
+    FOR Field f IS Field AND organization(f) IS Organization AND centerLat(f)
+        AND kuFieldRank(f) <= 1
+        AND NOT locationByCode('KU-FLK-' + code(f))
+    DO {
+        NEW l = Location {
+            name(l) <- (IF kuFieldRank(f) = 0 THEN 'Комбайн К-' ELSE 'Трактор Т-') + code(f);
+            code(l) <- 'KU-FLK-' + code(f);
+            organization(l) <- organization(f);
+            latitude(l) <- centerLat(f);
+            longitude(l) <- centerLon(f);
+            loc() <- l;
+        }
+        // присвоения d — строго ВНУТРИ его блока: за скобками алиас d
+        // разрешается контекстно (наблюдались записи всем устройствам сразу)
+        NEW d = Device {
+            id(d) <- (OVERRIDE (GROUP MAX id(Device x) IF id(x) >= 930000 AND id(x) < 940000), 930000) + 1;
+            location(d) <- loc();
+            kuDeviceField(d) <- f;
+        }
+    }
+    APPLY;
+    // 1а) почвенные датчики (Волна 3): по одному на первое поле организации;
+    // значения — лаборатория последнего анализа ±10% (эталоны демо не рвём)
+    LOCAL sol = Location ();
+    FOR Field f IS Field AND organization(f) IS Organization AND centerLat(f)
+        AND (kuFieldRank(f) = 0 OR code(f) = 'KH-007')   // КФ-С2: KH-007 — демо-дефицит влаги
+        AND NOT locationByCode('KU-SOL-' + code(f))
+    DO {
+        NEW l = Location {
+            name(l) <- 'Датчик почвы П-' + code(f);
+            code(l) <- 'KU-SOL-' + code(f);
+            organization(l) <- organization(f);
+            latitude(l) <- centerLat(f);
+            longitude(l) <- centerLon(f);
+            sol() <- l;
+        }
+        NEW ds = Device {
+            id(ds) <- (OVERRIDE (GROUP MAX id(Device x) IF id(x) >= 940000 AND id(x) < 950000), 940000) + 1;
+            location(ds) <- sol();
+            kuDeviceField(ds) <- f;
+        }
+    }
+    APPLY;
+    // 2) свежие измерения: GPS — ТОЛЬКО машинам флота (почвенный датчик без
+    // GPS не попадает в FLEET-секцию карты), почве — N/P/K/влажность/t°
+    FOR Device d IS Device AND kuDeviceField(d) IS Field
+        AND code(location(d)) LIKE 'KU-FLK%'
+    DO
+        NEW m = Measurement {
+            device(m) <- d;
+            dateTime(m) <- currentZDateTime();
+            IF kuLatType() THEN value(m, kuLatType()) <- centerLat(kuDeviceField(d)) + (random() - 0.5) * 0.004;
+            IF kuLonType() THEN value(m, kuLonType()) <- centerLon(kuDeviceField(d)) + (random() - 0.5) * 0.004;
+            IF kuBatteryType() THEN value(m, kuBatteryType()) <- 55.0 + random() * 40.0;
+        }
+    FOR Device d IS Device AND kuDeviceField(d) IS Field
+        AND code(location(d)) LIKE 'KU-SOL%'
+    DO
+        NEW ms = Measurement {
+            device(ms) <- d;
+            dateTime(ms) <- currentZDateTime();
+            IF kuSoilNType() THEN value(ms, kuSoilNType()) <- (OVERRIDE lastN(kuDeviceField(d)), 20.0) * (0.95 + random() * 0.1);
+            IF kuSoilPType() THEN value(ms, kuSoilPType()) <- (OVERRIDE lastP(kuDeviceField(d)), 30.0) * (0.95 + random() * 0.1);
+            IF kuSoilKType() THEN value(ms, kuSoilKType()) <- (OVERRIDE lastK(kuDeviceField(d)), 200.0) * (0.95 + random() * 0.1);
+            // приёмка КФ-С2: у поля KH-007 датчик демонстрирует дефицит влаги
+            // (влажность 9–12% < порога 15%) — стресс-монитор без NDVI-причины
+            IF kuHumType() THEN value(ms, kuHumType()) <- IF code(kuDeviceField(d)) = 'KH-007' THEN 9.0 + random() * 3.0 ELSE 38.0 + random() * 16.0;
+            IF kuTempType() THEN value(ms, kuTempType()) <- 11.0 + random() * 6.0;
+        }
+    APPLY;
+    refreshKuMap();
+    kuJobFinish('Имитация телеметрии', 'Выполнено',
+        'Машин флота: ' + (OVERRIDE ('' + (GROUP SUM 1 IF Device d IS Device AND kuDeviceField(d) IS Field AND code(location(d)) LIKE 'KU-FLK%')), '0')
+        + '; датчиков почвы: ' + (OVERRIDE ('' + (GROUP SUM 1 IF Device d2 IS Device AND kuDeviceField(d2) IS Field AND code(location(d2)) LIKE 'KU-SOL%')), '0'));
+}
+
+setKuDeviceFieldAct 'Выбрать поле' (Device d) {
+    DIALOG pickField OBJECTS f = kuDeviceField(d) INPUT f NULL DO kuDeviceField(d) <- f;
+}
+
+FORM kuFleet 'Техника и телеметрия'   // п.17 UI-обзора: бывший «Флот и телеметрия»
+    OBJECTS d = Device
+    FILTERS kuDeviceField(d) IS Field
+    PROPERTIES (d) READONLY kuDeviceName, nameType, nameKuDeviceField, latitude, longitude, nameKuDeviceStatus, kuDeviceLastSeen
+    PROPERTIES (d) setKuDeviceFieldAct
+    PROPERTIES () kuSimTelemetry
+    ORDERS id(d)
+;
+
+
+// диагностика VRP-кнопки (п.6 обзора 12.10): след выполнения в БД
+vrpDebug = DATA TEXT ();
+// ФТ4.4.4: рассчитать маршруты вывоза через мост и показать на карте
+buildVrpRoutes 'Маршруты вывоза (VRP)' () {
+    LOCAL resp = TEXT ();
+    timeoutHttp() <- 15000;   // платформенный дефолт 30 мин — зависший мост не должен держать кнопку
+    vrpDebug() <- 'start';
+    // не-2xx и сетевые сбои EXTERNAL HTTP — runtime-исключение (TRY обязателен)
+    TRY {
+        // депо = Весы/МТМ машинного двора (совпадает с маркером на карте;
+        // прежние координаты 54.93,71.43 давали маршруты по 250+ км)
+        EXTERNAL HTTP GET kuVrpBridgeUrl() + '/api/v1/logistics/vrp/solve-get'
+            + '?depot=55.0679,73.4423'
+            + '&demands=' + (OVERRIDE kuVrpDemands(), '')
+            + '&vehicles=KAMAZ-1:30:40:true,KAMAZ-2:30:40:true,KAMAZ-3:25:40:false' TO resp;
+    } CATCH {
+        vrpDebug() <- 'catch: ' + (OVERRIDE messageCaughtException(), 'нет связи');
+        MESSAGE 'Мост VRP недоступен: ' + (OVERRIDE messageCaughtException(), 'нет связи') NOWAIT;
+    }
+    vrpDebug() <- vrpDebug() + '; after-http';
+    // п.16 UI-обзора: честная обратная связь — 200 с пустым телом не «тихо»;
+    // п.6 обзора 12.10: сообщение компактное, без сырого плоского ответа
+    IF resp() THEN {
+        vrpDebug() <- vrpDebug() + '; resp-ok';
+        LOCAL nVeh = INTEGER ();
+        // машин в плоском ответе = число '~' + 1; считаем ДО APPLY — LOCAL после APPLY мёртв
+        nVeh() <- (OVERRIDE (length(resp()) - length(replace(resp(), '~', ''))), 0) + 1;
+        kuVrpRoutes() <- resp();
+        APPLY;
+        MESSAGE 'Маршруты вывоза построены: машин в выпуске — ' + nVeh()
+            + '. Смотрите слой «Маршруты вывоза» на карте: пунктирные треки от депо с номерами визитов.' NOWAIT;
+    } ELSE {
+        vrpDebug() <- vrpDebug() + '; resp-empty';
+        MESSAGE 'Солвер VRP вернул пустой ответ — маршруты не построены (проверьте knp-bridge).' NOWAIT;
+    }
+    vrpDebug() <- vrpDebug() + '; done';
+    APPLY;
+    refreshKuMap();
+}
+
+
+// событие от клиента (клик по полю): запомнить + открыть карточку поля.
+// ON CHANGE — событие ФОРМЫ: срабатывает только от клиента (controller.change),
+// серверные присвоения в refreshKuMap рекурсии не дают (эталон: Agro.lsf onAgroEvent)
+kuMapClientEvent () {
+    INPUT j = JSON DO
+        IMPORT JSON FROM j FIELDS() STRING action, STRING objName, STRING kind, STRING descr DO {
+            IF action = 'select' AND objName THEN {
+                kuMapSelected() <- objName;
+                APPLY;   // фиксируем выбор: иначе останется в сессии формы
+                // снапшот с подсветкой СНАЧАЛА и с APPLY (refreshKuMap), карточка —
+                // ПОСЛЕ: SHOW раньше refresh заставлял форму наследовать «грязную»
+                // сессию с изменениями kuMapData → «Сохранить изменения?» при
+                // закрытии; «глотание» SHOW из rb30 имело тот же корень, что и
+                // неоткрывающиеся «Поле-*» (system__class NULL) — данные починены
+                refreshKuMap();
+                FOR Field f IS Field AND code(f) = objName DO SHOW fieldCard OBJECTS f = f;
+                IF NOT (GROUP MAX Field fx IS Field AND code(fx) = objName) THEN
+                    MESSAGE 'Поле с кодом ' + objName + ' не найдено.';
+            }
+            // ФТ3.4: клик по кадастровому участку → карточка участка
+            IF action = 'plot' AND objName THEN {
+                kuMapSelected() <- '';
+                APPLY;
+                refreshKuMap();
+                FOR LandPlot p IS LandPlot AND cadastralNumber(p) = objName DO SHOW landPlot OBJECTS p = p;
+                IF NOT (GROUP MAX LandPlot px IS LandPlot AND cadastralNumber(px) = objName) THEN
+                    MESSAGE 'Участок с кадастровым номером ' + objName + ' не найден.';
+            }
+            // ФТ.GEO.7: выбор организации (демо RLS-изоляции)
+            IF action = 'org' THEN {
+                kuMapOrgFilter() <- objName;
+                APPLY;
+                refreshKuMap();
+            }
+            // UI-801: фиксация наблюдения скаутинга (клик по карте в режиме «+»)
+            IF action = 'scoutadd' THEN {
+                NEW o = ScoutObservation {
+                    scKind(o) <- OVERRIDE kind, 'вредители';
+                    scDescr(o) <- OVERRIDE descr, '';
+                    // поле — строго внутри NEW-блока: ссылка на o снаружи
+                    // резолвится в «текущий объект» и переписывает ВСЕ записи (урок 05.10).
+                    // Координаты — центр поля: числовые поля через IMPORT JSON из
+                    // custom-компонента не доходят (GWT сериализует строками)
+                    IF objName THEN scField(o) <- fieldByCode(objName);
+                    IF objName THEN FOR Field f IS Field AND code(f) = objName DO {
+                        scLat(o) <- (OVERRIDE centerLat(f), 0);
+                        scLon(o) <- (OVERRIDE centerLon(f), 0);
+                    }
+                }
+                APPLY;
+                refreshKuMap();
+                MESSAGE 'Наблюдение зафиксировано: ' + (OVERRIDE kind, 'вредители')
+                    + ' (поле ' + (OVERRIDE objName, '—') + '). Маркер появился в слое «Наблюдения».' NOWAIT;
+            }
+        }
+}
+
+exportKuMapXls 'Выгрузить в Excel' () ABSTRACT;
+
+// закрытие карты (ТЗ ФТ.GEO: окно карты обязано закрываться; в навигаторе
+// вкладка без явной кнопки — добавляем действие поверх карты)
+closeKuMapAct 'Закрыть карту' () {
+    CLOSE FORM kuMap;
+}
+FORM kuMap 'Интерактивная карта'
+    PROPERTIES () kuMapData CUSTOM 'kumap' ON CHANGE kuMapClientEvent()
+    PROPERTIES () closeKuMapAct
+    PROPERTIES () refreshKuMap
+    PROPERTIES () buildVrpRoutes
+    PROPERTIES () exportKuMapXls
+;
+// пп.2/3 UI-обзора: подпись данных «Ku map data» убрана, кнопки формы —
+// одной строкой ПОД картой (по образцу kuFleet3d)
+DESIGN kuMap {
+    PROPERTY(kuMapData()) { caption = ''; }
+    NEW mapActions {
+        caption = '';
+        horizontal = TRUE;
+        MOVE PROPERTY(closeKuMapAct());
+        MOVE PROPERTY(refreshKuMap());
+        MOVE PROPERTY(buildVrpRoutes());
+        MOVE PROPERTY(exportKuMapXls());
+    }
+}
+
+showPlotOnMap 'Показать на карте' (LandPlot p) {
+    // подсветим связанное поле (связь 1:1 из сида)
+    kuMapSelected() <- (OVERRIDE (GROUP MAX code(field[FieldPlot](fp)) IF plot[FieldPlot](fp) = p), kuMapSelected());
+    refreshKuMap();
+    SHOW kuMap;
+}
+
+// UI-106: «Построить карту обеспеченности» — карта с агрохимической темой
+openSoilMap 'Карта обеспеченности (N)' () {
+    kuMapTheme() <- 'agroN';
+    refreshKuMap();
+    SHOW kuMap;
+}
+
+FORM soilAnalyses 'Агрохиманализы'
+    OBJECTS a = SoilAnalysis
+    PROPERTIES (a) READONLY analysisDate, nameField, n, p, k, ph, humus
+    PROPERTIES (a) NEWSESSION NEW, EDIT, DELETE
+    PROPERTIES () exportSoilAnalysesXls, openSoilMap
+    ORDERS analysisDate(a) DESC
+;
+// П.10: карточка анализа (была автоформа с числовым ИД)
+setAnalysisFieldAct 'Выбрать поле' (SoilAnalysis a) {
+    DIALOG pickField OBJECTS f = field(a) INPUT f NULL DO field(a) <- f;
+}
+FORM soilAnalysis 'Агрохиманализ'
+    OBJECTS a = SoilAnalysis PANEL
+    PROPERTIES (a) READONLY nameField
+    PROPERTIES (a) setAnalysisFieldAct SHOWIF NOT field(a)
+    PROPERTIES (a) analysisDate, n, p, k, ph, humus
+    EDIT SoilAnalysis OBJECT a
+;
+
+FORM scoutObservations 'Наблюдения (скаутинг)'
+    OBJECTS o = ScoutObservation
+    PROPERTIES (o) READONLY scAt, scNameField, scKind, scDescr, scAuthor
+    PROPERTIES (o) NEWSESSION NEW, EDIT, DELETE
+    ORDERS scAt(o) DESC
+;
+// П.12: карточка наблюдения (была автоформа с числовым ИД)
+setScoutFieldAct 'Выбрать поле' (ScoutObservation o) {
+    DIALOG pickField OBJECTS f = scField(o) INPUT f NULL DO scField(o) <- f;
+}
+FORM scoutObservation 'Наблюдение (скаутинг)'
+    OBJECTS o = ScoutObservation PANEL
+    PROPERTIES (o) READONLY scNameField
+    PROPERTIES (o) setScoutFieldAct SHOWIF NOT scField(o)
+    PROPERTIES (o) READONLY scAt
+    PROPERTIES (o) scKind, scLat, scLon, scDescr, scAuthor
+    PROPERTIES (o) scPhoto
+    EDIT ScoutObservation OBJECT o
+;
+
+// «Показать на карте» из реестра полей: выбор + подсветка + переход на карту
+showFieldOnMap 'Показать на карте' (Field f) {
+    kuMapSelected() <- code(f);
+    refreshKuMap();
+    SHOW kuMap;
+}
+
+// кнопки карты добавляются расширением: форма карты объявлена ниже
+// landPlot/fields, а EXTEND снимает цикл «форма ↔ действие» (паттерн Mite)
+EXTEND FORM landPlot
+    PROPERTIES (p) showPlotOnMap
+;
+EXTEND FORM fields
+    PROPERTIES (f) showFieldOnMap
+;
+
+exportKuMapXls () + {
+    PRINT fields XLSX SHEET 'Поля (карта)' TO exportFile;
+    open(exportFile());
+}
+
+// ===================== Excel-выгрузка реестров (UI-101) =====================
+exportLandPlotsXls () + {
+    PRINT landPlots XLSX SHEET 'Участки' TO exportFile;
+    open(exportFile());
+}
+
+exportLeaseContractsXls () + {
+    PRINT leaseContracts XLSX SHEET 'Договоры' TO exportFile;
+    open(exportFile());
+}
+
+exportFieldsXls () + {
+    PRINT fields XLSX SHEET 'Поля' TO exportFile;
+    open(exportFile());
+}
+
+// C1.3: GeoJSON-экспорт полей с контурами (GIS-совместимый формат)
+exportFieldsGeoJson 'Выгрузить GeoJSON (контуры полей)' () {
+    // собираем FeatureCollection из boundaryGeoJson полей
+    LOCAL json = TEXT ();
+    json() <- (OVERRIDE ('' + (GROUP SUM 1 IF Field fx IS Field AND boundaryGeoJson(fx))), '0');
+    // через REST apiMapGeoJson — канонический формат; кнопка открывает
+    open(exportFile());   // заглушка — реальная выгрузка через apiMapGeoJson REST
+    MESSAGE 'GeoJSON-выгрузка полей: REST /exec?action=Ku.apiMapGeoJson (все контуры). Прямая кнопка — этап 2 (Java-конвертер).';
+}
+
+exportSoilAnalysesXls () + {
+    PRINT soilAnalyses XLSX SHEET 'Агрохиманализы' TO exportFile;
+    open(exportFile());
+}
+
+// ===================== Сид (docs/03-logic-KuLand.md §6) =====================
+landSeed () {
+    // организация (своя, чтобы не зависеть от демо-MITE)
+    IF NOT (GROUP MAX Organization o IF name(o) = 'Омский АНЦ') THEN
+        NEW o = Organization { name(o) <- 'Омский АНЦ'; unn(o) <- '5503001927'; address(o) <- 'г. Омск, проспект Академика Королёва (СИБНИИСХОЗ)';
+            contact(o) <- 'Демо-стенд'; phone(o) <- '+7 (3812) 77-67-34'; site(o) <- 'https://anc55.ru'; email(o) <- 'office@anc55.ru'; }
+    APPLY;
+
+    // типы почв
+    IF NOT (GROUP MAX SoilType st) THEN {
+        NEW st = SoilType { name(st) <- 'Чернозём выщелоченный'; code(st) <- 'CH'; }
+        NEW st = SoilType { name(st) <- 'Дерново-подзолистая'; code(st) <- 'DP'; }
+        NEW st = SoilType { name(st) <- 'Каштановая'; code(st) <- 'KA'; }
+        APPLY;
+    }
+    // дозаполнение атрибутов почв (идемпотентно)
+    FOR SoilType st IS SoilType AND NOT densitySoil(st) DO {
+        granulometry(st) <- IF code(st) = 'CH' THEN Granulometry.midLoam
+            ELSE IF code(st) = 'DP' THEN Granulometry.lightLoam
+            ELSE Granulometry.heavyLoam;
+        densitySoil(st) <- IF code(st) = 'CH' THEN 1.20 ELSE IF code(st) = 'DP' THEN 1.35 ELSE 1.30;
+        humusNorm(st) <- IF code(st) = 'CH' THEN 6.5 ELSE IF code(st) = 'DP' THEN 2.5 ELSE 3.5;
+        phNormMin(st) <- IF code(st) = 'CH' THEN 5.6 ELSE IF code(st) = 'DP' THEN 4.5 ELSE 6.5;
+        phNormMax(st) <- IF code(st) = 'CH' THEN 7.0 ELSE IF code(st) = 'DP' THEN 6.0 ELSE 7.8;
+        APPLY;
+    }
+
+    // контрагенты: 2 юр + 4 физ
+    IF NOT (GROUP MAX Contractor x) THEN {
+        NEW x = Contractor { contractorKind(x) <- ContractorKind.company; inn(x) <- '2366654039'; fullName(x) <- 'ООО «АгроДон Земля»'; shortName(x) <- 'АгроДон'; ogrn(x) <- '1152366001234'; kpp(x) <- '236601001'; opf(x) <- 'ООО'; legalAddress(x) <- 'Ростовская обл., г. Азов'; }
+        NEW x = Contractor { contractorKind(x) <- ContractorKind.company; inn(x) <- '2354019876'; fullName(x) <- 'КФХ «Кубань-Агро»'; shortName(x) <- 'Кубань-Агро'; ogrn(x) <- '1072354005678'; kpp(x) <- '235401001'; opf(x) <- 'КФХ'; legalAddress(x) <- 'Краснодарский край, г. Кореновск'; }
+        NEW x = Contractor { contractorKind(x) <- ContractorKind.person; inn(x) <- '612304567890'; fullName(x) <- 'Иванов Пётр Сергеевич'; lastName(x) <- 'Иванов'; firstName(x) <- 'Пётр'; middleName(x) <- 'Сергеевич'; birthDate(x) <- 1975_03_12; citizenship(x) <- '643'; }
+        NEW x = Contractor { contractorKind(x) <- ContractorKind.person; inn(x) <- '612345678901'; fullName(x) <- 'Петренко Ольга Ивановна'; lastName(x) <- 'Петренко'; firstName(x) <- 'Ольга'; middleName(x) <- 'Ивановна'; birthDate(x) <- 1968_07_22; citizenship(x) <- '643'; }
+        NEW x = Contractor { contractorKind(x) <- ContractorKind.person; inn(x) <- '615678901234'; fullName(x) <- 'Сидоренко Виктор Михайлович'; lastName(x) <- 'Сидоренко'; firstName(x) <- 'Виктор'; middleName(x) <- 'Михайлович'; birthDate(x) <- 1980_11_05; citizenship(x) <- '643'; }
+        NEW x = Contractor { contractorKind(x) <- ContractorKind.entrepreneur; inn(x) <- '615601234567'; fullName(x) <- 'ИП Ковтун Андрей Леонидович'; lastName(x) <- 'Ковтун'; firstName(x) <- 'Андрей'; middleName(x) <- 'Леонидович'; birthDate(x) <- 1985_02_17; citizenship(x) <- '643'; }
+        APPLY;
+    }
+
+    // участки 1:1 с полями (10 шт.)
+    IF NOT (GROUP MAX LandPlot p) THEN {
+        NEW p = LandPlot { cadastralNumber(p) <- '23:34:010101:101'; name(p) <- 'Северное-1'; organization(p) <- kuOrg(); areaSqm(p) <- 1200000.0; }
+        NEW p = LandPlot { cadastralNumber(p) <- '23:34:010101:102'; name(p) <- 'Северное-2'; organization(p) <- kuOrg(); areaSqm(p) <- 850000.0; }
+        NEW p = LandPlot { cadastralNumber(p) <- '23:34:010101:103'; name(p) <- 'Южное-1'; organization(p) <- kuOrg(); areaSqm(p) <- 950000.0; }
+        NEW p = LandPlot { cadastralNumber(p) <- '23:34:010101:104'; name(p) <- 'Южное-2'; organization(p) <- kuOrg(); areaSqm(p) <- 700000.0; }
+        NEW p = LandPlot { cadastralNumber(p) <- '23:34:010101:105'; name(p) <- 'Заречное-1'; organization(p) <- kuOrg(); areaSqm(p) <- 550000.0; }
+        NEW p = LandPlot { cadastralNumber(p) <- '23:34:010101:106'; name(p) <- 'Заречное-2'; organization(p) <- kuOrg(); areaSqm(p) <- 430000.0; }
+        NEW p = LandPlot { cadastralNumber(p) <- '23:34:010101:107'; name(p) <- 'Луговое-1'; organization(p) <- kuOrg(); areaSqm(p) <- 600000.0; }
+        NEW p = LandPlot { cadastralNumber(p) <- '23:34:010101:108'; name(p) <- 'Луговое-2'; organization(p) <- kuOrg(); areaSqm(p) <- 380000.0; }
+        NEW p = LandPlot { cadastralNumber(p) <- '23:34:010101:109'; name(p) <- 'Приозёрное'; organization(p) <- kuOrg(); areaSqm(p) <- 480000.0; }
+        NEW p = LandPlot { cadastralNumber(p) <- '23:34:010101:110'; name(p) <- 'Балка-1'; organization(p) <- kuOrg(); areaSqm(p) <- 250000.0; }
+        APPLY;
+    }
+
+    // кадастровый справочник (КП07 шаг 3): локальный аналог сервиса ПКК
+    IF NOT (GROUP MAX CadastreCache c) THEN {
+        NEW c = CadastreCache { ccNumber(c) <- '23:34:010101:101'; ccAreaSqm(c) <- 1200400.0; ccSource(c) <- 'выписка ЕГРН (стенд)'; ccPolygon(c) <- '{"type":"Polygon","coordinates":[[[38.970,45.036],[38.982,45.036],[38.982,45.044],[38.970,45.044],[38.970,45.036]]]}'; }
+        NEW c = CadastreCache { ccNumber(c) <- '23:34:010101:102'; ccAreaSqm(c) <- 850300.0; ccSource(c) <- 'выписка ЕГРН (стенд)'; ccPolygon(c) <- '{"type":"Polygon","coordinates":[[[38.970,45.046],[38.978,45.046],[38.978,45.052],[38.970,45.052],[38.970,45.046]]]}'; }
+        NEW c = CadastreCache { ccNumber(c) <- '23:34:010101:103'; ccAreaSqm(c) <- 950200.0; ccSource(c) <- 'выписка ЕГРН (стенд)'; ccPolygon(c) <- '{"type":"Polygon","coordinates":[[[38.984,45.036],[38.994,45.036],[38.994,45.044],[38.984,45.044],[38.984,45.036]]]}'; }
+        NEW c = CadastreCache { ccNumber(c) <- '23:34:010101:104'; ccAreaSqm(c) <- 700100.0; ccSource(c) <- 'выписка ЕГРН (стенд)'; ccPolygon(c) <- '{"type":"Polygon","coordinates":[[[38.984,45.046],[38.992,45.046],[38.992,45.052],[38.984,45.052],[38.984,45.046]]]}'; }
+        NEW c = CadastreCache { ccNumber(c) <- '23:34:010101:105'; ccAreaSqm(c) <- 550800.0; ccSource(c) <- 'выписка ЕГРН (стенд)'; ccPolygon(c) <- '{"type":"Polygon","coordinates":[[[38.996,45.036],[39.004,45.036],[39.004,45.042],[38.996,45.042],[38.996,45.036]]]}'; }
+        NEW c = CadastreCache { ccNumber(c) <- '23:34:010101:106'; ccAreaSqm(c) <- 430400.0; ccSource(c) <- 'выписка ЕГРН (стенд)'; ccPolygon(c) <- '{"type":"Polygon","coordinates":[[[38.996,45.044],[39.002,45.044],[39.002,45.050],[38.996,45.050],[38.996,45.044]]]}'; }
+        NEW c = CadastreCache { ccNumber(c) <- '23:34:010101:107'; ccAreaSqm(c) <- 600600.0; ccSource(c) <- 'выписка ЕГРН (стенд)'; ccPolygon(c) <- '{"type":"Polygon","coordinates":[[[39.006,45.036],[39.014,45.036],[39.014,45.042],[39.006,45.042],[39.006,45.036]]]}'; }
+        NEW c = CadastreCache { ccNumber(c) <- '23:34:010101:108'; ccAreaSqm(c) <- 380200.0; ccSource(c) <- 'выписка ЕГРН (стенд)'; ccPolygon(c) <- '{"type":"Polygon","coordinates":[[[39.006,45.044],[39.012,45.044],[39.012,45.049],[39.006,45.049],[39.006,45.044]]]}'; }
+        NEW c = CadastreCache { ccNumber(c) <- '23:34:010101:109'; ccAreaSqm(c) <- 480500.0; ccSource(c) <- 'выписка ЕГРН (стенд)'; ccPolygon(c) <- '{"type":"Polygon","coordinates":[[[39.016,45.036],[39.024,45.036],[39.024,45.041],[39.016,45.041],[39.016,45.036]]]}'; }
+        NEW c = CadastreCache { ccNumber(c) <- '23:34:010101:110'; ccAreaSqm(c) <- 250900.0; ccSource(c) <- 'выписка ЕГРН (стенд)'; ccPolygon(c) <- '{"type":"Polygon","coordinates":[[[39.016,45.044],[39.022,45.044],[39.022,45.048],[39.016,45.048],[39.016,45.044]]]}'; }
+        APPLY;
+    }
+
+    // поля
+    IF NOT (GROUP MAX Field f) THEN {
+        // координаты — картография-эталон KNP (хозяйство под Петропавловском,
+        // СКО; полигоны KH-001..006 и инфраструктура — sql/cartography.sql,
+        // KH-007..010 — сгенерированные контуры SW-кластера, все поля без пересечений)
+        NEW f = Field { code(f) <- 'KH-001'; name(f) <- 'Северное-1'; organization(f) <- kuOrg(); areaHa(f) <- 120.0; soilType(f) <- chernozem(); centerLat(f) <- 55.055482; centerLon(f) <- 73.388421; bonitet(f) <- 88; landClass(f) <- LandClass.c1; }
+        NEW f = Field { code(f) <- 'KH-002'; name(f) <- 'Северное-2'; organization(f) <- kuOrg(); areaHa(f) <- 85.0; soilType(f) <- chernozem(); centerLat(f) <- 55.060124; centerLon(f) <- 73.405129; bonitet(f) <- 84; landClass(f) <- LandClass.c2; }
+        NEW f = Field { code(f) <- 'KH-003'; name(f) <- 'Южное-1'; organization(f) <- kuOrg(); areaHa(f) <- 95.0; soilType(f) <- chernozem(); centerLat(f) <- 55.069946; centerLon(f) <- 73.432211; bonitet(f) <- 82; landClass(f) <- LandClass.c2; }
+        NEW f = Field { code(f) <- 'KH-004'; name(f) <- 'Южное-2'; organization(f) <- kuOrg(); areaHa(f) <- 70.0; soilType(f) <- chernozem(); centerLat(f) <- 55.085049; centerLon(f) <- 73.44276; bonitet(f) <- 79; landClass(f) <- LandClass.c2; }
+        NEW f = Field { code(f) <- 'KH-005'; name(f) <- 'Заречное-1'; organization(f) <- kuOrg(); areaHa(f) <- 55.0; soilType(f) <- chernozem(); centerLat(f) <- 55.053143; centerLon(f) <- 73.464415; bonitet(f) <- 75; landClass(f) <- LandClass.c2; }
+        NEW f = Field { code(f) <- 'KH-006'; name(f) <- 'Заречное-2'; organization(f) <- kuOrg(); areaHa(f) <- 43.0; soilType(f) <- chernozem(); centerLat(f) <- 55.059997; centerLon(f) <- 73.46919; bonitet(f) <- 71; landClass(f) <- LandClass.c3; }
+        NEW f = Field { code(f) <- 'KH-007'; name(f) <- 'Луговое-1'; organization(f) <- kuOrg(); areaHa(f) <- 60.0; soilType(f) <- dernovo(); centerLat(f) <- 55.065408; centerLon(f) <- 73.453424; bonitet(f) <- 64; landClass(f) <- LandClass.c3; }
+        NEW f = Field { code(f) <- 'KH-008'; name(f) <- 'Луговое-2'; organization(f) <- kuOrg(); areaHa(f) <- 38.0; soilType(f) <- dernovo(); centerLat(f) <- 55.072172; centerLon(f) <- 73.456728; bonitet(f) <- 60; landClass(f) <- LandClass.c3; }
+        NEW f = Field { code(f) <- 'KH-009'; name(f) <- 'Приозёрное'; organization(f) <- kuOrg(); areaHa(f) <- 48.0; soilType(f) <- kastanovaya(); centerLat(f) <- 55.072; centerLon(f) <- 73.388675; bonitet(f) <- 58; landClass(f) <- LandClass.c3; }
+        NEW f = Field { code(f) <- 'KH-010'; name(f) <- 'Балка-1'; organization(f) <- kuOrg(); areaHa(f) <- 25.0; soilType(f) <- kastanovaya(); centerLat(f) <- 55.066067; centerLon(f) <- 73.380005; bonitet(f) <- 52; landClass(f) <- LandClass.c4; }
+        APPLY;
+    }
+
+    // ФТ.GEO.7 (демо RLS): вторая организация с двумя полями —
+    // селектор «Организация» на карте показывает изоляцию данных
+    IF NOT (GROUP MAX Organization o IF name(o) = 'Агро-Север (демо RLS)') THEN
+        TRY NEW o = Organization {
+            name(o) <- 'Агро-Север (демо RLS)';
+            unn(o) <- '290196543';
+            address(o) <- 'СКО, экспериментальная зона';
+            contact(o) <- 'Демо-стенд';
+            phone(o) <- '+7 (000) 000-00-00';
+            site(o) <- 'https://demo.local';
+            email(o) <- 'north@demo.local';
+        } CATCH;
+    APPLY;
+    IF kuOrgNorth() AND NOT (GROUP MAX Field f IF code(f) = 'KH-101') THEN {
+        NEW f = Field { code(f) <- 'KH-101'; name(f) <- 'Север-экспериментальное'; organization(f) <- kuOrgNorth(); areaHa(f) <- 65.0; centerLat(f) <- 55.061215; centerLon(f) <- 73.362981; soilType(f) <- chernozem(); bonitet(f) <- 80; landClass(f) <- LandClass.c2; }
+        NEW f = Field { code(f) <- 'KH-102'; name(f) <- 'Север-опытное'; organization(f) <- kuOrgNorth(); areaHa(f) <- 48.0; centerLat(f) <- 55.056685; centerLon(f) <- 73.370117; soilType(f) <- chernozem(); bonitet(f) <- 77; landClass(f) <- LandClass.c2; }
+        APPLY;
+    }
+
+    // пересборка карты
+    refreshKuMap();
+
+    // бэкфилл аудита (п. обзора 12.10(3-я порция)): записи, созданные до
+    // введения «Изменено», получают created=plotUpdated=сейчас — идемпотентно
+    IF (GROUP MAX 1 IF LandPlot lp IS LandPlot AND NOT created(lp)) THEN
+        FOR LandPlot lp IS LandPlot AND NOT created(lp) DO {
+            created(lp) <- currentDateTime();
+            plotUpdated(lp) <- created(lp);
+        }
+
+    // связь поле↔участок по ГЕОМЕТРИИ (п.3 обзора 12.10): контур поля пересекается
+    // с контуром участка → поле в его составе; NEWSESSION на итерацию (quirks)
+    IF NOT (GROUP MAX FieldPlot fp) THEN
+        FOR LandPlot p IS LandPlot DO
+            NEWSESSION relinkFieldPlotsAct(p);
+    APPLY;
+
+    // агрохиманализы на все поля: значения по убыванию плодородия почв
+    // (чернозёмы Северного → каштановые Лугового/Балки) + история для 2 полей
+    IF NOT (GROUP MAX SoilAnalysis a) THEN {
+        FOR Field f IS Field DO NEW a = SoilAnalysis {
+            field(a) <- f;
+            analysisDate(a) <- 2026_04_15;
+            n(a) <- CASE WHEN code(f) = 'KH-001' THEN 28.0 WHEN code(f) = 'KH-002' THEN 25.0 WHEN code(f) = 'KH-003' THEN 31.0 WHEN code(f) = 'KH-004' THEN 18.0 WHEN code(f) = 'KH-005' THEN 27.0 WHEN code(f) = 'KH-006' THEN 23.0 WHEN code(f) = 'KH-007' THEN 20.0 WHEN code(f) = 'KH-008' THEN 16.0 WHEN code(f) = 'KH-009' THEN 22.0 WHEN code(f) = 'KH-010' THEN 14.0 ELSE 24.0;
+            p(a) <- CASE WHEN code(f) = 'KH-001' THEN 34.0 WHEN code(f) = 'KH-002' THEN 30.0 WHEN code(f) = 'KH-003' THEN 38.0 WHEN code(f) = 'KH-004' THEN 22.0 WHEN code(f) = 'KH-005' THEN 33.0 WHEN code(f) = 'KH-006' THEN 29.0 WHEN code(f) = 'KH-007' THEN 26.0 WHEN code(f) = 'KH-008' THEN 20.0 WHEN code(f) = 'KH-009' THEN 27.0 WHEN code(f) = 'KH-010' THEN 18.0 ELSE 32.0;
+            k(a) <- CASE WHEN code(f) = 'KH-001' THEN 210.0 WHEN code(f) = 'KH-002' THEN 195.0 WHEN code(f) = 'KH-003' THEN 240.0 WHEN code(f) = 'KH-004' THEN 160.0 WHEN code(f) = 'KH-005' THEN 205.0 WHEN code(f) = 'KH-006' THEN 185.0 WHEN code(f) = 'KH-007' THEN 175.0 WHEN code(f) = 'KH-008' THEN 150.0 WHEN code(f) = 'KH-009' THEN 180.0 WHEN code(f) = 'KH-010' THEN 140.0 ELSE 205.0;
+            ph(a) <- CASE WHEN code(f) = 'KH-001' THEN 6.4 WHEN code(f) = 'KH-002' THEN 6.2 WHEN code(f) = 'KH-003' THEN 7.0 WHEN code(f) = 'KH-004' THEN 5.8 WHEN code(f) = 'KH-005' THEN 6.5 WHEN code(f) = 'KH-006' THEN 6.1 WHEN code(f) = 'KH-007' THEN 5.9 WHEN code(f) = 'KH-008' THEN 5.6 WHEN code(f) = 'KH-009' THEN 6.0 WHEN code(f) = 'KH-010' THEN 5.5 ELSE 6.2;
+            humus(a) <- CASE WHEN code(f) = 'KH-001' THEN 6 WHEN code(f) = 'KH-002' THEN 5 WHEN code(f) = 'KH-003' THEN 6 WHEN code(f) = 'KH-004' THEN 4 WHEN code(f) = 'KH-005' THEN 5 WHEN code(f) = 'KH-006' THEN 5 WHEN code(f) = 'KH-007' THEN 4 WHEN code(f) = 'KH-008' THEN 4 WHEN code(f) = 'KH-009' THEN 5 WHEN code(f) = 'KH-010' THEN 3 ELSE 5;
+        }
+        NEW a = SoilAnalysis { field(a) <- fieldByCode('KH-001'); analysisDate(a) <- 2024_09_20; n(a) <- 22.0; p(a) <- 28.0; k(a) <- 190.0; ph(a) <- 6.0; humus(a) <- 5; }
+        NEW a = SoilAnalysis { field(a) <- fieldByCode('KH-003'); analysisDate(a) <- 2023_10_05; n(a) <- 26.0; p(a) <- 33.0; k(a) <- 215.0; ph(a) <- 6.8; humus(a) <- 5; }
+    }
+    APPLY;
+
+    // наблюдения скаутинга (UI-801): 4 демо-точки на полях
+    IF NOT (GROUP MAX ScoutObservation o) THEN {
+        NEW o = ScoutObservation { scField(o) <- fieldByCode('KH-003'); scLat(o) <- 54.9335; scLon(o) <- 71.4200; scKind(o) <- 'вредители'; scDescr(o) <- 'Очаги тли на краевых полосах, поражено 5-7% растений'; }
+        NEW o = ScoutObservation { scField(o) <- fieldByCode('KH-007'); scLat(o) <- 54.8958; scLon(o) <- 71.3452; scKind(o) <- 'стресс'; scDescr(o) <- 'Визуальное увядание на юго-западном склоне, требуется проверка влажности почвы'; }
+        NEW o = ScoutObservation { scField(o) <- fieldByCode('KH-001'); scLat(o) <- 54.9371; scLon(o) <- 71.4218; scKind(o) <- 'фаза развития'; scDescr(o) <- 'Колошение, равномерность 90%'; }
+        NEW o = ScoutObservation { scField(o) <- fieldByCode('KH-005'); scLat(o) <- 54.9385; scLon(o) <- 71.4012; scKind(o) <- 'болезни'; scDescr(o) <- 'Единичные пятна ржавчины, ниже порога обработки'; }
+        APPLY;
+    }
+    // пересборка снапшота: наблюдения создаются позже первого refreshKuMap
+    refreshKuMap();
+
+    // договоры: 5 шт., в т.ч. истекающий и с просрочкой
+    IF NOT (GROUP MAX LeaseContract c) THEN {
+        NEW c = LeaseContract { number(c) <- 'АР-2023-001'; signDate(c) <- 2023_11_10; organization(c) <- kuOrg();
+            tenant(c) <- contractorByInn('2366654039'); landlord(c) <- contractorByInn('612304567890'); plot(c) <- plotByCadastral('23:34:010101:101');
+            dateFrom(c) <- 2024_01_01; dateTo(c) <- currentDate() + 30; rentAmount(c) <- 1800000.0; periodicity(c) <- PaymentPeriodicity.yearly;
+            paymentDay(c) <- 1; paymentMethod(c) <- PaymentMethod.cashless; indexation(c) <- IndexationKind.cpi; }
+        NEW c = LeaseContract { number(c) <- 'АР-2023-002'; signDate(c) <- 2023_11_15; organization(c) <- kuOrg();
+            tenant(c) <- contractorByInn('2366654039'); landlord(c) <- contractorByInn('612345678901'); plot(c) <- plotByCadastral('23:34:010101:102');
+            dateFrom(c) <- 2024_01_01; dateTo(c) <- 2028_12_31; rentAmount(c) <- 1280000.0; periodicity(c) <- PaymentPeriodicity.yearly;
+            paymentDay(c) <- 16; paymentMethod(c) <- PaymentMethod.cashless; indexation(c) <- IndexationKind.cpi; }
+        NEW c = LeaseContract { number(c) <- 'АР-2024-003'; signDate(c) <- 2024_01_20; organization(c) <- kuOrg();
+            tenant(c) <- contractorByInn('2354019876'); landlord(c) <- contractorByInn('615678901234'); plot(c) <- plotByCadastral('23:34:010101:103');
+            dateFrom(c) <- 2024_02_01; dateTo(c) <- 2029_01_31; rentAmount(c) <- 1420000.0; periodicity(c) <- PaymentPeriodicity.yearly;
+            paymentDay(c) <- 15; paymentMethod(c) <- PaymentMethod.cashless; indexation(c) <- IndexationKind.cpi; }
+        NEW c = LeaseContract { number(c) <- 'АР-2024-004'; signDate(c) <- 2024_02_05; organization(c) <- kuOrg();
+            tenant(c) <- contractorByInn('2354019876'); landlord(c) <- contractorByInn('615601234567'); plot(c) <- plotByCadastral('23:34:010101:104');
+            dateFrom(c) <- 2024_02_01; dateTo(c) <- 2027_06_30; rentAmount(c) <- 1050000.0; periodicity(c) <- PaymentPeriodicity.yearly;
+            paymentDay(c) <- 20; paymentMethod(c) <- PaymentMethod.cashless; indexation(c) <- IndexationKind.cpi; }
+        NEW c = LeaseContract { number(c) <- 'АР-2021-005'; signDate(c) <- 2021_03_01; organization(c) <- kuOrg();
+            tenant(c) <- contractorByInn('2366654039'); landlord(c) <- contractorByInn('612304567890'); plot(c) <- plotByCadastral('23:34:010101:105');
+            dateFrom(c) <- 2021_03_01; dateTo(c) <- 2023_12_31; rentAmount(c) <- 825000.0; periodicity(c) <- PaymentPeriodicity.yearly;
+            paymentDay(c) <- 1; paymentMethod(c) <- PaymentMethod.cashless; indexation(c) <- IndexationKind.cpi; }
+        APPLY;
+    }
+
+    // дозаправка статусов (WHEN SET в NEW-блоке затирает присвоения draft'ом —
+    // поэтому статусы выставляем отдельным идемпотентным проходом по номерам)
+    FOR LeaseContract c IS LeaseContract AND number(c) = 'АР-2021-005' DO
+        contractStatus(c) <- LeaseContractStatus.expired;
+    FOR LeaseContract c IS LeaseContract AND (number(c) = 'АР-2023-001' OR number(c) = 'АР-2023-002' OR number(c) = 'АР-2024-003' OR number(c) = 'АР-2024-004') DO
+        contractStatus(c) <- LeaseContractStatus.active;
+    FOR LandPlot p IS LandPlot AND (cadastralNumber(p) >= '23:34:010101:101' AND cadastralNumber(p) <= '23:34:010101:104') DO
+        plotStatus(p) <- PlotStatus.leased;
+    APPLY;
+
+    // уведомления по договорам
+    IF NOT (GROUP MAX LeaseNotification n) THEN
+        FOR LeaseContract c IS LeaseContract AND contractStatus(c) = LeaseContractStatus.active DO {
+            NEW n = LeaseNotification { contract(n) <- c; notifyKind(n) <- LeaseNotifyKind.rent; daysBefore(n) <- 14; channel(n) <- 'system'; enabled(n) <- TRUE; }
+            NEW n = LeaseNotification { contract(n) <- c; notifyKind(n) <- LeaseNotifyKind.expiry; daysBefore(n) <- 90; channel(n) <- 'все'; enabled(n) <- TRUE; }   // КФ-З23: 90 дней, канал «все»
+        }
+    APPLY;
+
+    // взаиморасчёсы: начисления + частичные оплаты (демо-состояния)
+    IF NOT (GROUP MAX LeaseEntry e) THEN {
+        FOR LeaseContract c IS LeaseContract AND number(c) = 'АР-2023-001' DO {
+            NEW e = LeaseEntry { contract(e) <- c; contractor(e) <- tenant(c); entryOrganization(e) <- organization(c); entryKind(e) <- LeaseEntryKind.obligation; amount(e) <- 1800000.0; entryDate(e) <- 2026_01_15; sourceDoc(e) <- 'сид-начисление'; }
+            NEW e = LeaseEntry { contract(e) <- c; contractor(e) <- tenant(c); entryOrganization(e) <- organization(c); entryKind(e) <- LeaseEntryKind.payment; amount(e) <- 900000.0; entryDate(e) <- 2026_02_10; sourceDoc(e) <- 'сид-оплата'; }
+        }
+        FOR LeaseContract c IS LeaseContract AND number(c) = 'АР-2023-002' DO {
+            NEW e = LeaseEntry { contract(e) <- c; contractor(e) <- tenant(c); entryOrganization(e) <- organization(c); entryKind(e) <- LeaseEntryKind.obligation; amount(e) <- 1280000.0; entryDate(e) <- 2026_01_15; sourceDoc(e) <- 'сид-начисление'; }
+            NEW e = LeaseEntry { contract(e) <- c; contractor(e) <- tenant(c); entryOrganization(e) <- organization(c); entryKind(e) <- LeaseEntryKind.payment; amount(e) <- 400000.0; entryDate(e) <- 2026_01_20; sourceDoc(e) <- 'сид-оплата'; }
+        }
+        FOR LeaseContract c IS LeaseContract AND number(c) = 'АР-2024-003' DO {
+            NEW e = LeaseEntry { contract(e) <- c; contractor(e) <- tenant(c); entryOrganization(e) <- organization(c); entryKind(e) <- LeaseEntryKind.obligation; amount(e) <- 1420000.0; entryDate(e) <- 2026_01_15; sourceDoc(e) <- 'сид-начисление'; }
+            NEW e = LeaseEntry { contract(e) <- c; contractor(e) <- tenant(c); entryOrganization(e) <- organization(c); entryKind(e) <- LeaseEntryKind.payment; amount(e) <- 1420000.0; entryDate(e) <- 2026_02_01; sourceDoc(e) <- 'сид-оплата'; }
+        }
+        APPLY;
+    }
+}
+
+// ===================== Хаб-навигация (маршрут А спеки) =====================
+showContractOnMap 'Показать на карте' (LeaseContract c) {
+    kuMapSelected() <- (OVERRIDE (GROUP MAX code(field[FieldPlot](fp)) IF plot[FieldPlot](fp) = plot(c)), '');
+    refreshKuMap();
+    SHOW kuMap;
+}
+// мини-карта в карточке участка (UI-102): read-only контур, компонент kuminimap
+plotMapData 'Мини-карта (контур участка)' (LandPlot p) = OVERRIDE polygonGeoJson(p), '';
+
+EXTEND FORM landPlots
+    PROPERTIES (p) showPlotOnMap
+;
+EXTEND FORM leaseContracts
+    PROPERTIES (c) showContractOnMap
+;
+EXTEND FORM landPlot
+    PROPERTIES (p) plotMapData CUSTOM 'kuminimap'
+;
+
+// горячие фильтры взаиморасчётов/агрохимии/договоров (GROUP SUM по растущим
+// таблицам); в конце модуля — после объявления индексируемых свойств
+INDEX contract(LeaseEntry e);
+INDEX field(SoilAnalysis a);
+INDEX plot(LeaseContract c);
+INDEX sheet(PaymentSheetItem i);
+
+// ===================== История поля: форма и кнопки (КФ-И2) =====================
+// сессионный выбор поля (паттерн rulesHost): заголовок + пикер
+histHost 'Поле истории (сессия)' = DATA Field ();
+histHostName 'Поле' () = OVERRIDE name(histHost()), '— выберите поле —';
+setHistHostAct 'Выбрать поле…' () {
+    DIALOG pickField OBJECTS f = histHost() INPUT f NULL DO histHost() <- f;
+}
+FORM fieldHistory 'История поля'
+    PROPERTIES () histHostName, setHistHostAct
+    OBJECTS s = FieldSeason
+    PROPERTIES (s) READONLY fsYear, nameFsPlanCrop, nameFsFactCrop, fsPlanYieldC, fsFactYieldC, fsDeviationMark, fsReason, fsSrc
+    FILTERS fsField(s) = histHost()
+    ORDERS fsYear(s) DESC
+;
+openFieldHistoryAct 'История поля…' (Field f) {
+    histHost() <- f;
+    SHOW fieldHistory;
+}
+EXTEND FORM fieldCard
+    PROPERTIES (f) openFieldHistoryAct, rebuildFieldHistory
+    // п.4 обзора (4-я порция): связанные участки поля (зеркально карточке участка)
+    PROPERTIES (f) READONLY fieldPlotsList
+;
+EXTEND FORM fields
+    PROPERTIES (f) openFieldHistoryAct
+;

@@ -1,0 +1,388 @@
+MODULE KuHerd;
+
+// Код Урожая: животноводческий контур этапа 1 (решение пользователя
+// 09–10.10): групповой справочно-отчётный учёт — стада, продуктивность,
+// ветмероприятия, кормление; отчёты продуктивности/кормления и здоровья.
+// Элементный учёт (особи), ФУС, SCADA, животноводческий БДР — этап 2
+// (спека, раздел «Животноводческий контур», spec-work 10.10).
+REQUIRE KuCrop, KuLand, KuBudget;
+
+NAMESPACE Ku;
+
+// ===================== Ж1: справочник «Стадо» =====================
+CLASS HerdKind 'Вид животных' {
+    dairyCattle 'КРС молочный', beefCattle 'КРС мясной', pigs 'Свиньи', sheep 'Овцы', poultry 'Птица'
+}
+CLASS Herd 'Стадо (группа животных)';
+TABLE herd (Herd);
+herdCode 'Код' = DATA ISTRING[20] (Herd) NONULL IN id;
+herdName 'Наименование' = DATA ISTRING[60] (Herd);
+herdKind 'Вид' = DATA HerdKind (Herd) NONULL;
+nameHerdKind 'Вид' (Herd h) = staticCaption(herdKind(h));
+herdAgeGroup 'Половозрастная группа' = DATA ISTRING[60] (Herd);
+herdCount 'Численность, голов' = DATA INTEGER (Herd) NONULL;
+herdOrg 'Организация' = DATA Organization (Herd) NONULL;
+nameHerdOrg 'Организация' (Herd h) = OVERRIDE name(herdOrg(h)), '';
+herdLocation 'Ферма (точка размещения)' = DATA Location (Herd);
+nameHerdLocation 'Ферма' (Herd h) = OVERRIDE name(herdLocation(h)), '';
+CONSTRAINT Herd h IS Herd AND herdCount(h) <= 0 CHECKED BY herdCount MESSAGE 'Численность стада — положительное число';
+feedGroup () = GROUP MAX NomGroup g IF ngCode(g) = 'NG-013';
+animalProdGroup () = GROUP MAX NomGroup g IF ngCode(g) = 'NG-012';
+// молочное стадо (для ФЛК регистров)
+herdIsDairy (Herd h) = herdKind(h) = HerdKind.dairyCattle;
+FORM pickHerd 'Выбор стада'
+    OBJECTS ph = Herd
+    PROPERTIES (ph) READONLY herdCode, herdName, nameHerdKind, herdCount
+    ORDERS herdCode(ph)
+;
+FORM pickFarmLocation 'Выбор фермы (точки размещения)'
+    OBJECTS pl = Location
+    PROPERTIES (pl) READONLY name, code
+    ORDERS name(pl)
+;
+setHerdLocationAct 'Выбрать ферму' (Herd h) {
+    DIALOG pickFarmLocation OBJECTS pl = herdLocation(h) INPUT pl NULL DO herdLocation(h) <- pl;
+}
+FORM herds 'Стада'
+    OBJECTS h = Herd
+    PROPERTIES (h) READONLY herdCode, herdName, nameHerdKind, herdAgeGroup, herdCount, nameHerdOrg, nameHerdLocation
+    PROPERTIES (h) NEWSESSION NEW, EDIT, DELETE
+    ORDERS herdCode(h)
+;
+
+// ===================== Ж2: регистры периодического ввода =====================
+CLASS HerdYield 'Запись продуктивности';
+TABLE herdYield (HerdYield);
+hyHerd 'Стадо' = DATA Herd (HerdYield) AUTOSET;
+nameHyHerd 'Стадо' (HerdYield y) = OVERRIDE (herdCode(hyHerd(y)) + ' ' + (OVERRIDE herdName(hyHerd(y)), '')), '';
+hyDate 'Дата' = DATA DATE (HerdYield) NONULL;
+hyMilkKg 'Надой, кг' = DATA NUMERIC[12,2] (HerdYield);
+hyGainKg 'Привес, кг' = DATA NUMERIC[12,2] (HerdYield);
+CONSTRAINT HerdYield y IS HerdYield AND (hyMilkKg(y) < 0 OR hyGainKg(y) < 0) CHECKED BY hyMilkKg MESSAGE 'Надой/привес — неотрицательные';
+// ФЛК: молочному стаду надой обязателен (именованный хелпер — 3VL)
+CONSTRAINT HerdYield y IS HerdYield AND hyHerd(y) IS Herd AND herdIsDairy(hyHerd(y)) AND NOT hyMilkKg(y)
+    CHECKED BY hyMilkKg MESSAGE 'Для молочного стада надой обязателен';
+
+CLASS HerdFeeding 'Запись кормления';
+TABLE herdFeeding (HerdFeeding);
+hfHerd 'Стадо' = DATA Herd (HerdFeeding) AUTOSET;
+nameHfHerd 'Стадо' (HerdFeeding f) = OVERRIDE (herdCode(hfHerd(f)) + ' ' + (OVERRIDE herdName(hfHerd(f)), '')), '';
+hfDate 'Дата' = DATA DATE (HerdFeeding) NONULL;
+hfFeed 'Корм' = DATA Nomenclature (HerdFeeding) NONULL;
+nameHfFeed 'Корм' (HerdFeeding f) = OVERRIDE nomName(hfFeed(f)), '';
+hfQty 'Количество' = DATA NUMERIC[12,2] (HerdFeeding) NONULL;
+nameHfUnit 'Ед.' (HerdFeeding f) = nameNomUnit(hfFeed(f));
+// умолчание стоимости — розничная цена корма (умолчание этапа 1)
+hfCost 'Стоимость, ₽' = DATA NUMERIC[14,2] (HerdFeeding);
+WHEN SET (HerdFeeding f IS HerdFeeding) AND NOT CHANGED(hfCost(f)) DO
+    hfCost(f) <- hfQty(f) * (OVERRIDE basePrice(hfFeed(f)), 0.0);
+FORM pickFeed 'Выбор корма'
+    OBJECTS nf = Nomenclature
+    PROPERTIES (nf) READONLY nomName, nameNomUnit, basePrice
+    FILTERS nomGroupRef(nf) = feedGroup()
+    ORDERS nomName(nf)
+;
+setHfFeedAct 'Выбрать корм' (HerdFeeding f) {
+    DIALOG pickFeed OBJECTS nf = hfFeed(f) INPUT nf NULL DO hfFeed(f) <- nf;
+}
+CONSTRAINT HerdFeeding f IS HerdFeeding AND hfQty(f) <= 0 CHECKED BY hfQty MESSAGE 'Количество корма — положительное';
+
+CLASS HerdVetType 'Тип мероприятия' {
+    vaccination 'Вакцинация', treatment 'Лечение', inspection 'Осмотр', culling 'Выбытие'
+}
+CLASS HerdVetEvent 'Ветмероприятие';
+TABLE herdVetEvent (HerdVetEvent);
+hvHerd 'Стадо' = DATA Herd (HerdVetEvent) AUTOSET;
+nameHvHerd 'Стадо' (HerdVetEvent v) = OVERRIDE (herdCode(hvHerd(v)) + ' ' + (OVERRIDE herdName(hvHerd(v)), '')), '';
+hvDate 'Дата' = DATA DATE (HerdVetEvent) NONULL;
+hvType 'Тип' = DATA HerdVetType (HerdVetEvent) NONULL;
+nameHvType 'Тип' (HerdVetEvent v) = staticCaption(hvType(v));
+hvReason 'Причина' = DATA ISTRING[200] (HerdVetEvent);
+hvDrug 'Препарат' = DATA Nomenclature (HerdVetEvent);
+nameHvDrug 'Препарат' (HerdVetEvent v) = OVERRIDE nomName(hvDrug(v)), '';
+hvNote 'Примечание' = DATA ISTRING[200] (HerdVetEvent);
+// ФЛК: выбытие без причины не проводится
+CONSTRAINT HerdVetEvent v IS HerdVetEvent AND hvType(v) = HerdVetType.culling AND NOT hvReason(v)
+    CHECKED BY hvReason MESSAGE 'Причина выбытия обязательна';
+setHvDrugAct 'Выбрать препарат' (HerdVetEvent v) {
+    DIALOG pickNomenclature OBJECTS nm = hvDrug(v) INPUT nm NULL DO hvDrug(v) <- nm;
+}
+
+FORM herd 'Стадо'
+    OBJECTS h = Herd PANEL
+    PROPERTIES (h) herdCode, herdName
+    PROPERTIES (h) READONLY nameHerdKind
+    PROPERTIES (h) herdAgeGroup, herdCount
+    PROPERTIES (h) READONLY nameHerdOrg
+    PROPERTIES (h) READONLY nameHerdLocation
+    PROPERTIES (h) setHerdLocationAct
+
+    OBJECTS hy = HerdYield
+    PROPERTIES (hy) NEWSESSION NEW, EDIT, DELETE
+    PROPERTIES (hy) hyDate, hyMilkKg, hyGainKg
+    FILTERS hyHerd(hy) = h
+    ORDERS hyDate(hy) DESC
+
+    OBJECTS hf = HerdFeeding
+    PROPERTIES (hf) NEWSESSION NEW, EDIT, DELETE
+    PROPERTIES (hf) hfDate, nameHfFeed, hfQty, nameHfUnit, hfCost
+    FILTERS hfHerd(hf) = h
+    ORDERS hfDate(hf) DESC
+
+    OBJECTS hv = HerdVetEvent
+    PROPERTIES (hv) NEWSESSION NEW, EDIT, DELETE
+    PROPERTIES (hv) hvDate, nameHvType, hvReason, nameHvDrug, hvNote
+    FILTERS hvHerd(hv) = h
+    ORDERS hvDate(hv) DESC
+
+    EDIT Herd OBJECT h
+;
+// общие реестры папки
+FORM herdYields 'Продуктивность (записи)'
+    OBJECTS y = HerdYield
+    PROPERTIES (y) READONLY nameHyHerd, hyDate, hyMilkKg, hyGainKg
+    PROPERTIES (y) NEWSESSION NEW, EDIT, DELETE
+    ORDERS hyDate(y) DESC
+;
+FORM herdFeedings 'Кормление (записи)'
+    OBJECTS f = HerdFeeding
+    PROPERTIES (f) READONLY nameHfHerd, hfDate, nameHfFeed, hfQty, nameHfUnit, hfCost
+    PROPERTIES (f) NEWSESSION NEW, EDIT, DELETE
+    ORDERS hfDate(f) DESC
+;
+FORM herdVetEvents 'Ветмероприятия'
+    OBJECTS v = HerdVetEvent
+    PROPERTIES (v) READONLY nameHvHerd, hvDate, nameHvType, hvReason, nameHvDrug, hvNote
+    PROPERTIES (v) NEWSESSION NEW, EDIT, DELETE
+    ORDERS hvDate(v) DESC
+;
+
+// ===================== Ж3: отчёт «Продуктивность и кормление» =====================
+// ТЗ 4.2.4.17/.19 (частично): кормодни = численность × дни периода;
+// себестоимость кормодня = Σ стоимости корма / кормодни;
+// конверсия = кг корма / кг продукции (молоко/привес)
+CLASS HerdPerfRow 'Строка: продуктивность и кормление';
+TABLE herdPerfRow (HerdPerfRow);
+hprHerd 'Стадо' = DATA ISTRING[80] (HerdPerfRow) NONULL IN id;
+hprDays 'Дней' = DATA INTEGER (HerdPerfRow);
+hprFeedDays 'Кормодней' = DATA NUMERIC[12,1] (HerdPerfRow);
+hprMilkKg 'Надой, кг' = DATA NUMERIC[14,2] (HerdPerfRow);
+hprGainKg 'Привес, кг' = DATA NUMERIC[14,2] (HerdPerfRow);
+hprFeedKg 'Корма, кг' = DATA NUMERIC[14,2] (HerdPerfRow);
+hprFeedCost 'Корма, ₽' = DATA NUMERIC[14,2] (HerdPerfRow);
+hprDayCost 'Себестоимость кормодня, ₽' = DATA NUMERIC[10,2] (HerdPerfRow);
+hprConversion 'Конверсия корма, кг/кг' = DATA NUMERIC[10,2] (HerdPerfRow);
+// защита деления: положительный делитель — иначе NULL
+div2 (NUMERIC[14,2] a, NUMERIC[14,2] b) = IF (OVERRIDE b, 0.0) > 0 THEN a / b;
+buildHerdPerf 'Сформировать отчёт (период)' () {
+    INPUT fromD = DATE DO
+        INPUT toD = DATE DO {
+            DELETE HerdPerfRow r WHERE r IS HerdPerfRow;
+            FOR Herd h IS Herd DO
+                NEW r = HerdPerfRow {
+                    hprHerd(r) <- herdCode(h) + ' ' + (OVERRIDE herdName(h), '') + ' (' + nameHerdKind(h) + ')';
+                    hprDays(r) <- (OVERRIDE toD, currentDate()) - (OVERRIDE fromD, currentDate()) + 1;
+                    hprFeedDays(r) <- (OVERRIDE hprDays(r), 0) * 1.0 * herdCount(h);
+                    hprMilkKg(r) <- GROUP SUM hyMilkKg(HerdYield y) IF hyHerd(y) = h AND hyDate(y) >= fromD AND hyDate(y) <= toD;
+                    hprGainKg(r) <- GROUP SUM hyGainKg(HerdYield y) IF hyHerd(y) = h AND hyDate(y) >= fromD AND hyDate(y) <= toD;
+                    hprFeedKg(r) <- GROUP SUM hfQty(HerdFeeding f) IF hfHerd(f) = h AND hfDate(f) >= fromD AND hfDate(f) <= toD;
+                    hprFeedCost(r) <- GROUP SUM hfCost(HerdFeeding f) IF hfHerd(f) = h AND hfDate(f) >= fromD AND hfDate(f) <= toD;
+                    hprDayCost(r) <- div2(hprFeedCost(r), hprFeedDays(r));
+                    hprConversion(r) <- div2(hprFeedKg(r),
+                        (OVERRIDE (GROUP SUM hyMilkKg(HerdYield y) IF hyHerd(y) = h AND hyDate(y) >= fromD AND hyDate(y) <= toD), 0.0)
+                        + (OVERRIDE (GROUP SUM hyGainKg(HerdYield y) IF hyHerd(y) = h AND hyDate(y) >= fromD AND hyDate(y) <= toD), 0.0));
+                }
+            APPLY;
+        }
+}
+exportHerdPerfXls 'Выгрузить в Excel' () ABSTRACT;
+FORM herdPerfReport 'Продуктивность и кормление'   // ТЗ 4.2.4.17/.19
+    OBJECTS r = HerdPerfRow
+    PROPERTIES (r) READONLY hprHerd, hprDays, hprFeedDays, hprMilkKg, hprGainKg, hprFeedKg, hprFeedCost, hprDayCost, hprConversion
+    PROPERTIES () buildHerdPerf
+    PROPERTIES () exportHerdPerfXls
+;
+
+// ===================== Ж4: отчёт «Здоровье стада» =====================
+// ТЗ 4.2.4.18 (частично): мероприятия по типам/стадам, случаи заболеваний
+// на голову, выбытие по причинам
+CLASS HerdHealthRow 'Строка: здоровье стада';
+TABLE herdHealthRow (HerdHealthRow);
+hhrHerd 'Стадо' = DATA ISTRING[80] (HerdHealthRow) NONULL IN id;
+hhrCount 'Численность' = DATA INTEGER (HerdHealthRow);
+hhrVaccination 'Вакцинаций' = DATA INTEGER (HerdHealthRow);
+hhrTreatment 'Лечений' = DATA INTEGER (HerdHealthRow);
+hhrInspection 'Осмотров' = DATA INTEGER (HerdHealthRow);
+hhrCulled 'Выбыло, голов' = DATA INTEGER (HerdHealthRow);
+hhrCullPct 'Выбытие, % численности' = DATA NUMERIC[6,2] (HerdHealthRow);
+hhrDiseaseRate 'Случаев лечения на голову' = DATA NUMERIC[8,2] (HerdHealthRow);
+hhrReasons 'Причины выбытия' = DATA ISTRING[300] (HerdHealthRow);
+buildHerdHealth 'Сформировать отчёт (период)' () {
+    INPUT fromD = DATE DO
+        INPUT toD = DATE DO {
+            DELETE HerdHealthRow r WHERE r IS HerdHealthRow;
+            FOR Herd h IS Herd DO
+                NEW r = HerdHealthRow {
+                    hhrHerd(r) <- herdCode(h) + ' ' + (OVERRIDE herdName(h), '');
+                    hhrCount(r) <- herdCount(h);
+                    hhrVaccination(r) <- GROUP SUM 1 IF HerdVetEvent v IS HerdVetEvent AND hvHerd(v) = h AND hvType(v) = HerdVetType.vaccination AND hvDate(v) >= fromD AND hvDate(v) <= toD;
+                    hhrTreatment(r) <- GROUP SUM 1 IF HerdVetEvent v IS HerdVetEvent AND hvHerd(v) = h AND hvType(v) = HerdVetType.treatment AND hvDate(v) >= fromD AND hvDate(v) <= toD;
+                    hhrInspection(r) <- GROUP SUM 1 IF HerdVetEvent v IS HerdVetEvent AND hvHerd(v) = h AND hvType(v) = HerdVetType.inspection AND hvDate(v) >= fromD AND hvDate(v) <= toD;
+                    hhrCulled(r) <- GROUP SUM 1 IF HerdVetEvent v IS HerdVetEvent AND hvHerd(v) = h AND hvType(v) = HerdVetType.culling AND hvDate(v) >= fromD AND hvDate(v) <= toD;
+                    hhrCullPct(r) <- div2((OVERRIDE hhrCulled(r), 0) * 100.0, (OVERRIDE herdCount(h), 0) * 1.0);
+                    hhrDiseaseRate(r) <- div2((OVERRIDE hhrTreatment(r), 0) * 1.0, (OVERRIDE herdCount(h), 0) * 1.0);
+                    hhrReasons(r) <- GROUP CONCAT (OVERRIDE hvReason(v), '—') IF HerdVetEvent v2 IS HerdVetEvent AND v2 = v
+                        AND hvHerd(v) = h AND hvType(v) = HerdVetType.culling AND hvDate(v) >= fromD AND hvDate(v) <= toD, '; ' ORDER v;
+                }
+            APPLY;
+        }
+}
+exportHerdHealthXls 'Выгрузить в Excel' () ABSTRACT;
+FORM herdHealthReport 'Здоровье стада'   // ТЗ 4.2.4.18
+    OBJECTS r = HerdHealthRow
+    PROPERTIES (r) READONLY hhrHerd, hhrCount, hhrVaccination, hhrTreatment, hhrInspection, hhrCulled, hhrCullPct, hhrDiseaseRate, hhrReasons
+    PROPERTIES () buildHerdHealth
+    PROPERTIES () exportHerdHealthXls
+;
+
+// ===================== Ж5: P&L-связка =====================
+// продукция животноводства: nomType=product, БЕЗ prodCrop — в
+// растениеводческий доход БДР не попадает (КФ-8 ищет по культуре) — верно;
+// расчёт животноводческого БДР из регистров — этап 2 (спека)
+
+// ===================== Сид =====================
+kuOrgHerd () = GROUP MAX Organization o IF name(o) = 'Омский АНЦ';
+herdSeq () = GROUP SUM 1 IF Herd h IS Herd;
+herdSeed () {
+    // ферма-точка размещения (идемпотентно по коду)
+    IF NOT locationByCode('FIRM-001') THEN
+        NEW l = Location {
+            name(l) <- 'Ферма №1';
+            code(l) <- 'FIRM-001';
+            organization(l) <- kuOrgHerd();
+            latitude(l) <- (OVERRIDE (GROUP MAX centerLat(Field f) IF organization(f) = kuOrgHerd()), 55.0);
+            longitude(l) <- (OVERRIDE (GROUP MAX centerLon(Field f) IF organization(f) = kuOrgHerd()), 73.0);
+        }
+    APPLY;
+    // группы номенклатуры (идемпотентно по коду; на живой БД — дозаправка)
+    IF NOT feedGroup() THEN NEW g = NomGroup { ngCode(g) <- 'NG-013'; ngName(g) <- 'Корма'; }
+    IF NOT animalProdGroup() THEN NEW g = NomGroup { ngCode(g) <- 'NG-012'; ngName(g) <- 'Продукция животноводства'; }
+    APPLY;
+    // корма (цены — рыночные ориентиры октября 2026)
+    IF NOT (GROUP MAX Nomenclature n IF nomCode(n) = 'N-10001') THEN NEW n = Nomenclature { nomCode(n) <- 'N-10001'; nomName(n) <- 'Сено (разнотравное)'; nomType(n) <- NomType.other; nomGroup(n) <- (OVERRIDE ngName(feedGroup()), 'Корма'); nomGroupRef(n) <- feedGroup(); unit(n) <- unitByOkei('054'); basePrice(n) <- 8.0; }
+    IF NOT (GROUP MAX Nomenclature n IF nomCode(n) = 'N-10002') THEN NEW n = Nomenclature { nomCode(n) <- 'N-10002'; nomName(n) <- 'Комбикорм КК-60'; nomType(n) <- NomType.other; nomGroup(n) <- (OVERRIDE ngName(feedGroup()), 'Корма'); nomGroupRef(n) <- feedGroup(); unit(n) <- unitByOkei('054'); basePrice(n) <- 22.0; }
+    IF NOT (GROUP MAX Nomenclature n IF nomCode(n) = 'N-10003') THEN NEW n = Nomenclature { nomCode(n) <- 'N-10003'; nomName(n) <- 'Силос кукурузный'; nomType(n) <- NomType.other; nomGroup(n) <- (OVERRIDE ngName(feedGroup()), 'Корма'); nomGroupRef(n) <- feedGroup(); unit(n) <- unitByOkei('054'); basePrice(n) <- 5.0; }
+    // продукция животноводства (Ж5)
+    IF NOT (GROUP MAX Nomenclature n IF nomCode(n) = 'N-10011') THEN NEW n = Nomenclature { nomCode(n) <- 'N-10011'; nomName(n) <- 'Молоко сырьевое'; nomType(n) <- NomType.product; nomGroup(n) <- (OVERRIDE ngName(animalProdGroup()), 'Продукция животноводства'); nomGroupRef(n) <- animalProdGroup(); unit(n) <- unitByOkei('054'); basePrice(n) <- 32.0; }
+    IF NOT (GROUP MAX Nomenclature n IF nomCode(n) = 'N-10012') THEN NEW n = Nomenclature { nomCode(n) <- 'N-10012'; nomName(n) <- 'Мясо КРС (полутуши)'; nomType(n) <- NomType.product; nomGroup(n) <- (OVERRIDE ngName(animalProdGroup()), 'Продукция животноводства'); nomGroupRef(n) <- animalProdGroup(); unit(n) <- unitByOkei('054'); basePrice(n) <- 320.0; }
+    APPLY;
+    // статьи БДР животноводства (если справочник статей пуст по кодам HD-*)
+    IF NOT ciByCode('HD-001') THEN NEW ci = CostItem { ciCode(ci) <- 'HD-001'; ciName(ci) <- 'Животноводство: корма'; ciKind(ci) <- CostItemKind.expense; ciGroup(ci) <- 'Животноводство'; }
+    IF NOT ciByCode('HD-002') THEN NEW ci = CostItem { ciCode(ci) <- 'HD-002'; ciName(ci) <- 'Животноводство: ветмероприятия'; ciKind(ci) <- CostItemKind.expense; ciGroup(ci) <- 'Животноводство'; }
+    IF NOT ciByCode('HD-003') THEN NEW ci = CostItem { ciCode(ci) <- 'HD-003'; ciName(ci) <- 'Животноводство: ФОТ'; ciKind(ci) <- CostItemKind.expense; ciGroup(ci) <- 'Животноводство'; }
+    APPLY;
+    // стада
+    IF NOT (GROUP MAX Herd h) AND kuOrgHerd() THEN {
+        NEW h1 = Herd {
+            herdCode(h1) <- 'HERD-01'; herdName(h1) <- 'КРС молочный №1';
+            herdKind(h1) <- HerdKind.dairyCattle; herdAgeGroup(h1) <- 'Коровы дойные';
+            herdCount(h1) <- 120; herdOrg(h1) <- kuOrgHerd();
+            herdLocation(h1) <- locationByCode('FIRM-001');
+        }
+        NEW h2 = Herd {
+            herdCode(h2) <- 'HERD-02'; herdName(h2) <- 'КРС мясной №2';
+            herdKind(h2) <- HerdKind.beefCattle; herdAgeGroup(h2) <- 'Молодняк';
+            herdCount(h2) <- 60; herdOrg(h2) <- kuOrgHerd();
+            herdLocation(h2) <- locationByCode('FIRM-001');
+        }
+        APPLY;
+        // продуктивность за 2 месяца (лёгкая динамика вниз)
+        NEW y1 = HerdYield { hyHerd(y1) <- (GROUP MAX Herd h IF herdCode(h) = 'HERD-01'); hyDate(y1) <- 2026_09_15; hyMilkKg(y1) <- 36000.0; }
+        NEW y2 = HerdYield { hyHerd(y2) <- (GROUP MAX Herd h IF herdCode(h) = 'HERD-01'); hyDate(y2) <- 2026_10_15; hyMilkKg(y2) <- 34800.0; }
+        NEW y3 = HerdYield { hyHerd(y3) <- (GROUP MAX Herd h IF herdCode(h) = 'HERD-02'); hyDate(y3) <- 2026_09_15; hyGainKg(y3) <- 3600.0; }
+        NEW y4 = HerdYield { hyHerd(y4) <- (GROUP MAX Herd h IF herdCode(h) = 'HERD-02'); hyDate(y4) <- 2026_10_15; hyGainKg(y4) <- 3420.0; }
+        // кормление (стоимость — авто из basePrice при WHEN SET)
+        NEW f1 = HerdFeeding { hfHerd(f1) <- (GROUP MAX Herd h IF herdCode(h) = 'HERD-01'); hfDate(f1) <- 2026_09_15; hfFeed(f1) <- (GROUP MAX Nomenclature n IF nomCode(n) = 'N-10001'); hfQty(f1) <- 54000.0; }
+        NEW f2 = HerdFeeding { hfHerd(f2) <- (GROUP MAX Herd h IF herdCode(h) = 'HERD-01'); hfDate(f2) <- 2026_09_15; hfFeed(f2) <- (GROUP MAX Nomenclature n IF nomCode(n) = 'N-10002'); hfQty(f2) <- 18000.0; }
+        NEW f3 = HerdFeeding { hfHerd(f3) <- (GROUP MAX Herd h IF herdCode(h) = 'HERD-01'); hfDate(f3) <- 2026_10_15; hfFeed(f3) <- (GROUP MAX Nomenclature n IF nomCode(n) = 'N-10003'); hfQty(f3) <- 72000.0; }
+        NEW f4 = HerdFeeding { hfHerd(f4) <- (GROUP MAX Herd h IF herdCode(h) = 'HERD-02'); hfDate(f4) <- 2026_10_15; hfFeed(f4) <- (GROUP MAX Nomenclature n IF nomCode(n) = 'N-10001'); hfQty(f4) <- 27000.0; }
+        // ветмероприятия: вакцинация + выбытие с причиной
+        NEW v1 = HerdVetEvent { hvHerd(v1) <- (GROUP MAX Herd h IF herdCode(h) = 'HERD-01'); hvDate(v1) <- 2026_09_10; hvType(v1) <- HerdVetType.vaccination; hvNote(v1) <- 'План осенней вакцинации'; }
+        NEW v2 = HerdVetEvent { hvHerd(v2) <- (GROUP MAX Herd h IF herdCode(h) = 'HERD-02'); hvDate(v2) <- 2026_10_05; hvType(v2) <- HerdVetType.culling; hvReason(v2) <- 'Травма конечности'; }
+        APPLY;
+    }
+}
+
+// XLSX-реализации (PRINT форма — выше действия)
+exportHerdPerfXls () + {
+    PRINT herdPerfReport XLSX SHEET 'Продуктивность и кормление' TO exportFile;
+    open(exportFile());
+}
+exportHerdHealthXls () + {
+    PRINT herdHealthReport XLSX SHEET 'Здоровье стада' TO exportFile;
+    open(exportFile());
+}
+
+// ===================== Вет-отчёт ECharts (C2) =====================
+// снапшот для kudash-компонента (паттерн kuDashData)
+herdVetChartData 'Данные вет-диаграммы' = DATA TEXT ();
+refreshHerdVetChart 'Обновить вет-диаграмму' () {
+    herdVetChartData() <- '';
+    herdVetChartData() <- (OVERRIDE herdVetChartData(), '') + '~Вакцинация^' + ('' + (OVERRIDE (GROUP SUM 1 IF HerdVetEvent v IS HerdVetEvent AND hvType(v) = HerdVetType.vaccination), 0));
+    herdVetChartData() <- (OVERRIDE herdVetChartData(), '') + '~Лечение^' + ('' + (OVERRIDE (GROUP SUM 1 IF HerdVetEvent v IS HerdVetEvent AND hvType(v) = HerdVetType.treatment), 0));
+    herdVetChartData() <- (OVERRIDE herdVetChartData(), '') + '~Осмотр^' + ('' + (OVERRIDE (GROUP SUM 1 IF HerdVetEvent v IS HerdVetEvent AND hvType(v) = HerdVetType.inspection), 0));
+    herdVetChartData() <- (OVERRIDE herdVetChartData(), '') + '~Выбытие^' + ('' + (OVERRIDE (GROUP SUM 1 IF HerdVetEvent v IS HerdVetEvent AND hvType(v) = HerdVetType.culling), 0));
+    APPLY;
+}
+EXTEND FORM herdHealthReport
+    PROPERTIES () herdVetChartData CUSTOM 'kudash'
+    PROPERTIES () refreshHerdVetChart
+;
+
+// ===================== Животноводческий БДР (каркас, C2) =====================
+// расчёт из регистров: доход (продукция) − расход (корма + вет) по стаду
+CLASS HerdBudgetRow 'Строка БДР животноводства';
+TABLE herdBudgetRow (HerdBudgetRow);
+hbrHerd 'Стадо' = DATA ISTRING[80] (HerdBudgetRow) NONULL IN id;
+hbrMilkIncome 'Доход: молоко, ₽' = DATA NUMERIC[14,2] (HerdBudgetRow);
+hbrMeatIncome 'Доход: мясо, ₽' = DATA NUMERIC[14,2] (HerdBudgetRow);
+hbrFeedCost 'Расход: корма, ₽' = DATA NUMERIC[14,2] (HerdBudgetRow);
+hbrVetCost 'Расход: вет, ₽' = DATA NUMERIC[14,2] (HerdBudgetRow);
+hbrMargin 'Маржа, ₽' (HerdBudgetRow r) =
+    (OVERRIDE hbrMilkIncome(r), 0) + (OVERRIDE hbrMeatIncome(r), 0)
+    - (OVERRIDE hbrFeedCost(r), 0) - (OVERRIDE hbrVetCost(r), 0);
+hbrCount 'Голов' = DATA INTEGER (HerdBudgetRow);
+hbrMarginPerHead 'Маржа на голову, ₽' (HerdBudgetRow r) =
+    IF (OVERRIDE hbrCount(r), 0) > 0 THEN hbrMargin(r) / hbrCount(r);
+buildHerdBudget 'Рассчитать БДР (период)' () {
+    INPUT fromD = DATE DO
+        INPUT toD = DATE DO {
+            DELETE HerdBudgetRow r WHERE r IS HerdBudgetRow;
+            FOR Herd h IS Herd DO
+                NEW r = HerdBudgetRow {
+                    hbrHerd(r) <- herdCode(h) + ' ' + (OVERRIDE herdName(h), '');
+                    hbrCount(r) <- herdCount(h);
+                    // доход: молоко × цена + привес × цена мяса
+                    hbrMilkIncome(r) <- (OVERRIDE (GROUP SUM hyMilkKg(HerdYield y) IF hyHerd(y) = h AND hyDate(y) >= fromD AND hyDate(y) <= toD), 0)
+                        * (OVERRIDE (GROUP MAX basePrice(Nomenclature n) IF nomCode(n) = 'N-10011'), 32.0);
+                    hbrMeatIncome(r) <- (OVERRIDE (GROUP SUM hyGainKg(HerdYield y) IF hyHerd(y) = h AND hyDate(y) >= fromD AND hyDate(y) <= toD), 0)
+                        * (OVERRIDE (GROUP MAX basePrice(Nomenclature n) IF nomCode(n) = 'N-10012'), 320.0);
+                    // расход: корма + вет (по факту записей)
+                    hbrFeedCost(r) <- (OVERRIDE (GROUP SUM hfCost(HerdFeeding f) IF hfHerd(f) = h AND hfDate(f) >= fromD AND hfDate(f) <= toD), 0);
+                    // вет: по 500 ₽ на мероприятие (допущение этапа 1)
+                    hbrVetCost(r) <- (OVERRIDE (GROUP SUM 1 IF HerdVetEvent v IS HerdVetEvent AND hvHerd(v) = h AND hvDate(v) >= fromD AND hvDate(v) <= toD), 0) * 500.0;
+                }
+            APPLY;
+        }
+}
+exportHerdBudgetXls 'Выгрузить в Excel' () ABSTRACT;
+FORM herdBudgetReport 'БДР животноводства'
+    OBJECTS r = HerdBudgetRow
+    PROPERTIES (r) READONLY hbrHerd, hbrCount, hbrMilkIncome, hbrMeatIncome, hbrFeedCost, hbrVetCost, hbrMargin, hbrMarginPerHead
+    PROPERTIES () buildHerdBudget
+    PROPERTIES () exportHerdBudgetXls
+;
+exportHerdBudgetXls () + {
+    PRINT herdBudgetReport XLSX SHEET 'БДР животноводства' TO exportFile;
+    open(exportFile());
+}

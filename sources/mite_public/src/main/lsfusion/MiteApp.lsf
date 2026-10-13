@@ -1,0 +1,6 @@
+MODULE MiteApp;
+
+// Зонтик приложения: единая точка сборки всех фич-модулей.
+// topModule = MiteApp (см. lsfusion.properties). MachineBot тянет Mite -> Grafana и т.д.
+REQUIRE MachineBot, Weather, WeatherOpenWeatherMap, WeatherWttr, Scheme, SosediDemo,
+         KuApp;   // «Код Урожая» — зонтик Ku-модулей (docs/06-generation-guide.md §2)

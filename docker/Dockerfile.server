@@ -1,0 +1,29 @@
+FROM registry.altlinux.org/p11/openjdk21
+
+USER root
+RUN mkdir -p /opt/lsfusion/logs
+# Шрифты для серверной генерации XLSX/PDF (PRINT): без fontconfig Java AWT
+# падает «Fontconfig head is null» при экспорте в Excel (ПМИ КП07/агрохимия)
+RUN apt-get update && apt-get install -y fontconfig fonts-ttf-dejavu && rm -rf /var/cache/apt/archives/*.rpm
+WORKDIR /opt/lsfusion
+
+EXPOSE 7651 7652
+
+# lib/* — зависимости логики из pom (jlibmodbus, paho, httpclient...),
+# выгружаются builder'ом в artifacts/lib (иначе NoClassDefFoundError).
+# rmi.server.hostname=server — чтобы RMI-стабы были достижимы из web.
+CMD ["java", "-Xmx4g", \
+     "-DbatchScriptErrors=true", \
+     "-Djava.rmi.server.hostname=server", \
+     "-Ddb.server=db:5432", \
+     "-Ddb.name=iot", \
+     "-Ddb.user=postgres", \
+     "-Ddb.password=11111", \
+     "-Drmi.port=7652", \
+     "-Dhttp.port=7651", \
+     "-Dlogics.initialAdminPassword=fusion", \
+     "-DminInterfaceStatForValueUnique=2", \
+     "--add-opens=java.base/java.lang=ALL-UNNAMED", \
+     "--add-opens=java.base/java.util=ALL-UNNAMED", \
+     "-cp", "iot-1.0-SNAPSHOT.jar:lsfusion-server-7.0-SNAPSHOT.jar:lib/*", \
+     "lsfusion.server.logics.BusinessLogicsBootstrap"]
